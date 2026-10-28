@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "libstrix"
+version = "0.0.1"
+description = "gfx1151 (Strix Halo) HIP kernels and a vLLM plugin that uses them"
+requires-python = ">=3.10"
+license = "MIT AND Apache-2.0"
+license-files = ["LICENSE", "LICENSES/*", "NOTICE"]
+
+[project.entry-points."vllm.general_plugins"]
+strix = "strix_vllm:register"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+packages = ["strix", "strix_vllm"]
+
+[tool.setuptools.package-data]
+strix = ["_C.so"]
+
+[tool.ruff]
+line-length = 88
+# Vendored from vLLM; kept byte-for-byte comparable with its source.
+extend-exclude = ["python/strix_vllm/triton_unified_attention.py"]

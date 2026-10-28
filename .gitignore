@@ -1,0 +1,13 @@
+build/
+*.so
+__pycache__/
+.pytest_cache/
+*.egg-info/
+profiles/
+.rocprofv3/
+/.claude/
+
+# Local working notes, not published
+NOTES.md
+docs/handoff.md
+bench/suite/

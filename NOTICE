@@ -1,0 +1,13 @@
+libstrix
+Copyright (c) 2026 asf0
+
+libstrix is licensed under the MIT License (LICENSE), except for the files
+below, which contain third-party code under the Apache License 2.0
+(LICENSES/Apache-2.0.txt) and keep that license in their header.
+
+From vLLM (https://github.com/vllm-project/vllm), Copyright contributors to
+the vLLM project, including gfx1151 changes from the asf0/strix-vllm fork:
+
+  python/strix_vllm/triton_unified_attention.py   vendored
+  csrc/gemm/w8a16_skinny_gemm.hip                 derived from csrc/rocm/skinny_gemms.cu
+  csrc/gemm/w8a8_wmma_gemm.hip                    derived from csrc/rocm/skinny_gemms.cu
