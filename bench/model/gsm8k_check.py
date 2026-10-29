@@ -30,6 +30,18 @@ def main() -> None:
     p.add_argument("--mtp", type=int, default=0, help="MTP draft tokens, 0 = off")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.75)
     p.add_argument("--mamba-ssm-cache-dtype", default="auto")
+    p.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=32,
+        help="<= 5 keeps decode on the skinny (M <= 5) GEMM paths",
+    )
+    p.add_argument("--attention-backend", default="TRITON_ATTN")
+    p.add_argument(
+        "--engram-disk-offload",
+        action="store_true",
+        help="Qwen3.8-Flash-Next: n-gram table read from disk",
+    )
     args = p.parse_args()
 
     data = load_dataset("openai/gsm8k", "main", split="test").select(range(args.n))
@@ -38,9 +50,10 @@ def main() -> None:
         language_model_only=True,
         max_model_len=4096,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        max_num_seqs=32,
-        attention_backend="TRITON_ATTN",
+        max_num_seqs=args.max_num_seqs,
+        attention_backend=args.attention_backend or None,
         mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
+        **({"engram_config": {"disk_offload": True}} if args.engram_disk_offload else {}),
         speculative_config=(
             {"method": "mtp", "num_speculative_tokens": args.mtp} if args.mtp else None
         ),

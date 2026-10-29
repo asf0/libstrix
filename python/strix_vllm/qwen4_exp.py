@@ -151,7 +151,16 @@ def _register_hc_up_gate_mix() -> None:
     if unfused is None:
         return
 
+    from strix_vllm import dense_w8
+
     def hc_up_gate_mix(x, lowrank, weight, hc_count):
+        if x.shape[0] <= dense_w8.MAX_SKINNY_BATCH_SIZE:
+            w8 = dense_w8.lookup(weight)
+            if w8 is not None and lowrank.is_contiguous():
+                # Decode: the int8 copy dense_w8 made of input_mix_weight_up.
+                w_q, w_s, group, cu = w8
+                gate = torch.ops.strix.w8a16_skinny_gemm(w_q, lowrank, w_s, None, cu, group)
+                return hc._hc_gate_mix(x, gate, hc_count)
         if not (
             hc_count == 4
             and x.shape[0] >= _HC_MIN_ROWS
