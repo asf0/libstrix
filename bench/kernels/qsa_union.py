@@ -9,6 +9,7 @@ padded) or synthetic 4-token block selections.
 """
 
 import argparse
+import os
 
 import strix  # noqa: F401
 import torch
@@ -59,8 +60,12 @@ def main() -> None:
     t_ref = timed(lambda: ops.qsa_sparse_paged_attention(q, k_cache, v_cache, indices, bt2, token_to_req))
     out = torch.empty_like(q)
 
+    tokens = int(indices.max()) + 1 if os.environ.get("F16") == "1" else 0
+
     def new():
-        torch.ops.strix.qsa_union_attn_bf16(out, q, k_cache, v_cache, indices, block_table)
+        torch.ops.strix.qsa_union_attn_bf16(
+            out, q, k_cache, v_cache, indices, block_table, tokens
+        )
 
     t_new = timed(new)
     d = (out.float() - ref.float()).abs()

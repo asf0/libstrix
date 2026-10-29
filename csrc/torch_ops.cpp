@@ -32,11 +32,14 @@ void qsa_indexer_bf16(torch::Tensor& logits, torch::Tensor& visible,
                       const torch::Tensor& block_table,
                       const torch::Tensor& positions, const torch::Tensor& seq_lens,
                       int64_t compress_ratio, double score_divisor);
+void qsa_kv_to_f16(torch::Tensor& k16, torch::Tensor& v16,
+                   const torch::Tensor& key_cache, const torch::Tensor& value_cache,
+                   const torch::Tensor& block_table, int64_t tokens);
 void qsa_union_attn_bf16(torch::Tensor& out, const torch::Tensor& q,
                          const torch::Tensor& key_cache,
                          const torch::Tensor& value_cache,
                          const torch::Tensor& indices,
-                         const torch::Tensor& block_table);
+                         const torch::Tensor& block_table, int64_t tokens = 0);
 void moe_act_quant_i8(const torch::Tensor& x, torch::Tensor& q, torch::Tensor& sa);
 void moe_gemm_w4a8(torch::Tensor& c, const torch::Tensor& qa,
                    const torch::Tensor& sa, const torch::Tensor& w,
@@ -163,8 +166,11 @@ TORCH_LIBRARY(strix, m) {
       "int compress_ratio, float score_divisor) -> ()");
   // Qwen3.8-Flash-Next QSA sparse attention over row unions (single request).
   m.def(
+      "qsa_kv_to_f16(Tensor(a!) k16, Tensor(b!) v16, Tensor key_cache, "
+      "Tensor value_cache, Tensor block_table, int tokens) -> ()");
+  m.def(
       "qsa_union_attn_bf16(Tensor(a!) out, Tensor q, Tensor key_cache, "
-      "Tensor value_cache, Tensor indices, Tensor block_table) -> ()");
+      "Tensor value_cache, Tensor indices, Tensor block_table, int tokens=0) -> ()");
   // int8 activations per (row, 128-element group) for moe_gemm_w4a8.
   m.def("moe_act_quant_i8(Tensor x, Tensor(a!) q, Tensor(b!) sa) -> ()");
   m.def(
@@ -249,6 +255,7 @@ TORCH_LIBRARY_IMPL(strix, CUDA, m) {
   m.impl("moe_gemm_w4a16", &strix::moe_gemm_w4a16);
   m.impl("moe_act_quant_i8", &strix::moe_act_quant_i8);
   m.impl("qsa_union_attn_bf16", &strix::qsa_union_attn_bf16);
+  m.impl("qsa_kv_to_f16", &strix::qsa_kv_to_f16);
   m.impl("qsa_indexer_bf16", &strix::qsa_indexer_bf16);
   m.impl("hc_up_gate_mix_bf16", &strix::hc_up_gate_mix_bf16);
   m.impl("moe_gemm_w4a8", &strix::moe_gemm_w4a8);

@@ -26,6 +26,9 @@
 #include "../strix_common.h"
 
 namespace strix {
+void qsa_kv_to_f16(torch::Tensor& k16, torch::Tensor& v16,
+                   const torch::Tensor& key_cache, const torch::Tensor& value_cache,
+                   const torch::Tensor& block_table, int64_t tokens);
 namespace {
 
 constexpr int kMaxWords = 4096;   // bitmap words: positions < 131072
@@ -94,7 +97,10 @@ __global__ __launch_bounds__(T) void qsa_union_build_kernel(
 // VGPRs capped at 192 (8 waves per SIMD), as in attn_prefill_kernel: at the
 // ~250 the compiler picks on its own, one block fills a CU and every barrier
 // bubble stays empty.
-template <int D, int G, int BN, int ROWS, typename XT>
+// F16: read K/V from the compact [token][kv_heads * 256] fp16 arrays that
+// qsa_kv_to_f16 builds (dense rows, half the bytes, no page math) and run the
+// WMMAs and P in fp16 instead of bf16.
+template <int D, int G, int BN, int ROWS, typename XT, bool F16 = false>
 __global__ __launch_bounds__((G / 4) * (ROWS / 4) * (D / 128) * kWave)
 __attribute__((amdgpu_waves_per_eu(8))) void qsa_union_attn_kernel(
     uint16_t* __restrict__ out, const uint16_t* __restrict__ q,
@@ -103,7 +109,7 @@ __attribute__((amdgpu_waves_per_eu(8))) void qsa_union_attn_kernel(
     const int32_t* __restrict__ ulen, const int32_t* __restrict__ bt, int rows,
     int64_t u_cap, int block_size, int64_t sq_t, int64_t sq_h, int64_t so_t,
     int64_t so_h, int64_t sk_b, int64_t sk_s, int64_t sk_h, int64_t sv_b,
-    int64_t sv_s, int64_t sv_h, float scale_log2) {
+    int64_t sv_s, int64_t sv_h, float scale_log2, int kv_width) {
   constexpr int kHalf = 128, W = D / kHalf;  // waves per head group
   constexpr int HG = G / 4;                  // head groups of 4 heads
   constexpr int HPB = HG * (ROWS / 4);       // wave pairs
@@ -136,13 +142,27 @@ __attribute__((amdgpu_waves_per_eu(8))) void qsa_union_attn_kernel(
   {
     const uint16_t* qrow = q + int64_t(safe_row) * sq_t + h * sq_h + half * kHalf;
 #pragma unroll
-    for (int kk = 0; kk < kHalf / 16; ++kk) qf[kk] = load_frag_bf16(qrow + kk * 16, 0, 0);
+    for (int kk = 0; kk < kHalf / 16; ++kk) {
+      qf[kk] = load_frag_bf16(qrow + kk * 16, 0, 0);
+      if constexpr (F16) {
+        // bf16 -> fp16, exact for these magnitudes; done once per block.
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+          // The fragment holds 16-bit containers: store the fp16 *bits*.
+          const _Float16 h = static_cast<_Float16>(
+              __uint_as_float(uint32_t(uint16_t(qf[kk][i])) << 16));
+          qf[kk][i] = static_cast<short>(__builtin_bit_cast(uint16_t, h));
+        }
+      }
+    }
   }
   f32x8 o_acc[kHalf / 16];
 #pragma unroll
   for (int i = 0; i < kHalf / 16; ++i) o_acc[i] = f32x8{};
   float m_run = -INFINITY, l_run = 0.f;
-  const uint32_t p_sel = hi ? 0x03020706u : 0x07060302u;
+  // bf16 rounds into the high half of each word, fp16 into the low half.
+  const uint32_t p_sel = F16 ? (hi ? 0x01000504u : 0x05040100u)
+                            : (hi ? 0x03020706u : 0x07060302u);
 
   constexpr int kChunks = BN * D / 8;
   constexpr int kLoads = (kChunks + kThreads - 1) / kThreads;
@@ -160,15 +180,18 @@ __attribute__((amdgpu_waves_per_eu(8))) void qsa_union_attn_kernel(
         const int ki = k0 + koff, vi = k0 + voff;
         if (ki < n_keys) {
           const int t = guni[ki];
-          const int64_t a = int64_t(bt[t / block_size]) * sk_b +
-                            int64_t(t % block_size) * sk_s + kvh * sk_h + kd;
+          // F16: dense compact fp16 row; else the paged bf16 cache.
+          const int64_t a = F16 ? int64_t(t) * kv_width + kvh * 256 + kd
+                                : int64_t(bt[t / block_size]) * sk_b +
+                                      int64_t(t % block_size) * sk_s + kvh * sk_h + kd;
           xk = *reinterpret_cast<const uint4*>(kc + a);
           if (kd == 0) xm = gmem[ki];
         }
         if (vi < n_keys) {
           const int t = guni[vi];
-          const int64_t a = int64_t(bt[t / block_size]) * sv_b +
-                            int64_t(t % block_size) * sv_s + kvh * sv_h + vd;
+          const int64_t a = F16 ? int64_t(t) * kv_width + kvh * 256 + vd
+                                : int64_t(bt[t / block_size]) * sv_b +
+                                      int64_t(t % block_size) * sv_s + kvh * sv_h + vd;
           xv = *reinterpret_cast<const uint4*>(vc + a);
         }
       }
@@ -210,7 +233,7 @@ __attribute__((amdgpu_waves_per_eu(8))) void qsa_union_attn_kernel(
       for (int kk = 0; kk < kHalf / 16; ++kk) {
         const bf16x16 kf =
             load_frag_bf16(s_k + j * 16 * kPK + half * kHalf + kk * 16, kPK, lane);
-        s[j] = wmma_bf16(kf, qf[kk], s[j]);
+        s[j] = F16 ? wmma_f16(kf, qf[kk], s[j]) : wmma_bf16(kf, qf[kk], s[j]);
       }
 #pragma unroll
       for (int e = 0; e < 8; ++e) s[j][e] *= scale_log2;
@@ -255,7 +278,7 @@ __attribute__((amdgpu_waves_per_eu(8))) void qsa_union_attn_kernel(
       for (int e = 0; e < 8; ++e) {
         const float p = __builtin_amdgcn_exp2f(s[j][e] - m_ref);
         l_loc += p;
-        const uint32_t mine = round_bf16_hi(p);
+        const uint32_t mine = F16 ? f16_bits(p) : round_bf16_hi(p);
         const uint32_t other = __float_as_uint(xor_shuffle_f32(__uint_as_float(mine), 16));
         const uint32_t pk = __builtin_amdgcn_perm(other, mine, p_sel);
         pf[2 * e] = static_cast<short>(pk & 0xffffu);
@@ -265,7 +288,7 @@ __attribute__((amdgpu_waves_per_eu(8))) void qsa_union_attn_kernel(
       for (int dt = 0; dt < kHalf / 16; ++dt) {
         const bf16x16 vf =
             load_frag_bf16(s_vt + (half * kHalf + dt * 16) * kPV + j * 16, kPV, lane);
-        o_acc[dt] = wmma_bf16(vf, pf, o_acc[dt]);
+        o_acc[dt] = F16 ? wmma_f16(vf, pf, o_acc[dt]) : wmma_bf16(vf, pf, o_acc[dt]);
       }
     }
     l_loc += xor_shuffle_f32(l_loc, 16);
@@ -298,7 +321,8 @@ void qsa_union_attn_bf16(torch::Tensor& out, const torch::Tensor& q,
                          const torch::Tensor& key_cache,
                          const torch::Tensor& value_cache,
                          const torch::Tensor& indices,
-                         const torch::Tensor& block_table) {
+                         const torch::Tensor& block_table,
+                         int64_t compact_tokens = 0) {
   TORCH_CHECK(q.scalar_type() == at::kBFloat16 && out.scalar_type() == at::kBFloat16 &&
                   key_cache.scalar_type() == at::kBFloat16 &&
                   value_cache.scalar_type() == at::kBFloat16,
@@ -350,20 +374,36 @@ void qsa_union_attn_bf16(torch::Tensor& out, const torch::Tensor& q,
   const float scale_log2 = 1.4426950408889634f / 16.f;  // log2(e) / sqrt(256)
   // fp16 cross-wave partials: 67 vs 73 ms on the 26k-token selections; 32-key
   // steps and float partials were slower at every group size.
-  auto kernel = rows_per == 4   ? qsa_union_attn_kernel<D, G, 16, 4, _Float16>
+  // compact_tokens > 0: convert this layer's visible K/V to compact fp16
+  // (qsa_kv_to_f16) and read the gather from there.
+  const int kv_width = int(hkv * D);
+  at::Tensor k16, v16;
+  const void* ksrc = key_cache.data_ptr();
+  const void* vsrc = value_cache.data_ptr();
+  if (compact_tokens > 0 && rows_per == 16) {
+    auto half_opts = q.options().dtype(at::kHalf);
+    k16 = at::empty({compact_tokens * kv_width}, half_opts);
+    v16 = at::empty({compact_tokens * kv_width}, half_opts);
+    qsa_kv_to_f16(k16, v16, key_cache, value_cache, block_table, compact_tokens);
+    ksrc = k16.data_ptr();
+    vsrc = v16.data_ptr();
+  }
+  const bool f16 = compact_tokens > 0 && rows_per == 16;
+  auto kernel = f16             ? qsa_union_attn_kernel<D, G, 16, 16, _Float16, true>
+                : rows_per == 4 ? qsa_union_attn_kernel<D, G, 16, 4, _Float16>
                 : rows_per == 8 ? qsa_union_attn_kernel<D, G, 16, 8, _Float16>
                                 : qsa_union_attn_kernel<D, G, 16, 16, _Float16>;
   kernel<<<dim3(hkv, groups), (G / 4) * (rows_per / 4) * (D / 128) * kWave, 0, stream>>>(
           reinterpret_cast<uint16_t*>(out.data_ptr()),
           reinterpret_cast<const uint16_t*>(q.data_ptr()),
-          reinterpret_cast<const uint16_t*>(key_cache.data_ptr()),
-          reinterpret_cast<const uint16_t*>(value_cache.data_ptr()),
+          reinterpret_cast<const uint16_t*>(ksrc),
+          reinterpret_cast<const uint16_t*>(vsrc),
           uni.data_ptr<int32_t>(), reinterpret_cast<const uint16_t*>(mem.data_ptr()),
           ulen.data_ptr<int32_t>(),
           block_table.data_ptr<int32_t>(), int(rows), u_cap, block_size, q.stride(0),
           q.stride(1), out.stride(0), out.stride(1), key_cache.stride(0),
           key_cache.stride(1), key_cache.stride(2), value_cache.stride(0),
-          value_cache.stride(1), value_cache.stride(2), scale_log2);
+          value_cache.stride(1), value_cache.stride(2), scale_log2, kv_width);
 }
 
 }  // namespace strix

@@ -57,6 +57,7 @@ def _union_ok(q, k_cache, v_cache, logical_indices, block_table) -> bool:
 
 
 _HC_MIN_ROWS = 512
+_F16 = os.environ.get("STRIX_QSA_UNION_F16", "0") == "1"
 
 
 _IDX_MIN_ROWS = 128
@@ -196,8 +197,14 @@ def _register_qsa_union() -> None:
             )
         if out is None:
             out = torch.empty_like(q)
+        # STRIX_QSA_UNION_F16=1: gather from a compact fp16 copy of the
+        # visible K/V instead of the paged bf16 cache (one extra pass per
+        # layer). The token count comes from the selection itself.
+        tokens = 0
+        if _F16:
+            tokens = int(logical_indices.max()) + 1
         torch.ops.strix.qsa_union_attn_bf16(
-            out, q, k_cache, v_cache, logical_indices, block_table[0]
+            out, q, k_cache, v_cache, logical_indices, block_table[0], tokens
         )
         return out
 
