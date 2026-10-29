@@ -64,7 +64,7 @@ def register() -> None:
     # directly, and models without GDN layers import nothing else from strix.
     import strix  # noqa: F401
 
-    from strix_vllm import attn, gdn, gemm, int8, linear, moe, mxfp4, norm, qsa
+    from strix_vllm import attn, gdn, gemm, int8, linear, moe, mxfp4, norm, qwen4_exp
 
     int8.register()
     linear.register()
@@ -74,5 +74,5 @@ def register() -> None:
     moe.register()
     gdn.register()
     attn.register()
-    qsa.register()
+    qwen4_exp.register()
     logger.info("libstrix: plugin registered")
