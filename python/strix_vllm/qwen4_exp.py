@@ -14,6 +14,10 @@ vLLM's AMD QSA module imports `qsa_sparse_paged_attention` from
 `vllm.models.qwen4_exp.amd.ops.qsa` at call time, so swapping the module
 attribute is enough.
 
+qsa_indexer: the QSA indexer's paged scores for a single-request prefill on
+strix::qsa_indexer_bf16 (1.7-1.9x vLLM's tl.dot kernel, 4k to 128k context);
+vLLM's qsa_select_paged_tokens calls `qsa_mqa_paged` from its module globals.
+
 hc_up_gate_mix: the hyper-connection up projection fused with the gated mix
 (strix::hc_up_gate_mix_bf16) from 512 rows: 5.2 vs 6.7 ms at 16k rows and no
 [M, 4H] gate in memory. vLLM's qwen4_exp_hc_up_gate_mix op calls
@@ -21,6 +25,7 @@ hc_up_gate_mix: the hyper-connection up projection fused with the gated mix
 unfused path (vLLM's skinny GEMMs at decode).
 """
 
+import math
 import os
 
 import torch
@@ -54,9 +59,85 @@ def _union_ok(q, k_cache, v_cache, logical_indices, block_table) -> bool:
 _HC_MIN_ROWS = 512
 
 
+_IDX_MIN_ROWS = 128
+
+
 def register() -> None:
     _register_qsa_union()
+    _register_qsa_indexer()
     _register_hc_up_gate_mix()
+
+
+def _register_qsa_indexer() -> None:
+    if disabled("qsa_indexer"):
+        return
+    try:
+        from vllm.models.qwen4_exp.amd.ops import qsa as ops
+    except ImportError:
+        return
+    orig = ops.qsa_mqa_paged
+
+    def qsa_mqa_paged(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+        num_columns=None,
+        score_scale=None,
+    ):
+        columns = (
+            page_table.shape[1] * k_cache.shape[1] if num_columns is None else num_columns
+        )
+        if not (
+            q.shape[0] >= _IDX_MIN_ROWS
+            and columns > 0
+            and page_table.dim() == 2
+            and page_table.shape[0] == 1
+            and q.dtype == k_cache.dtype == torch.bfloat16
+            and q.dim() == 3
+            and q.shape[1] == 4
+            and q.shape[2] == 128
+            and q.stride(2) == 1
+            and q.stride(0) % 8 == 0
+            and q.stride(1) % 8 == 0
+            and k_cache.dim() == 4
+            and k_cache.shape[2] == 1
+            and k_cache.stride(3) == 1
+            and query_positions.dtype == torch.int64
+            and sequence_lengths.dtype == torch.int32
+            and compress_ratio > 0
+        ):
+            return orig(
+                q,
+                k_cache,
+                page_table,
+                token_to_req,
+                query_positions,
+                sequence_lengths,
+                compress_ratio,
+                num_columns,
+                score_scale,
+            )
+        divisor = math.sqrt(q.shape[2]) if score_scale is None else score_scale
+        logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
+        visible = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
+        torch.ops.strix.qsa_indexer_bf16(
+            logits,
+            visible,
+            q,
+            k_cache,
+            page_table[0],
+            query_positions.contiguous(),
+            sequence_lengths,
+            compress_ratio,
+            float(divisor),
+        )
+        return logits, visible
+
+    ops.qsa_mqa_paged = qsa_mqa_paged
 
 
 def _register_hc_up_gate_mix() -> None:

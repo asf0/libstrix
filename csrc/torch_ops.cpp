@@ -27,6 +27,11 @@ void moe_gemm_w4a16(torch::Tensor& c, const torch::Tensor& a,
                     int64_t group_size);
 void hc_up_gate_mix_bf16(torch::Tensor& y, const torch::Tensor& x,
                          const torch::Tensor& a, const torch::Tensor& w);
+void qsa_indexer_bf16(torch::Tensor& logits, torch::Tensor& visible,
+                      const torch::Tensor& q, const torch::Tensor& k_cache,
+                      const torch::Tensor& block_table,
+                      const torch::Tensor& positions, const torch::Tensor& seq_lens,
+                      int64_t compress_ratio, double score_divisor);
 void qsa_union_attn_bf16(torch::Tensor& out, const torch::Tensor& q,
                          const torch::Tensor& key_cache,
                          const torch::Tensor& value_cache,
@@ -151,6 +156,11 @@ TORCH_LIBRARY(strix, m) {
       "bool silu_mul=False, str activation='silu', int group_size=32) -> ()");
   // Qwen3.8-Flash-Next hyper-connection up GEMM fused with the gated mix.
   m.def("hc_up_gate_mix_bf16(Tensor(a!) y, Tensor x, Tensor a, Tensor w) -> ()");
+  // Qwen3.8-Flash-Next QSA indexer scores (single request).
+  m.def(
+      "qsa_indexer_bf16(Tensor(a!) logits, Tensor(b!) visible, Tensor q, "
+      "Tensor k_cache, Tensor block_table, Tensor positions, Tensor seq_lens, "
+      "int compress_ratio, float score_divisor) -> ()");
   // Qwen3.8-Flash-Next QSA sparse attention over row unions (single request).
   m.def(
       "qsa_union_attn_bf16(Tensor(a!) out, Tensor q, Tensor key_cache, "
@@ -239,6 +249,7 @@ TORCH_LIBRARY_IMPL(strix, CUDA, m) {
   m.impl("moe_gemm_w4a16", &strix::moe_gemm_w4a16);
   m.impl("moe_act_quant_i8", &strix::moe_act_quant_i8);
   m.impl("qsa_union_attn_bf16", &strix::qsa_union_attn_bf16);
+  m.impl("qsa_indexer_bf16", &strix::qsa_indexer_bf16);
   m.impl("hc_up_gate_mix_bf16", &strix::hc_up_gate_mix_bf16);
   m.impl("moe_gemm_w4a8", &strix::moe_gemm_w4a8);
   m.impl("moe_gemm_w8a16", &strix::moe_gemm_w8a16);
