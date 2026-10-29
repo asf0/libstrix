@@ -45,6 +45,16 @@ def main() -> None:
     p.add_argument("--mamba-ssm-cache-dtype", default="auto")
     p.add_argument("--kv-cache-dtype", default="auto")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.75)
+    p.add_argument(
+        "--attention-backend",
+        default="TRITON_ATTN",
+        help="'' lets vLLM pick (Qwen4-exp QSA layers bring their own kernels)",
+    )
+    p.add_argument(
+        "--engram-disk-offload",
+        action="store_true",
+        help="Qwen3.8-Flash-Next: n-gram table read from disk",
+    )
     args = p.parse_args()
 
     llm = LLM(
@@ -53,10 +63,11 @@ def main() -> None:
         max_model_len=4096,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_num_seqs=8,
-        attention_backend="TRITON_ATTN",
+        attention_backend=args.attention_backend or None,
         mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
         kv_cache_dtype=args.kv_cache_dtype,
         enable_prefix_caching=False,
+        **({"engram_config": {"disk_offload": True}} if args.engram_disk_offload else {}),
     )
     tok = llm.get_tokenizer()
 

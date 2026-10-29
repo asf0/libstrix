@@ -42,6 +42,29 @@ def strix_blocks(num_tokens: int) -> tuple[int, int]:
     return 128, 128
 
 
+# int4 experts, (w13 n, k) -> [(max tokens, block_m, block_n)], from
+# bench/kernels/moe_wna16.py. Qwen3.8-Flash-Next (E=512, top-10, inter 640,
+# group 128): 16x64 is ~2x the 32x64/64x128 tiles up to 256 tokens (only
+# ~3 rows per expert). Past 4k tokens the bench's uniform routing favors
+# 64x256, but the model's skewed routing does not: in a 16k-token prefill
+# 128x128 takes 3.26 s of expert GEMM against 3.40 s for 64x256.
+_WNA16_BLOCKS: dict[tuple[int, int], list[tuple[int, int, int]]] = {
+    (1280, 2560): [
+        (256, 16, 64),
+        (1024, 32, 64),
+        (2048, 64, 256),
+        (1 << 62, 128, 128),
+    ],
+}
+
+
+def wna16_blocks(num_tokens: int, n: int, k: int) -> tuple[int, int]:
+    for max_tokens, bm, bn in _WNA16_BLOCKS.get((n, k), ()):
+        if num_tokens <= max_tokens:
+            return bm, bn
+    return strix_blocks(num_tokens)
+
+
 # (n, k) -> the fewest rows at which moe_gemm_bf16 beat vLLM's Triton expert
 # GEMM on gfx1151. Rows are tokens for w13 and tokens * top_k for w2; a
 # missing key means "no measured floor", i.e. the strix kernel is taken.
@@ -370,7 +393,21 @@ def _make_wna16_experts_cls():
             num_experts = w1.size(0)
             n, k = w1.size(1), w2.size(1)
             group = int(self.block_shape[1])
-            bm, bn = strix_blocks(num_tokens)
+            if _w4a8_ok(num_tokens, group, n, k):
+                return self._apply_w4a8(
+                    output,
+                    hidden_states,
+                    w1,
+                    w2,
+                    topk_weights,
+                    topk_ids,
+                    activation,
+                    expert_map,
+                    workspace13,
+                    workspace2,
+                    apply_router_weight_on_input,
+                )
+            bm, bn = wna16_blocks(num_tokens, n, w1.size(2) * 2)
             sorted_ids, expert_ids, num_post = moe_align_block_size(
                 topk_ids, bm, num_experts
             )
@@ -418,7 +455,103 @@ def _make_wna16_experts_cls():
                 cache3.view(num_tokens, top_k, k), output, topk_ids, expert_map
             )
 
+        def _apply_w4a8(
+            self,
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation,
+            expert_map,
+            workspace13,
+            workspace2,
+            apply_router_weight_on_input,
+        ):
+            """Prefill: int8 activations (per row and 128-element group) on the
+            iu8 WMMA, see csrc/moe/moe_gemm_w4a8.hip."""
+            num_tokens, top_k = hidden_states.size(0), topk_ids.size(1)
+            n, k = w1.size(1), w2.size(1)
+            bm, bn = 64, 256
+            sorted_ids, expert_ids, num_post = moe_align_block_size(
+                topk_ids, bm, w1.size(0)
+            )
+            slots = num_tokens * top_k
+            qa, sa = _act_quant_i8(hidden_states)
+            cache2 = _resize_cache(workspace13, (slots, n // 2))
+            torch.ops.strix.moe_gemm_w4a8(
+                cache2,
+                qa,
+                sa,
+                w1,
+                self.w1_scale,
+                sorted_ids,
+                expert_ids,
+                num_post,
+                None,
+                top_k,
+                bm,
+                bn,
+                True,
+                activation.value,
+            )
+            qa, sa = _act_quant_i8(cache2)
+            cache3 = _resize_cache(workspace2, (slots, k))
+            weights = (
+                None
+                if apply_router_weight_on_input
+                else topk_weights.reshape(-1).to(torch.float32)
+            )
+            torch.ops.strix.moe_gemm_w4a8(
+                cache3,
+                qa,
+                sa,
+                w2,
+                self.w2_scale,
+                sorted_ids,
+                expert_ids,
+                num_post,
+                weights,
+                1,
+                bm,
+                bn,
+                False,
+                "silu",
+            )
+            self.moe_sum(
+                cache3.view(num_tokens, top_k, k), output, topk_ids, expert_map
+            )
+
     return StrixTritonWNA16Experts
+
+
+# moe_gemm_w4a8 (int8 activations): 1.34x (w13) / 1.19x (w2) over
+# moe_gemm_w4a16 at 16k tokens of Qwen3.8-Flash-Next, quantization included.
+# Teacher-forced top-1 vs the w4a16 path 1820/1820, mean |dlogprob| 0.038
+# (switching w4a16's own weight staging moves it 0.036). STRIX_DISABLE=moe_w4a8
+# turns it off.
+# STRIX_MOE_W4A8_MIN_TOKENS lowers the floor for accuracy runs on short prompts.
+_W4A8_MIN_TOKENS = int(os.environ.get("STRIX_MOE_W4A8_MIN_TOKENS", "1024"))
+
+
+def _w4a8_ok(num_tokens: int, group: int, n: int, k: int) -> bool:
+    return (
+        not disabled("moe_w4a8")
+        and num_tokens >= _W4A8_MIN_TOKENS
+        and group == 128
+        and n % 128 == 0
+        and k % 128 == 0
+    )
+
+
+def _act_quant_i8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    q = torch.empty(x.shape, dtype=torch.int8, device=x.device)
+    sa = torch.empty(
+        (x.size(0), x.size(1) // 128), dtype=torch.float32, device=x.device
+    )
+    torch.ops.strix.moe_act_quant_i8(x, q, sa)
+    return q, sa
 
 
 def _make_int8_experts_cls():

@@ -13,7 +13,14 @@ import re
 from collections import defaultdict
 
 CATEGORIES = [
-    ("moe", r"fused_moe|moe_|topk|_moe_align|count_and_sort"),
+    # Qwen3.8-Flash-Next (qwen4_exp). Ahead of the generic patterns: the
+    # indexer's top_k and the QSA kernels would otherwise land in moe/sampling.
+    ("qsa_indexer", r"_qsa_mqa_paged|top_k_per_row|_expand_qsa"),
+    ("qsa_attn", r"_qsa_sparse|_qsa_merge"),
+    ("qsa_prep", r"_qsa_prepare|_store_qsa|_compress_qsa"),
+    ("hc", r"_hc_|grouped_gemma_rmsnorm"),
+    ("ple", r"ple_|ngram"),
+    ("moe",r"fused_moe|moe_|topk|_moe_align|count_and_sort"),
     # W8A16/W4A16 linears: the mainloop, the activation-quantize pass and the
     # split-K reduce are separate kernels. Which of the three dominates is what
     # decides the next tile change, so they get their own buckets instead of

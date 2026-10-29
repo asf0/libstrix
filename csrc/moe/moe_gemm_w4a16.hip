@@ -20,6 +20,8 @@
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
 
+#include <cstdlib>
+
 #include "../strix_common.h"
 
 namespace strix {
@@ -41,7 +43,13 @@ __device__ __forceinline__ float moe_gate(float g) {
   }
 }
 
-template <int BM, int BN, int WAVES_M, int WAVES_N, int ACT>
+// DEFER (group a multiple of kBK): W is staged as the exact bf16 128 + q with
+// bit operations only, WMMA accumulates one group at a time, and the group's
+// scale is applied in fp32 at its end: acc += s[n] * (raw - 136 * rowsum(A)),
+// the row sums coming from one extra WMMA against a ones fragment. That drops
+// the per-weight convert / multiply / round of the default staging (~30 % of
+// the kernel at Qwen3.8-Flash-Next shapes) and keeps weights unrounded.
+template <int BM, int BN, int WAVES_M, int WAVES_N, int ACT, bool DEFER>
 __global__ __launch_bounds__(WAVES_M* WAVES_N* kWave) void moe_gemm_w4a16_kernel(
     uint16_t* __restrict__ c, const uint16_t* __restrict__ a,
     const uint8_t* __restrict__ w, const uint16_t* __restrict__ scales,
@@ -98,6 +106,20 @@ __global__ __launch_bounds__(WAVES_M* WAVES_N* kWave) void moe_gemm_w4a16_kernel
   stage_b_t rb = {};
   float rs[kLoadsB];
 
+  // Tile row brow -> W row. Fused and-mul: tile rows [0, BN/2) are gate rows
+  // n0/2.., the rest up rows N/2 + n0/2.. (n_half = N/2); otherwise BN
+  // consecutive rows.
+  auto w_row = [&](int brow) -> int64_t {
+    const int64_t base = ACT != kActNone ? n0 / 2 : n0;
+    const bool up = ACT != kActNone && brow >= BN / 2;
+    return base + (up ? int64_t(n_half - BN / 2) : 0) + brow;
+  };
+  auto load_scale = [&](int64_t row, int g) -> float {
+    const uint16_t sraw = scales[s_base + row * lds_n + g];
+    return s_f16 ? __half2float(*reinterpret_cast<const __half*>(&sraw))
+                 : __uint_as_float(uint32_t(sraw) << 16);
+  };
+
   auto load = [&](int k0) {
 #pragma unroll
     for (int i = 0; i < kLoadsA; ++i) {
@@ -120,17 +142,10 @@ __global__ __launch_bounds__(WAVES_M* WAVES_N* kWave) void moe_gemm_w4a16_kernel
       if (ch < kChunksB) {
         const int brow = ch / (kBK / 16);
         const int k16 = (ch % (kBK / 16)) * 16;
-        // Fused and-mul: tile rows [0, BN/2) are gate rows n0/2.., the rest
-        // up rows N/2 + n0/2.. (n_half = N/2); otherwise BN consecutive rows.
-        const int64_t base = ACT != kActNone ? n0 / 2 : n0;
-        const bool up = ACT != kActNone && brow >= BN / 2;
-        const int64_t row =
-            base + (up ? int64_t(n_half - BN / 2) : 0) + brow;
+        const int64_t row = w_row(brow);
         v = *reinterpret_cast<const uint2*>(w + w_base + row * ldw +
                                             (k0 + k16) / 2);
-        const uint16_t sraw = scales[s_base + row * lds_n + (k0 + k16) / group];
-        s = s_f16 ? __half2float(*reinterpret_cast<const __half*>(&sraw))
-                  : __uint_as_float(uint32_t(sraw) << 16);
+        if constexpr (!DEFER) s = load_scale(row, (k0 + k16) / group);
       }
       rb[2 * i] = v.x, rb[2 * i + 1] = v.y;
       rs[i] = s;
@@ -151,6 +166,24 @@ __global__ __launch_bounds__(WAVES_M* WAVES_N* kWave) void moe_gemm_w4a16_kernel
       if (ch < kChunksB) {
         const int brow = ch / (kBK / 16);
         const int k16 = (ch % (kBK / 16)) * 16;
+        uint16_t* dst = s_b + brow * kPitch + k16;
+        if constexpr (DEFER) {
+          // Pair p of word h holds logical k = 8h + 2p (low) and 8h + 2p + 1
+          // (high); 0x4300 | q is exactly 128 + q in bf16.
+          uint32_t pr[8];
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {
+            const uint32_t wd = rb[2 * i + h];
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+              const uint32_t t = wd >> (8 * p);
+              pr[4 * h + p] = (t & 0xFu) | ((t & 0xF0u) << 12) | 0x43004300u;
+            }
+          }
+          *reinterpret_cast<uint4*>(dst) = make_uint4(pr[0], pr[1], pr[2], pr[3]);
+          *reinterpret_cast<uint4*>(dst + 8) = make_uint4(pr[4], pr[5], pr[6], pr[7]);
+          continue;
+        }
         float f[16];
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
@@ -164,7 +197,6 @@ __global__ __launch_bounds__(WAVES_M* WAVES_N* kWave) void moe_gemm_w4a16_kernel
                               pack_bf16x2(f[4], f[5]), pack_bf16x2(f[6], f[7]));
         uint4 hi = make_uint4(pack_bf16x2(f[8], f[9]), pack_bf16x2(f[10], f[11]),
                               pack_bf16x2(f[12], f[13]), pack_bf16x2(f[14], f[15]));
-        uint16_t* dst = s_b + brow * kPitch + k16;
         *reinterpret_cast<uint4*>(dst) = lo;
         *reinterpret_cast<uint4*>(dst + 8) = hi;
       }
@@ -176,6 +208,21 @@ __global__ __launch_bounds__(WAVES_M* WAVES_N* kWave) void moe_gemm_w4a16_kernel
   for (int i = 0; i < FM; ++i)
 #pragma unroll
     for (int j = 0; j < FN; ++j) acc[i][j] = f32x8{};
+  // DEFER: this group's raw sums and the A row sums (the same value in every
+  // column of rsum[i]).
+  f32x8 accg[DEFER ? FM : 1][DEFER ? FN : 1];
+  f32x8 rsum[DEFER ? FM : 1];
+  bf16x16 ones;
+  if constexpr (DEFER) {
+#pragma unroll
+    for (int i = 0; i < FM; ++i) {
+      rsum[i] = f32x8{};
+#pragma unroll
+      for (int j = 0; j < FN; ++j) accg[i][j] = f32x8{};
+    }
+#pragma unroll
+    for (int e = 0; e < 16; ++e) ones[e] = short(0x3F80);  // bf16 1.0
+  }
 
   load(0);
   store();
@@ -196,8 +243,34 @@ __global__ __launch_bounds__(WAVES_M* WAVES_N* kWave) void moe_gemm_w4a16_kernel
       for (int i = 0; i < FM; ++i) {
         const bf16x16 fa =
             load_frag_bf16(sa + (wm * TM + i * 16) * kPitch + kk, kPitch, lane);
+        if constexpr (DEFER) {
+          rsum[i] = wmma_bf16(fa, ones, rsum[i]);
 #pragma unroll
-        for (int j = 0; j < FN; ++j) acc[i][j] = wmma_bf16(fa, fb[j], acc[i][j]);
+          for (int j = 0; j < FN; ++j)
+            accg[i][j] = wmma_bf16(fa, fb[j], accg[i][j]);
+        } else {
+#pragma unroll
+          for (int j = 0; j < FN; ++j)
+            acc[i][j] = wmma_bf16(fa, fb[j], acc[i][j]);
+        }
+      }
+    }
+    if constexpr (DEFER) {
+      if ((k0 + kBK) % group == 0) {
+        const int g = k0 / group;
+#pragma unroll
+        for (int j = 0; j < FN; ++j) {
+          const float sc = load_scale(w_row(wn * TN + j * 16 + acc_col(lane)), g);
+#pragma unroll
+          for (int i = 0; i < FM; ++i) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e)
+              acc[i][j][e] += sc * (accg[i][j][e] - 136.f * rsum[i][e]);
+            accg[i][j] = f32x8{};
+          }
+        }
+#pragma unroll
+        for (int i = 0; i < FM; ++i) rsum[i] = f32x8{};
       }
     }
     __syncthreads();
@@ -282,9 +355,9 @@ struct MoeW4Launch {
   hipStream_t stream;
 };
 
-template <int BM, int BN, int WM, int WN, int ACT>
+template <int BM, int BN, int WM, int WN, int ACT, bool DEFER>
 inline void launch_moe_w4(const MoeW4Launch& m) {
-  moe_gemm_w4a16_kernel<BM, BN, WM, WN, ACT>
+  moe_gemm_w4a16_kernel<BM, BN, WM, WN, ACT, DEFER>
       <<<m.grid, WM * WN * kWave, 0, m.stream>>>(
           m.c, m.a, m.w, m.scales, m.sorted_ids, m.expert_ids,
           m.num_post_padded, m.topk_w, m.num_valid, m.top_k, m.k_dim, m.group,
@@ -376,14 +449,28 @@ void moe_gemm_w4a16(torch::Tensor& c, const torch::Tensor& a,
       int(n / 2),
       grid,
       stream};
-#define STRIX_MOE_W4(BM, BN, WM, WN)                                          \
+  // STRIX_MOE_W4_DEFER=0 keeps the per-weight scaled staging (A/B only).
+  static const bool defer_ok = [] {
+    const char* e = std::getenv("STRIX_MOE_W4_DEFER");
+    return !(e && std::atoi(e) == 0);
+  }();
+  const bool defer = defer_ok && group_size % kBK == 0;
+#define STRIX_MOE_W4_ACT(BM, BN, WM, WN, DF)                                  \
   do {                                                                        \
     if (act == kActNone) {                                                    \
-      launch_moe_w4<BM, BN, WM, WN, kActNone>(m);                             \
+      launch_moe_w4<BM, BN, WM, WN, kActNone, DF>(m);                         \
     } else if (act == kActSilu) {                                             \
-      launch_moe_w4<BM, BN, WM, WN, kActSilu>(m);                             \
+      launch_moe_w4<BM, BN, WM, WN, kActSilu, DF>(m);                         \
     } else {                                                                  \
-      launch_moe_w4<BM, BN, WM, WN, kActGeluTanh>(m);                         \
+      launch_moe_w4<BM, BN, WM, WN, kActGeluTanh, DF>(m);                     \
+    }                                                                         \
+  } while (0)
+#define STRIX_MOE_W4(BM, BN, WM, WN)                                          \
+  do {                                                                        \
+    if (defer) {                                                              \
+      STRIX_MOE_W4_ACT(BM, BN, WM, WN, true);                                 \
+    } else {                                                                  \
+      STRIX_MOE_W4_ACT(BM, BN, WM, WN, false);                                \
     }                                                                         \
   } while (0)
   if (block_m == 16 && block_n == 64) STRIX_MOE_W4(16, 64, 1, 4);
@@ -395,6 +482,7 @@ void moe_gemm_w4a16(torch::Tensor& c, const torch::Tensor& a,
   else if (block_m == 64 && block_n == 256) STRIX_MOE_W4(64, 256, 2, 4);
   else TORCH_CHECK(false, "unsupported block_m/block_n ", block_m, "/", block_n);
 #undef STRIX_MOE_W4
+#undef STRIX_MOE_W4_ACT
 }
 
 }  // namespace strix

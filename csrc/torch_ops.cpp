@@ -25,6 +25,15 @@ void moe_gemm_w4a16(torch::Tensor& c, const torch::Tensor& a,
                     int64_t top_k, int64_t block_m, int64_t block_n,
                     bool silu_mul, c10::string_view activation,
                     int64_t group_size);
+void moe_act_quant_i8(const torch::Tensor& x, torch::Tensor& q, torch::Tensor& sa);
+void moe_gemm_w4a8(torch::Tensor& c, const torch::Tensor& qa,
+                   const torch::Tensor& sa, const torch::Tensor& w,
+                   const torch::Tensor& scales, const torch::Tensor& sorted_ids,
+                   const torch::Tensor& expert_ids,
+                   const torch::Tensor& num_post_padded,
+                   const std::optional<torch::Tensor>& topk_weights,
+                   int64_t top_k, int64_t block_m, int64_t block_n,
+                   bool silu_mul, c10::string_view activation);
 void moe_gemm_w8a16(torch::Tensor& c, const torch::Tensor& a,
                     const torch::Tensor& b, const torch::Tensor& scales,
                     const torch::Tensor& sorted_ids,
@@ -133,6 +142,13 @@ TORCH_LIBRARY(strix, m) {
       "Tensor sorted_ids, Tensor expert_ids, Tensor num_post_padded, "
       "Tensor? topk_weights, int top_k, int block_m, int block_n, "
       "bool silu_mul=False, str activation='silu', int group_size=32) -> ()");
+  // int8 activations per (row, 128-element group) for moe_gemm_w4a8.
+  m.def("moe_act_quant_i8(Tensor x, Tensor(a!) q, Tensor(b!) sa) -> ()");
+  m.def(
+      "moe_gemm_w4a8(Tensor(a!) c, Tensor qa, Tensor sa, Tensor b, Tensor scales, "
+      "Tensor sorted_ids, Tensor expert_ids, Tensor num_post_padded, "
+      "Tensor? topk_weights, int top_k, int block_m, int block_n, "
+      "bool silu_mul=False, str activation='silu') -> ()");
   m.def(
       "moe_gemm_w8a16(Tensor(a!) c, Tensor a, Tensor b, Tensor scales, "
       "Tensor sorted_ids, Tensor expert_ids, Tensor num_post_padded, "
@@ -208,6 +224,8 @@ TORCH_LIBRARY_IMPL(strix, CUDA, m) {
   m.impl("_wmma_bf16_tile", &strix::_wmma_bf16_tile);
   m.impl("moe_gemm_bf16", &strix::moe_gemm_bf16);
   m.impl("moe_gemm_w4a16", &strix::moe_gemm_w4a16);
+  m.impl("moe_act_quant_i8", &strix::moe_act_quant_i8);
+  m.impl("moe_gemm_w4a8", &strix::moe_gemm_w4a8);
   m.impl("moe_gemm_w8a16", &strix::moe_gemm_w8a16);
   m.impl("gdn_chunk_fwd_k128_v128_c64_bf16",
          &strix::gdn_chunk_fwd_k128_v128_c64_bf16);

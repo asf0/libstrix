@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """moe_gemm_w4a16: int4 experts in vLLM's Triton WNA16 layout, gemma-4-26B
-shapes (w13 N=1408 K=2816, w2 N=2816 K=704, group 32)."""
+shapes (w13 N=1408 K=2816, w2 N=2816 K=704, group 32) and Qwen3.8-Flash-Next
+shapes (E=512, top-10, w13 N=1280 K=2560, w2 N=2560 K=640, group 128)."""
 
 import pytest
 import strix
@@ -9,7 +10,13 @@ import torch.nn.functional as F
 
 pytestmark = pytest.mark.skipif(not strix.is_supported_device(), reason="needs gfx1151")
 
-E, TOP_K, GROUP = 128, 8, 32
+# model -> (experts, top_k, group, w13 (n, k), w2 (n, k))
+MODELS = {
+    "gemma": (128, 8, 32, (1408, 2816), (2816, 704)),
+    # 64 of the 512 experts: the fp32 reference of all 512 does not fit the
+    # test memory cap, and the expert count only offsets the weight pointer.
+    "qfn": (64, 10, 128, (1280, 2560), (2560, 640)),
+}
 
 
 def align(topk_ids: torch.Tensor, block_m: int, num_experts: int):
@@ -42,11 +49,16 @@ def pack(q: torch.Tensor) -> torch.Tensor:
 
 
 def dequant(w_u8: torch.Tensor, scales: torch.Tensor, group: int) -> torch.Tensor:
-    """Decode the packed bytes the long way, so a nibble-order bug fails."""
+    """Decode the packed bytes the long way, so a nibble-order bug fails.
+
+    Groups that are a multiple of the kernel's 64-wide K step take its
+    deferred-scale path, which scales fp32 sums instead of bf16-rounded
+    weights; compare those against the exact fp32 weights."""
     q = torch.stack(
         [(w_u8 & 0xF).float() - 8.0, ((w_u8 >> 4) & 0xF).float() - 8.0], dim=-1
     ).reshape(*w_u8.shape[:-1], -1)
-    return (q * scales.float().repeat_interleave(group, dim=-1)).to(torch.bfloat16)
+    w = q * scales.float().repeat_interleave(group, dim=-1)
+    return w if group % 64 == 0 else w.to(torch.bfloat16)
 
 
 def reference(a, b, topk_ids, top_k, weights):
@@ -63,13 +75,17 @@ def reference(a, b, topk_ids, top_k, weights):
 @pytest.mark.parametrize("scale_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("tokens", [1, 5])
 @pytest.mark.parametrize(
-    "block_m,block_n", [(16, 64), (64, 128), (128, 128), (64, 256)]
+    "block_m,block_n", [(16, 64), (32, 64), (64, 128), (128, 128), (64, 256)]
 )
 @pytest.mark.parametrize(
     "gemm,activation", [("w13", "silu"), ("w13", "gelu_tanh"), ("w2", "silu")]
 )
-def test_matches_reference(tokens, block_m, block_n, gemm, activation, scale_dtype):
-    n, k = (1408, 2816) if gemm == "w13" else (2816, 704)
+@pytest.mark.parametrize("model", ["gemma", "qfn"])
+def test_matches_reference(
+    model, tokens, block_m, block_n, gemm, activation, scale_dtype
+):
+    E, TOP_K, GROUP, w13, w2 = MODELS[model]
+    n, k = w13 if gemm == "w13" else w2
     if n % block_n:
         pytest.skip(f"N={n} is not a multiple of block_n={block_n}")
     torch.manual_seed(0)

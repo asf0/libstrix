@@ -67,6 +67,18 @@ def main() -> None:
     p.add_argument("--gpu-memory-utilization", type=float, default=0.75)
     p.add_argument("--enforce-eager", action="store_true")
     p.add_argument("--max-model-len", type=int, default=16384)
+    p.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    p.add_argument(
+        "--attention-backend",
+        default="TRITON_ATTN",
+        help="'' lets vLLM pick (Qwen4-exp QSA layers bring their own kernels)",
+    )
+    p.add_argument(
+        "--engram-disk-offload",
+        action="store_true",
+        help="Qwen3.8-Flash-Next: stream the n-gram table from disk "
+        "(engram_config={'disk_offload': True})",
+    )
     p.add_argument(
         "--kv-cache-dtype",
         default="auto",
@@ -117,14 +129,15 @@ def main() -> None:
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_num_seqs=max(int(b) for b in args.decode_batches.split(",")),
-        max_num_batched_tokens=8192,
+        max_num_batched_tokens=args.max_num_batched_tokens,
         enable_prefix_caching=False,
-        attention_backend="TRITON_ATTN",
+        attention_backend=args.attention_backend or None,
         kv_cache_dtype=args.kv_cache_dtype,
         mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
         # Per-request token timestamps (RequestOutput.metrics) for DECODE lines.
         disable_log_stats=False,
         enforce_eager=args.enforce_eager,
+        **({"engram_config": {"disk_offload": True}} if args.engram_disk_offload else {}),
         speculative_config=(
             {"method": "mtp", "num_speculative_tokens": args.mtp} if args.mtp else None
         ),
