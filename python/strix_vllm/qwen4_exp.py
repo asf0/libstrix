@@ -5,7 +5,7 @@ qsa_union: QSA sparse attention for a single-request prefill on
 strix::qsa_union_attn_bf16.
 
 Groups of 16 consecutive query rows attend over the union of their selected
-tokens (csrc/attn/qsa_union_bf16.hip): 1.39x the RDNA-tuned Triton per-row
+tokens (csrc/attn/qsa_union_bf16.hip): 1.51x the RDNA-tuned Triton per-row
 kernel on a 26k-token prompt's real selections, more as the context grows.
 Everything else (decode, several requests, other shapes, positions past the
 128k union bitmap) keeps vLLM's Triton kernel.

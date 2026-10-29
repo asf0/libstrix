@@ -94,7 +94,7 @@ __global__ __launch_bounds__(T) void qsa_union_build_kernel(
 // VGPRs capped at 192 (8 waves per SIMD), as in attn_prefill_kernel: at the
 // ~250 the compiler picks on its own, one block fills a CU and every barrier
 // bubble stays empty.
-template <int D, int G, int BN, int ROWS>
+template <int D, int G, int BN, int ROWS, typename XT>
 __global__ __launch_bounds__((G / 4) * (ROWS / 4) * (D / 128) * kWave)
 __attribute__((amdgpu_waves_per_eu(8))) void qsa_union_attn_kernel(
     uint16_t* __restrict__ out, const uint16_t* __restrict__ q,
@@ -113,7 +113,9 @@ __attribute__((amdgpu_waves_per_eu(8))) void qsa_union_attn_kernel(
   constexpr int NS = BN / 16;
   __shared__ __attribute__((aligned(16))) uint16_t s_k[BN * kPK];
   __shared__ __attribute__((aligned(16))) uint16_t s_vt[D * kPV];
-  __shared__ float s_x[W * HPB][NS][kWave][8];
+  // Cross-wave partial scores; XT = _Float16 halves the buffer (the partials
+  // are already in the log2 softmax domain, |S| << 65504).
+  __shared__ XT s_x[W * HPB][NS][kWave][8];
   __shared__ uint16_t s_mem[BN];
 
   const int kvh = blockIdx.x, group = blockIdx.y;
@@ -216,7 +218,7 @@ __attribute__((amdgpu_waves_per_eu(8))) void qsa_union_attn_kernel(
 #pragma unroll
     for (int j = 0; j < NS; ++j)
 #pragma unroll
-      for (int e = 0; e < 8; ++e) s_x[wave][j][lane][e] = s[j][e];
+      for (int e = 0; e < 8; ++e) s_x[wave][j][lane][e] = static_cast<XT>(s[j][e]);
     barrier();
 
     // Element e of subtile j is union entry k0 + 16 j + 2 e + hi.
@@ -228,7 +230,8 @@ __attribute__((amdgpu_waves_per_eu(8))) void qsa_union_attn_kernel(
         const int kloc = 16 * j + 2 * e + hi;
         float v = s[j][e];
 #pragma unroll
-        for (int o = 1; o < W; ++o) v += s_x[pair * W + (half + o) % W][j][lane][e];
+        for (int o = 1; o < W; ++o)
+          v += static_cast<float>(s_x[pair * W + (half + o) % W][j][lane][e]);
         const bool seen =
             row_ok && k0 + kloc < n_keys && ((s_mem[kloc] >> r) & 1u);
         s[j][e] = seen ? v : -INFINITY;
@@ -320,8 +323,8 @@ void qsa_union_attn_bf16(torch::Tensor& out, const torch::Tensor& q,
   // Larger groups gather a union that grows slower than their row count
   // (one row's selection x1.75 for 4 rows, x2.34 for 8, x3.38 for 16), and
   // more waves share each staged K/V tile.
-  // 16-row groups: 1.39x the Triton per-row kernel on real 26k-token
-  // selections against 1.34x (8 rows) and 1.22x (4); STRIX_QSA_UNION_ROWS
+  // 16-row groups: 1.51x the Triton per-row kernel on real 26k-token
+  // selections (fp32 partials: 1.39x, 8 rows 1.34x, 4 rows 1.22x); STRIX_QSA_UNION_ROWS
   // picks another for A/B runs.
   static const int rows_per = [] {
     const char* e = std::getenv("STRIX_QSA_UNION_ROWS");
@@ -345,14 +348,11 @@ void qsa_union_attn_bf16(torch::Tensor& out, const torch::Tensor& q,
       ulen.data_ptr<int32_t>(), u_cap, words);
   constexpr int D = 256, G = 12;
   const float scale_log2 = 1.4426950408889634f / 16.f;  // log2(e) / sqrt(256)
-  static const int bn = [] {
-    const char* e = std::getenv("STRIX_QSA_UNION_BN");
-    return e ? std::atoi(e) : 16;
-  }();
-  auto kernel = rows_per == 4    ? qsa_union_attn_kernel<D, G, 16, 4>
-                : rows_per == 16 ? qsa_union_attn_kernel<D, G, 16, 16>
-                : bn == 32       ? qsa_union_attn_kernel<D, G, 32, 8>
-                                 : qsa_union_attn_kernel<D, G, 16, 8>;
+  // fp16 cross-wave partials: 67 vs 73 ms on the 26k-token selections; 32-key
+  // steps and float partials were slower at every group size.
+  auto kernel = rows_per == 4   ? qsa_union_attn_kernel<D, G, 16, 4, _Float16>
+                : rows_per == 8 ? qsa_union_attn_kernel<D, G, 16, 8, _Float16>
+                                : qsa_union_attn_kernel<D, G, 16, 16, _Float16>;
   kernel<<<dim3(hkv, groups), (G / 4) * (rows_per / 4) * (D / 128) * kWave, 0, stream>>>(
           reinterpret_cast<uint16_t*>(out.data_ptr()),
           reinterpret_cast<const uint16_t*>(q.data_ptr()),
