@@ -27,7 +27,7 @@ import os
 
 import torch
 
-from strix_vllm import disabled
+from strix_vllm import disabled, model_gate
 
 ROW_PAD = 64  # elements; (K + 64) * 2 bytes has a small power-of-two factor
 
@@ -279,6 +279,11 @@ def _make_wna16_experts_cls():
     _FUSED = (MoEActivation.SILU, MoEActivation.GELU_TANH)
 
     class StrixTritonWNA16Experts(TritonWNA16Experts):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Built while vLLM's config names the model; see ARCH_GATED.
+            self._strix_w4a8 = model_gate("moe_w4a8")
+
         def _strix_ok(
             self, hidden_states, w1, w2, activation, expert_map, a1q_scale, a2_scale
         ):
@@ -393,7 +398,7 @@ def _make_wna16_experts_cls():
             num_experts = w1.size(0)
             n, k = w1.size(1), w2.size(1)
             group = int(self.block_shape[1])
-            if _w4a8_ok(num_tokens, group, n, k):
+            if self._strix_w4a8 and _w4a8_ok(num_tokens, group, n, k):
                 return self._apply_w4a8(
                     output,
                     hidden_states,
@@ -529,8 +534,9 @@ def _make_wna16_experts_cls():
 # moe_gemm_w4a8 (int8 activations): 1.34x (w13) / 1.19x (w2) over
 # moe_gemm_w4a16 at 16k tokens of Qwen3.8-Flash-Next, quantization included.
 # Teacher-forced top-1 vs the w4a16 path 1820/1820, mean |dlogprob| 0.038
-# (switching w4a16's own weight staging moves it 0.036). STRIX_DISABLE=moe_w4a8
-# turns it off.
+# (switching w4a16's own weight staging moves it 0.036). Measured there only,
+# so it is on for that architecture alone (strix_vllm.ARCH_GATED);
+# STRIX_ENABLE=moe_w4a8 tries it elsewhere, STRIX_DISABLE=moe_w4a8 turns it off.
 # STRIX_MOE_W4A8_MIN_TOKENS lowers the floor for accuracy runs on short prompts.
 _W4A8_MIN_TOKENS = int(os.environ.get("STRIX_MOE_W4A8_MIN_TOKENS", "1024"))
 

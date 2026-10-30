@@ -38,6 +38,13 @@ Installing the package registers the `vllm.general_plugins` entry point
 does. `STRIX_DISABLE=all`, or a comma-separated list of the names below, keeps
 vLLM's own kernels for A/B runs.
 
+`dense_w8` and `moe_w4a8` change numerics or memory and were measured on
+Qwen3.8-Flash-Next only, so they turn on for that architecture
+(`Qwen4Exp*`) alone and log `libstrix: <op> on/off for <arch>` at load.
+`STRIX_ENABLE=dense_w8,moe_w4a8` turns them on for another model;
+`STRIX_DISABLE` still wins. `dense_w8` stops adding int8 copies at
+`STRIX_DENSE_W8_MAX_GB` (default 12).
+
 | `STRIX_DISABLE` name | kernel | replaces | when |
 | --- | --- | --- | --- |
 | `rms_norm_gated` | `gdn_gated_rmsnorm_h128_bf16` | `RMSNormGated` (GDN output norm) | bf16, 128 channels |
@@ -63,9 +70,9 @@ vLLM's own kernels for A/B runs.
 
 Some swaps live in code that `torch.compile` traces. vLLM keys its compile
 caches on its own env vars and config only, so the plugin adds
-`STRIX_VLLM_CACHE_KEY` (a digest of `STRIX_DISABLE` plus the plugin source) to
-vLLM's cache key; without it, a graph traced with the plugin off could be
-replayed with it on.
+`STRIX_VLLM_CACHE_KEY` (a digest of `STRIX_DISABLE`, `STRIX_ENABLE` and the
+plugin source) to vLLM's cache key; without it, a graph traced with the plugin
+off could be replayed with it on.
 
 ### The kernel table
 

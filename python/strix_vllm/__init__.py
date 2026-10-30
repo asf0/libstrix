@@ -15,13 +15,64 @@ _registered = False
 CACHE_FACTOR = "STRIX_VLLM_CACHE_KEY"
 
 
+def _env_names(var: str) -> set[str]:
+    return {s.strip() for s in os.environ.get(var, "").split(",") if s.strip()}
+
+
 def disabled(op: str) -> bool:
-    names = {s.strip() for s in os.environ.get("STRIX_DISABLE", "").split(",")}
+    names = _env_names("STRIX_DISABLE")
     return "all" in names or op in names
 
 
+# Swaps that were measured (speed and accuracy) on one model family only.
+# They change numerics or memory, so elsewhere they stay off unless
+# STRIX_ENABLE names them: tuning them for one model cannot change another.
+ARCH_GATED = {
+    # int8 decode copies of bf16 linears: +50 % of the dense weight memory.
+    "dense_w8": ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM"),
+    # int8 activations in the int4 MoE GEMM.
+    "moe_w4a8": ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM"),
+}
+
+
+def _model_architectures() -> list[str]:
+    """Architectures of the model being loaded; [] outside a vLLM config."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    model_config = getattr(config, "model_config", None)
+    if model_config is None:
+        return []
+    archs = list(getattr(model_config.hf_config, "architectures", None) or [])
+    try:
+        archs.append(model_config.architecture)
+    except Exception:
+        pass
+    return archs
+
+
+def model_gate(op: str) -> bool:
+    """Whether an ARCH_GATED swap applies to the model being loaded."""
+    if disabled(op):
+        return False
+    if op in _env_names("STRIX_ENABLE"):
+        return True
+    archs = _model_architectures()
+    on = any(a in ARCH_GATED[op] for a in archs)
+    from vllm.logger import init_logger
+
+    init_logger(f"vllm.{__name__}").info_once(
+        "libstrix: %s %s for %s%s",
+        op,
+        "on" if on else "off",
+        archs[0] if archs else "unknown model",
+        "" if on else f" (not measured there; STRIX_ENABLE={op} to try it)",
+    )
+    return on
+
+
 def _cache_factor() -> str:
-    """STRIX_DISABLE plus a digest of the plugin's Python source.
+    """STRIX_DISABLE, STRIX_ENABLE and a digest of the plugin's Python source.
 
     Some swaps (OOT norm, W8A16 apply, GEMM wrapper) live in code that
     torch.compile traces, and vLLM keys its compile caches on its own env vars
@@ -29,6 +80,7 @@ def _cache_factor() -> str:
     older plugin) is replayed with it on.
     """
     h = hashlib.sha256(os.environ.get("STRIX_DISABLE", "").encode())
+    h.update(os.environ.get("STRIX_ENABLE", "").encode())
     for f in sorted(Path(__file__).parent.glob("*.py")):
         h.update(f.read_bytes())
     return h.hexdigest()[:16]

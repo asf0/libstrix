@@ -22,16 +22,23 @@ symmetric int4 (RTN, group 128) copy instead, on vLLM's skinny int4 GEMV; the
 LM head and other K stay int8. Plain RTN costs accuracy on Qwen3.8-Flash-Next:
 GSM8K 100q 84 vs 92 (bf16) / 93 (int8 copies) - it would need calibrated
 (AWQ/GPTQ) weights to be usable.
+
+Measured on Qwen3.8-Flash-Next only, so it is on for that architecture alone
+(strix_vllm.ARCH_GATED); STRIX_ENABLE=dense_w8 tries it on another model. The
+copies stop at STRIX_DENSE_W8_MAX_GB (default 12, about 4.5 GB on QFN): on a
+bf16 dense model they would otherwise add half the checkpoint (~27 GB on
+Qwen3.8-27B), and the layers past the budget keep bf16 only.
 """
 
 import os
 
 import torch
 
-from strix_vllm import disabled
+from strix_vllm import disabled, model_gate
 from strix_vllm.linear import MAX_SKINNY_BATCH_SIZE, _pack_w8_rows
 
 _GROUP = 128
+_MAX_BYTES = float(os.environ.get("STRIX_DENSE_W8_MAX_GB", "12")) * 2**30
 # weight.data_ptr() -> (w_q, w_s, group, cu_count) for every converted layer.
 _BY_WEIGHT: dict[int, tuple] = {}
 
@@ -140,9 +147,14 @@ def register() -> None:
             fake_impl=_fake4,
         )
     stats = {"layers": 0, "bytes": 0}
-    logger.info_once("libstrix: dense_w8 int8 decode copies of bf16 linears + LM head")
+    # Decided at the first layer, while vLLM's config names the model.
+    gate: dict[str, bool] = {}
 
     def convert(layer: torch.nn.Module, allow_w4: bool = True) -> None:
+        if "on" not in gate:
+            gate["on"] = model_gate("dense_w8")
+        if not gate["on"]:
+            return
         w = getattr(layer, "weight", None)
         if (
             w is None
@@ -152,6 +164,13 @@ def register() -> None:
             or w.size(1) % 16
             or w.size(0) < 16
         ):
+            return
+        if stats["bytes"] + w.numel() > _MAX_BYTES:
+            logger.warning_once(
+                "libstrix: dense_w8 reached STRIX_DENSE_W8_MAX_GB=%.0f; "
+                "further layers keep bf16 only",
+                _MAX_BYTES / 2**30,
+            )
             return
         cu = num_compute_units()
         x = torch.randn(1, w.size(1), device=w.device, dtype=w.dtype)
