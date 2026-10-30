@@ -1,0 +1,24 @@
+# gemma-4-26B-A4B bf16.
+# Text only (--language-model-only), as measured in docs/performance.md; the
+# MXFP4 checkpoint's vision tower does not load in vLLM.
+#
+#   docker compose -f gemma-4-26b-a4b-it.yaml up -d
+#
+# Overrides go in .env (see .env.example) or the shell.
+services:
+  gemma-4-26b-a4b-it:
+    extends:
+      file: common.yaml
+      service: strix
+    environment:
+      MTP: ${MTP:-0}
+      HF_REPO: google/gemma-4-26B-A4B-it
+    command:
+      - /models/gemma-4-26B-A4B-it
+      - --language-model-only
+      - --attention-backend=TRITON_ATTN
+      - --kv-cache-dtype=int8_per_token_head
+      - --gpu-memory-utilization=${GPU_UTIL:-0.85}
+      - --max-model-len=${MAX_MODEL_LEN:-131072}
+      - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-8192}
+      - --max-num-seqs=${MAX_NUM_SEQS:-16}

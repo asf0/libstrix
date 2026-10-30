@@ -1,0 +1,9 @@
+build/
+profiles/
+docker/recipes/.env
+docker/recipes/cache/
+docker/recipes/models/
+**/__pycache__
+**/*.so
+NOTES.md
+docs/handoff.md

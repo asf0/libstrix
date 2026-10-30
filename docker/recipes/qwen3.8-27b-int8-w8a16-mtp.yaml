@@ -1,0 +1,25 @@
+# Qwen3.8-27B INT8 W8A16 with its MTP head: the docs/performance.md serving
+# config (MTP 2, 40 sequences, 131k, int8 KV), with RecoverSSM
+# (--use-replayssm) so MTP keeps one GDN state per request.
+#
+#   docker compose -f qwen3.8-27b-int8-w8a16-mtp.yaml up -d
+#
+# Overrides go in .env (see .env.example) or the shell.
+services:
+  qwen3.8-27b-int8-w8a16-mtp:
+    extends:
+      file: common.yaml
+      service: strix
+    environment:
+      MTP: ${MTP:-2}
+      REPLAYSSM: ${REPLAYSSM:-1}
+      HF_REPO: lued/Qwen3.8-27B-INT8-W8A16-MTP
+    command:
+      - /models/Qwen3.8-27B-INT8-W8A16-MTP
+      - --language-model-only
+      - --attention-backend=TRITON_ATTN
+      - --kv-cache-dtype=int8_per_token_head
+      - --gpu-memory-utilization=${GPU_UTIL:-0.85}
+      - --max-model-len=${MAX_MODEL_LEN:-131072}
+      - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-8192}
+      - --max-num-seqs=${MAX_NUM_SEQS:-40}

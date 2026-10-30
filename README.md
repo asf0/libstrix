@@ -31,6 +31,90 @@ pip install --no-deps --no-build-isolation -e .
 overrides the target architecture (default `gfx1151`) and `MAX_JOBS` the build
 parallelism (default 8).
 
+## Docker
+
+`ghcr.io/asf0/strix-vllm` bundles the [strix-vllm](https://github.com/asf0/strix-vllm)
+fork (branch `gfx1151`), this plugin and ROCm 10.1 on Ubuntu 26.04 / Python 3.14.
+Nothing to build. `docker/recipes/` has one compose file per tested model.
+
+### Host setup (once)
+
+The image cannot set these; they belong to the host kernel.
+
+- **GPU memory.** By default the iGPU can map only part of the 128 GB, and
+  every recipe asks for 85 % of it. Raise the cap on the kernel command line,
+  but not to all of RAM: GPU memory is host memory the kernel cannot reclaim,
+  so a cap near the total lets one run take the whole machine down. The
+  recipes were tested with a 117 GiB cap (`amdgpu.gttsize` in MiB,
+  `ttm.pages_limit` in 4 KiB pages). `amd_iommu=off` is also recommended:
+  every number in this README was measured with it. On Ubuntu:
+
+  ```sh
+  sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="/&amdgpu.gttsize=120000 ttm.pages_limit=30720000 amd_iommu=off /' /etc/default/grub
+  sudo update-grub && sudo reboot
+  cat /sys/class/drm/card*/device/mem_info_gtt_total   # ~117 GiB afterwards
+  ```
+
+- **BIOS.** Keep the dedicated VRAM (UMA frame buffer) small, e.g. 2 GB; the
+  GPU uses the shared memory above, so a large carve-out only takes it away.
+- **Docker** with Compose v2 (`docker.io docker-compose-v2` on Ubuntu). The
+  amdgpu kernel driver must expose `/dev/kfd` and `/dev/dri`; no ROCm install is
+  needed on the host.
+
+### Running a model
+
+```sh
+git clone https://github.com/asf0/libstrix && cd libstrix/docker/recipes
+cp .env.example .env              # set MODELS=/path/to/your/models
+docker compose -f qwen3.8-flash-next.yaml up -d
+docker compose -f qwen3.8-flash-next.yaml logs -f   # first start compiles: minutes
+curl localhost:8000/v1/models
+```
+
+Each recipe serves `/models/<folder>` and downloads the model's Hugging Face
+repo into `CACHE` when the folder is missing (gated repos such as gemma-4 need
+`HF_TOKEN` in `.env`). Run one model at a time; each takes most of the 128 GB.
+
+Memory at the default `GPU_UTIL=0.85`, from each recipe's startup log: the
+weights, the KV cache left after them, and how many full 131k-token requests
+that cache holds at once.
+
+| recipe | model | weights | KV cache | KV tokens | 131k requests |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `qwen3.8-flash-next` | wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 (n-gram table streamed from disk, MTP 2) | 79.5 GiB | 12.3 GiB | 413,911 | 3.2 |
+| `qwen3.6-35b-a3b` | Qwen/Qwen3.6-35B-A3B (MTP 2) | 70.1 GiB | 21.9 GiB | 1,692,198 | 12.9 |
+| `qwen3.6-35b-a3b-int8-w8a8` | Avesed/Qwen3.6-35B-A3B-INT8-W8A8 (MTP 2) | 36.6 GiB | 55.3 GiB | 4,270,599 | 32.6 |
+| `qwen3.8-27b` | Qwen/Qwen3.8-27B (MTP 2) | 52.3 GiB | 45.1 GiB | 1,190,074 | 9.1 |
+| `qwen3.8-27b-int8-w8a16-mtp` | lued/Qwen3.8-27B-INT8-W8A16-MTP (MTP 2, 40 sequences) | 29.6 GiB | 66.6 GiB | 1,759,045 | 13.4 |
+| `qwen3.8-27b-quark-awq-int4-w4a16` | amd/Qwen3.8-27B-Quark-AWQ-INT4-W4A16 | 16.8 GiB | 80.5 GiB | 2,408,267 | 18.4 |
+| `qwen3.8-27b-quark-awq-mxfp4` | amd/Qwen3.8-27B-Quark-AWQ-MXFP4 (not benchmarked) | 17.0 GiB | 80.8 GiB | 2,419,790 | 18.5 |
+| `lfm2.5-24b-a2b` | LiquidAI/LFM2.5-24B-A2B | 46.2 GiB | 52.4 GiB | 5,170,005 | 39.4 |
+| `gemma-4-26b-a4b-it` | google/gemma-4-26B-A4B-it | 49.5 GiB | 48.6 GiB | 1,506,660 | 11.5 |
+| `gemma-4-26b-a4b-it-awq-4bit` | cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit | 15.6 GiB | 82.1 GiB | 2,546,720 | 19.4 |
+| `gemma-4-31b-it-mxfp4` | amd/gemma-4-31B-it-MXFP4 | 17.8 GiB | 79.9 GiB | 619,182 | 4.7 |
+| `gemma-4-31b-it-qat-w4a16-ct` | google/gemma-4-31B-it-qat-w4a16-ct | 18.8 GiB | 75.1 GiB | 581,841 | 4.4 |
+
+Overrides go in `.env` or the shell: `GPU_UTIL` (default 0.85), `MAX_MODEL_LEN`,
+`MAX_NUM_SEQS`, `MAX_BATCHED_TOKENS`, `MTP` (draft tokens, `0` = off),
+`REPLAYSSM` (`1` keeps one GDN state per request under MTP; on in the Qwen
+GDN recipes that use MTP), `SERVED_MODEL_NAME`, `STRIX_DISABLE`,
+`STRIX_ENABLE` (see [Using it with vLLM](#using-it-with-vllm)), `HF_TOKEN`,
+`PORT`, and `EXTRA_ARGS` (appended to `vllm serve`). `CACHE` keeps the compile
+caches, so later starts skip recompiling; the container runs as root, so
+removing it needs `sudo`.
+
+A run that asks for more memory than the machine has does not fail cleanly
+here: the kernel OOM-kills the host. The entrypoint therefore stops vLLM (exit
+137) when host `MemAvailable` drops below `STRIX_MIN_AVAIL_GB` (default 10) or
+when less than `STRIX_MIN_GPU_FREE_GB` (default 14) of the GPU cap is left;
+the driver fails a few GB before the cap, while `MemAvailable` still looks
+fine. `0` turns a check off. Every recipe passed both checks at 0.85 with the
+117 GiB cap above.
+
+To build the image yourself (about 40 minutes, mostly vLLM's C++):
+`docker/build-and-push.sh` (or `docker build -f docker/Dockerfile .` from the
+repo root).
+
 ## Using it with vLLM
 
 Installing the package registers the `vllm.general_plugins` entry point
@@ -115,8 +199,11 @@ vllm serve /path/to/Qwen3.8-Flash-Next-AWQ-W4A16 \
   --speculative-config '{"method": "mtp", "num_speculative_tokens": 2}'
 ```
 
-- `--gpu-memory-utilization 0.80` leaves page cache for the table rows. A
-  lower setting prefills slower; a higher one leaves too little host memory.
+- `--gpu-memory-utilization 0.80` (the measured numbers) leaves page cache
+  for the table rows; a lower setting prefills slower. 0.85 (the Docker
+  recipe, 414k tokens of KV) and 0.88 (531k) prefill and decode at the same
+  speed, but 0.88 leaves only about 11 GiB of host memory free, 1 GiB above
+  the container's guard.
 - 16k prefill chunks are the measured best; 32k is not faster.
 - MTP 2 costs about 4 % prefill and more than doubles decode (18 -> 40-43
   tok/s on real text). Drop `--speculative-config` for prefill-only work.

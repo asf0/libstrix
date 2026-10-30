@@ -1,0 +1,33 @@
+# Shared by every recipe in this folder (pulled in with `extends`).
+services:
+  strix:
+    image: ${IMAGE:-ghcr.io/asf0/strix-vllm:latest}
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    ipc: host
+    security_opt:
+      - seccomp=unconfined
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      - ${MODELS:-./models}:/models:ro
+      - ${CACHE:-./cache}:/cache
+    environment:
+      MTP: ${MTP:-0}
+      SERVED_MODEL_NAME: ${SERVED_MODEL_NAME:-}
+      STRIX_DISABLE: ${STRIX_DISABLE:-}
+      STRIX_ENABLE: ${STRIX_ENABLE:-}
+      EXTRA_ARGS: ${EXTRA_ARGS:-}
+      REPLAYSSM: ${REPLAYSSM:-0}
+      # Gated repos (gemma-4) need it when a model is downloaded, not mounted.
+      HF_TOKEN: ${HF_TOKEN:-}
+      # The entrypoint stops vLLM below this much free host RAM, or this much
+      # free GPU memory cap (0 = off); see entrypoint.sh.
+      STRIX_MIN_AVAIL_GB: ${STRIX_MIN_AVAIL_GB:-10}
+      STRIX_MIN_GPU_FREE_GB: ${STRIX_MIN_GPU_FREE_GB:-14}
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 1800s

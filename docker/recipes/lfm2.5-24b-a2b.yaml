@@ -1,0 +1,21 @@
+# LFM2.5-24B-A2B. Context caps at 131,072.
+#
+#   docker compose -f lfm2.5-24b-a2b.yaml up -d
+#
+# Overrides go in .env (see .env.example) or the shell.
+services:
+  lfm2.5-24b-a2b:
+    extends:
+      file: common.yaml
+      service: strix
+    environment:
+      MTP: ${MTP:-0}
+      HF_REPO: LiquidAI/LFM2.5-24B-A2B
+    command:
+      - /models/LFM2.5-24B-A2B
+      - --attention-backend=TRITON_ATTN
+      - --kv-cache-dtype=int8_per_token_head
+      - --gpu-memory-utilization=${GPU_UTIL:-0.85}
+      - --max-model-len=${MAX_MODEL_LEN:-131072}
+      - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-8192}
+      - --max-num-seqs=${MAX_NUM_SEQS:-16}

@@ -7,6 +7,11 @@ profiles/
 .rocprofv3/
 /.claude/
 
+# docker/recipes: local settings (HF_TOKEN) and the default cache/model dirs
+docker/recipes/.env
+docker/recipes/cache/
+docker/recipes/models/
+
 # Local working notes, not published
 NOTES.md
 docs/handoff.md

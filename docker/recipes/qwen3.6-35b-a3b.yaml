@@ -1,0 +1,23 @@
+# Qwen3.6-35B-A3B bf16. MTP 2 by default (its MTP head); MTP=0 turns it off.
+#
+#   docker compose -f qwen3.6-35b-a3b.yaml up -d
+#
+# Overrides go in .env (see .env.example) or the shell.
+services:
+  qwen3.6-35b-a3b:
+    extends:
+      file: common.yaml
+      service: strix
+    environment:
+      MTP: ${MTP:-2}
+      REPLAYSSM: ${REPLAYSSM:-1}
+      HF_REPO: Qwen/Qwen3.6-35B-A3B
+    command:
+      - /models/Qwen3.6-35B-A3B
+      - --language-model-only
+      - --attention-backend=TRITON_ATTN
+      - --kv-cache-dtype=int8_per_token_head
+      - --gpu-memory-utilization=${GPU_UTIL:-0.85}
+      - --max-model-len=${MAX_MODEL_LEN:-131072}
+      - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-8192}
+      - --max-num-seqs=${MAX_NUM_SEQS:-16}

@@ -1,0 +1,26 @@
+# Qwen3.8-Flash-Next AWQ W4A16 (169 GB). The 102 GB n-gram table streams from
+# disk; 16k chunks, MTP 2. gmu 0.85 (~100 GiB): ~414k tokens of KV; the
+# rest of RAM stays page cache for the table rows. QSA
+# layers bring their own attention. Keep gdn_conv enabled in STRIX_DISABLE:
+# stock vLLM's conv fails on this model.
+#
+#   docker compose -f qwen3.8-flash-next.yaml up -d
+#
+# Overrides go in .env (see .env.example) or the shell.
+services:
+  qwen3.8-flash-next:
+    extends:
+      file: common.yaml
+      service: strix
+    environment:
+      MTP: ${MTP:-2}
+      HF_REPO: wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16
+    command:
+      - /models/Qwen3.8-Flash-Next-AWQ-W4A16
+      - '--engram-config={"disk_offload": true}'
+      - --language-model-only
+      - --gpu-memory-utilization=${GPU_UTIL:-0.85}
+      - --max-model-len=${MAX_MODEL_LEN:-131072}
+      - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-16384}
+      - --max-num-seqs=${MAX_NUM_SEQS:-4}
+      - --no-enable-prefix-caching
