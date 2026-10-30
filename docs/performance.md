@@ -27,11 +27,16 @@ strix over stock; the last two columns are strix's own throughput.
 | gemma-4-26B-A4B AWQ 4-bit | 3.87× | 28.2× | 1.36× | 4.28× | 1,499 / 29.6 |
 | gemma-4-31B MXFP4 ² | 2.67× | 21.0× | 6.21× | 6.99× | 296 / 7.3 |
 | gemma-4-31B qat W4A16 | 2.99× | 22.5× | 1.32× | 2.99× | 292 / 8.0 |
+| Qwen3.8-Flash-Next AWQ W4A16 ³ | 1.76× | 2.01× | 1.89× | 1.58× | 1,635 / 25.1 |
 
 ¹ LFM2.5 caps context at 131,072; its deep point is 130,048.
 ² Stock vLLM runs MXFP4 as fp4 × fp4 emulation on this GPU; strix runs it as
 fp4 weights × bf16 activations. The ratio is against a slow path, not a
 tuned one.
+³ Measured differently from the other rows; see
+[Qwen3.8-Flash-Next](#qwen38-flash-next-awq-w4a16) below. In short: bf16 KV,
+16k prefill chunks, the n-gram table streamed from disk, and a baseline that
+keeps the libstrix GDN causal conv.
 
 What it means:
 
@@ -63,6 +68,7 @@ memory at that depth). The 27B bf16 checkpoint does not fit 256k.
 | gemma-4-26B-A4B AWQ | 3,358 / 2,769 / 1,499 / 934 | 38.2 / 35.6 / 29.6 / 24.1 |
 | gemma-4-31B MXFP4 | 542 / 462 / 296 / 200 | 9.7 / 8.9 / 7.3 / 5.9 |
 | gemma-4-31B qat W4A16 | 535 / 452 / 292 / 198 | 10.8 / 10.0 / 8.1 / 6.4 |
+| Qwen3.8-Flash-Next AWQ ³ | 1,422 / 1,644 / 1,635 / - | 24.7 / 25.4 / 25.1 / - |
 
 Decode here is without speculation; the 27B checkpoint's MTP head is not
 used in these runs.
@@ -88,6 +94,12 @@ sequences on head 256 / GQA 8, stock Triton above that).
 | gemma-4-26B-A4B-it-AWQ-4bit | int8 | 56 → **99** (1.77×) | 43 → **86** (1.99×) | 100 → **230** (2.29×) | 78 → **225** (2.89×) |
 | gemma-4-31B-it-MXFP4 | int8 | 6 → **29** (5.19×) | 5 → **28** (5.46×) | 14 → **92** (6.43×) | 12 → **83** (6.81×) |
 | gemma-4-31B-it-qat-w4a16-ct | int8 | 21 → **39** (1.84×) | 15 → **37** (2.38×) | 22 → **104** (4.72×) | 17 → **93** (5.45×) |
+| Qwen3.8-Flash-Next-AWQ-W4A16 ³ | bf16 | 37 → **44** (1.18×) | 32 → **40** (1.26×) | 81 → **96** (1.18×) | 78 → **90** (1.16×) |
+
+On Qwen3.8-Flash-Next, `dense_w8` (int8 decode copies) applies only up to 5
+rows, and decode attention (QSA) and the GDN recurrence stay on vLLM's
+kernels without MTP. The batched gain is therefore small, unlike the
+single-stream decode gain (1.6-1.9×).
 
 ## Serving
 
@@ -134,12 +146,20 @@ the same argmax. PPL deltas are only comparable within a row.
 | | 32k | 53.1% | 51.81 → 29.45 | 1.58 | 5.84 |
 | gemma-4-31B qat W4A16 | 2k | 92.0% | 14.78 → 14.94 | 0.028 | 0.091 |
 | | 32k | 95.9% | 12.93 → 13.21 | 0.0062 | 0.020 |
+| Qwen3.8-Flash-Next AWQ ³ | 2k | 96.9% | 1.670 → 1.670 | 0.019 | 0.095 |
+| | 32k | 96.8% | 3.056 → 3.074 | 0.0091 | 0.037 |
+| | 128k | 98.1% | 2.442 → 2.443 | 0.0078 | 0.029 |
 
 Reading it:
 
-- **Qwen is at the noise floor.** Two stock runs of the 27B INT8 differ by
+- **Qwen3.6 and Qwen3.8-27B are at the noise floor.** Two stock runs of the 27B INT8 differ by
   0.0006 on their own; every Qwen row is within a few times that, with
   97-99% top-1 agreement at every depth.
+- **Qwen3.8-Flash-Next** (0.008-0.019) is above the 27B floor. Its MoE GEMM
+  quantizes activations to int8 per 128-group (`moe_w4a8`), which is a different
+  arithmetic, not a bf16 reordering. Perplexity is unchanged at 2k and 128k
+  and 0.6% higher at 32k. The reference is near-stock
+  (every kernel off but `gdn_conv`; see footnote ³).
 - **LFM2.5** (0.02-0.03) is a real, small difference owned by attention.
 - **gemma-4-26B** (0.2-0.3) is real but not a kernel defect. The plugin's
   attention is within 2-4 bf16 ulp of an fp32 reference at every context
@@ -426,3 +446,46 @@ decode tok/s
 | 65,536 | 4.97 | 8.11 | 1.63x | 3.09 | 9.22 | 2.99x |
 | 131,072 | - | 6.61 | - | - | 8.05 | - |
 | 261,120 | - | - | - | - | 6.41 | - |
+
+### Qwen3.8-Flash-Next-AWQ-W4A16
+
+Measured on the [strix-vllm](https://github.com/asf0/strix-vllm) fork rather
+than unpatched upstream: only the fork streams the 102 GB n-gram table from
+disk (`engram_config={"disk_offload": true}`). Without that, the table does
+not fit in 128 GB alongside the model. Other differences from the method
+above: bf16 KV, 16,384-token prefill chunks (the served setting), and
+TunableOp on with a hipBLASLt solution file tuned for the 16k-row GEMMs.
+
+"stock" here is every libstrix kernel off except `gdn_conv`. With stock vLLM's
+GDN causal conv, the engine fails at startup: the next n-gram lookup reads
+out-of-range ids. This happens at 8k and at 16k chunks. Strix's own conv is
+a small part of the prefill step, so the ratios are close to plugin-off.
+
+prefill tok/s
+
+| depth | stock | strix | x | strix + MTP 2 |
+| ---: | ---: | ---: | ---: | ---: |
+| 2,048 | 807 | 1,422 | 1.76x | 1,361 |
+| 8,192 | 792 | 1,602 | 2.02x | 1,301 |
+| 16,384 | 889 | 1,124 ⁴ | 1.26x | 1,526 |
+| 32,768 | 819 | 1,644 | 2.01x | 1,574 |
+| 65,536 | 827 | 1,661 | 2.01x | 1,582 |
+| 131,072 | 827 | 1,635 | 1.98x | 1,492 |
+
+decode tok/s
+
+| depth | stock | strix | x | strix + MTP 2 ⁵ |
+| ---: | ---: | ---: | ---: | ---: |
+| 2,048 | 13.11 | 24.73 | 1.89x | 33.3 |
+| 8,192 | 13.99 | 25.43 | 1.82x | 30.9 |
+| 16,384 | 15.54 | 26.66 | 1.72x | 32.3 |
+| 32,768 | 14.36 | 25.36 | 1.77x | 33.0 |
+| 65,536 | 16.54 | 26.12 | 1.58x | 51.4 |
+| 131,072 | 14.35 | 25.06 | 1.75x | 35.8 |
+
+⁴ Reproducible: in a fresh engine, the first 16k request takes 11.0 s
+(1,490 tok/s) and the second, the one reported, takes 14.6 s. No other depth
+shows this.
+⁵ Random-token prompts, so MTP acceptance is low and varies from request to
+request. On real text (the vLLM docs), MTP 2 decodes at 40–43 tok/s, with
+prefill of 1,539 / 1,617 / 1,572 tok/s at 5.6k / 26.9k / 100.5k.

@@ -55,6 +55,11 @@ vLLM's own kernels for A/B runs.
 | `w8a8` | `w8a8_wmma_gemm` | compressed-tensors W8A8 int8 linears (`Int8ScaledMMLinearKernel`, first in the ROCm int8 list) | int8 per-channel weights, dynamic per-token activations (quantized per 128-group inside the op), symmetric, K % 128 == 0 |
 | `w4a16` | `w4a8_wmma_gemm` (M > 5), `w4a16_wmma_gemm` (g32, M > 128), vLLM's `wvSplitK_int4_g` (M <= 5) | `RDNAHybridW4A16LinearKernel` prefill (Triton) for symmetric int4 | uint4b8, group 128 / 32 / per-channel, K % 128 == 0; vLLM's packed layout, no extra weight copy |
 | `mxfp4` | `mxfp4_gemv` (M <= 2), `mxfp4_wmma_gemm` | `EmulationMxfp4LinearKernel` for Quark MXFP4 linears | fp4 weights + e8m0 scales used in place, bf16 activations (W4A16), K % 128 == 0 |
+| `moe_w4a8` | `moe_gemm_w4a8` + `moe_act_quant_i8` | takes over the WNA16 expert GEMMs from `moe_w4a16` for batch >= 1024 tokens: int8 activations per (row, 128-group) on the iu8 WMMA, int4 -> int8 at the LDS commit (1.2-1.34x the W4A16 tile at 16k Qwen3.8-Flash-Next tokens) | uint4, **group 128**, no zero-point/bias/LoRA/EP, bf16 activations, K % 128 == 0; TRITON backend only |
+| `qsa_union` | `qsa_union_attn_bf16` | Qwen4Exp QSA sparse attention (`qsa_sparse_paged_attention`) for a single-request prefill of >= 1024 rows: 16 consecutive rows share one union of their selected tokens (1.5x the gfx1151 Triton kernel, more as the context grows) | head_dim 256, GQA 12, bf16, one request, positions < 131072; `STRIX_QSA_UNION_F16=1` gathers from a compact fp16 K/V copy instead (needs a host sync) |
+| `qsa_indexer` | `qsa_indexer_bf16` | the QSA indexer's paged scores (`qsa_mqa_paged`) for a single-request prefill of >= 128 rows (1.7-1.9x the tl.dot kernel) | 4 indexer heads, head_dim 128, one KV head, bf16, one request |
+| `hc_up_gate_mix` | `hc_up_gate_mix_bf16` | Qwen4Exp hyper-connection up projection fused with `hc_gate_mix` (6.7 -> 5.2 ms per site at 16k rows, no gate in memory) | hc_count 4, bf16, K % 64 == 0, batch >= 512 rows |
+| `dense_w8` | `w8a16_skinny_gemm` on int8 copies | **decode** copies of unquantized bf16 linears and the LM head: the bf16 weight stays for prefill, batches of <= 5 rows read an int8 copy (Qwen3.8-Flash-Next decode 51 -> 37 ms/step; GSM8K 93 vs 92) | bf16 2-D weights, K % 16 == 0; each copy is checked against bf16 at load |
 
 Some swaps live in code that `torch.compile` traces. vLLM keys its compile
 caches on its own env vars and config only, so the plugin adds
@@ -88,6 +93,31 @@ the installed build's `vllm/*.so` copied in and its own `vllm/_version.py`
 bundled `amdsmi` on `PYTHONPATH`, which upstream needs to detect ROCm on this
 APU.
 
+### Qwen3.8-Flash-Next
+
+This model is the exception: its 102 GB n-gram (engram) table does not fit in
+128 GB next to the weights. The [strix-vllm](https://github.com/asf0/strix-vllm)
+fork (branch `gfx1151`) streams the table from disk, so run it there with the
+plugin installed. Use the AWQ W4A16 checkpoint; bf16 does not fit.
+
+```sh
+vllm serve /path/to/Qwen3.8-Flash-Next-AWQ-W4A16 \
+  --engram-config '{"disk_offload": true}' --language-model-only \
+  --gpu-memory-utilization 0.80 --max-model-len 131072 \
+  --max-num-batched-tokens 16384 --no-enable-prefix-caching \
+  --speculative-config '{"method": "mtp", "num_speculative_tokens": 2}'
+```
+
+- `--gpu-memory-utilization 0.80` leaves page cache for the table rows. A
+  lower setting prefills slower; a higher one leaves too little host memory.
+- 16k prefill chunks are the measured best; 32k is not faster.
+- MTP 2 costs about 4 % prefill and more than doubles decode (18 -> 40-43
+  tok/s on real text). Drop `--speculative-config` for prefill-only work.
+- Keep `gdn_conv` enabled: with vLLM's own GDN causal conv this model fails at
+  startup (out-of-range n-gram ids), so `STRIX_DISABLE=all` does not run.
+- The fork's [engram docs](https://github.com/asf0/strix-vllm/blob/gfx1151/docs/features/engram.md#disk-offload)
+  describe the disk path and its debugging switches.
+
 ## Results
 
 Stock upstream vLLM (`899a1689e2`, unpatched) with and without the plugin on
@@ -107,12 +137,20 @@ serving and accuracy are in [docs/performance.md](docs/performance.md).
 | gemma-4-26B-A4B AWQ | 3.9× / 28.2× | 1.36× / 4.28× | 1,499 / 29.6 |
 | gemma-4-31B MXFP4 | 2.7× / 21.0× | 6.21× / 6.99× | 296 / 7.3 |
 | gemma-4-31B W4A16 | 3.0× / 22.5× | 1.32× / 2.99× | 292 / 8.0 |
+| Qwen3.8-Flash-Next AWQ ¹ | 1.8× / 2.0× | 1.89× / 1.58× | 1,635 / 25.1 |
+
+¹ On the strix-vllm fork with bf16 KV and 16k chunks, against everything-off
+except `gdn_conv` (see [above](#qwen38-flash-next)). Decode is without MTP.
+With MTP 2 on real text it decodes at 40-43 tok/s and prefills at
+1,540-1,620 tok/s from 5.6k to 100k tokens. Batched decode gains 1.16-1.26×.
 
 Prefill gains grow with context: at 256k the 35B prefills in 241 s against
 7,568 s stock. Decode doubles where the plugin replaces the dominant op and
 is at parity elsewhere; no configuration, single stream or batched, is
-slower than stock. KLD against stock is at the noise floor on every Qwen
-checkpoint (0.001-0.006, 97-99 % top-1); gemma-4-26B drifts further (0.2),
+slower than stock. KLD against stock is at the noise floor on the Qwen3.6
+and Qwen3.8-27B checkpoints (0.001-0.006, 97-99 % top-1). Qwen3.8-Flash-Next
+sits higher (0.008-0.019, 97-98 % top-1, perplexity within 0.6 %), most likely because its
+MoE GEMM quantizes activations to int8. gemma-4-26B drifts further (0.2),
 which `docs/performance.md` explains. Serving the 27B INT8 + MTP at 40
 sequences gives 123 output tok/s.
 

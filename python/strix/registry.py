@@ -615,6 +615,89 @@ KERNELS: list[Kernel] = [
         {**_BF16, "k_min": Range(lo=16384)},
         {"rows": 1024},
     ),
+    # ------------------------------------------------- Qwen3.8-Flash-Next
+    Kernel(
+        "moe_act_quant_i8",
+        "moe_act_quant_i8",
+        "per (row, 128-element group) int8 quantization for moe_gemm_w4a8: "
+        "s = max|x| / 127 (1 for an all-zero group), q = clamp(rint(x / s), "
+        "-127, 127). bf16 in, int8 + fp32 scales out",
+        {**_BF16, "out_dtype": "int8", "group_size": (128,)},
+        {"threads": 256, "teams": "one 16-lane team per group"},
+    ),
+    Kernel(
+        "moe_gemm_w4a8",
+        "moe_gemm_w4a8",
+        "expert GEMM over the WNA16 int4 layout with int8 activations: the "
+        "iu8 WMMA is ~2x the bf16 FLOP rate, the int4 weights become int8 at "
+        "the LDS commit, and the i32 accumulator folds per 128-group with "
+        "sa * sw. Takes over from moe_gemm_w4a16 for batch >= 1024 tokens: "
+        "1.34x (w13) and 1.19x (w2) at 16k Qwen3.8-Flash-Next tokens",
+        {
+            "silu_mul": True,
+            **_BF16,
+            "activation_dtype": "int8",
+            "weight_dtype": "uint8",
+            "weight_bits": 4,
+            "quant": "wna16",
+            "group_size": (128,),
+            "activation": ("silu", "gelu_tanh"),
+        },
+        {"block_m": (64, 128), "block_n": (128, 256), "best": "64x256, 2x4 waves"},
+    ),
+    Kernel(
+        "qsa_union_attn_bf16",
+        "qsa_union_attn_bf16",
+        "Qwen4Exp QSA sparse attention for a single-request prefill: 16 "
+        "consecutive query rows gather the union of their selected tokens "
+        "once and mask each score by the row's membership bits (S^T = K Q^T, "
+        "O^T = V^T P^T, two waves per head). 1.5x the gfx1151 Triton per-row "
+        "kernel on real selections, more as the context grows",
+        {
+            "head_dim": 256,
+            "gqa": 12,
+            **_BF16,
+            "requests": 1,
+            "rows_min": 1024,
+            "max_position": Range(hi=131072),
+        },
+        {"rows": (4, 8, 16), "block_n": (16, 32), "partials": "fp16"},
+    ),
+    Kernel(
+        "qsa_kv_to_f16",
+        "qsa_kv_to_f16",
+        "rewrites one layer's visible K/V from the paged bf16 cache into "
+        "dense fp16 rows [kv_heads * 256] for qsa_union_attn_bf16 (bf16 -> "
+        "fp16 is exact for cache values); one pass per layer, ~0.5 ms at 16k "
+        "tokens. Opt-in via STRIX_QSA_UNION_F16=1",
+        {"head_dim": 256, **_BF16, "out_dtype": "fp16"},
+        {"threads": 256},
+    ),
+    Kernel(
+        "qsa_indexer_bf16",
+        "qsa_indexer_bf16",
+        "Qwen4Exp QSA indexer scores over the paged compressed-key cache: "
+        "64 x 64 WMMA tiles, the key tile in LDS shared by the four heads, "
+        "relu per head, -inf past each row's visible keys. 1.7-1.9x the "
+        "tl.dot kernel from 4k to 128k context",
+        {
+            "indexer_heads": 4,
+            "indexer_head_dim": 128,
+            **_BF16,
+            "requests": 1,
+            "rows_min": 128,
+        },
+        {"block_m": 64, "block_n": 64, "waves": 4},
+    ),
+    Kernel(
+        "hc_up_gate_mix_bf16",
+        "hc_up_gate_mix_bf16",
+        "Qwen4Exp hyper-connection up projection fused with the gated mix: "
+        "y = mean_s sigmoid(bf16(a @ w_s^T)) * x_s over four streams, the "
+        "gate never reaching memory (6.7 -> 5.2 ms per site at 16k rows)",
+        {"hc_count": 4, **_BF16, "k_min": Range(lo=64), "rows_min": 512},
+        {"block_m": 128, "block_n": 32, "waves": 8},
+    ),
 ]
 
 _selections: dict[tuple, dict[str, Any]] = {}

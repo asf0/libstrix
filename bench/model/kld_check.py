@@ -102,6 +102,16 @@ def main() -> None:
     p.add_argument("--topk", type=int, default=20)
     p.add_argument("--max-model-len", type=int, help="default: depth + tail")
     p.add_argument("--mamba-ssm-cache-dtype", default="auto")
+    p.add_argument(
+        "--attention-backend",
+        default="TRITON_ATTN",
+        help="'' lets vLLM pick (Qwen4-exp QSA layers bring their own kernels)",
+    )
+    p.add_argument(
+        "--engram-disk-offload",
+        action="store_true",
+        help="Qwen3.8-Flash-Next: n-gram table read from disk",
+    )
     p.add_argument("--kv-cache-dtype", default="auto")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.80)
     p.add_argument("--db", help="results DB (default profiles/results.db)")
@@ -135,7 +145,8 @@ def main() -> None:
         # Same prefill chunk as profile_model, so a vLLM default change does
         # not move the numerics under the comparison.
         max_num_batched_tokens=8192,
-        attention_backend="TRITON_ATTN",
+        attention_backend=args.attention_backend or None,
+        **({"engram_config": {"disk_offload": True}} if args.engram_disk_offload else {}),
         mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
         kv_cache_dtype=args.kv_cache_dtype,
         enable_prefix_caching=False,
