@@ -1,0 +1,24 @@
+# Sage-A1.5 FP8 (per-channel, Qwen3.6-35B-A3B architecture). MTP 2 by default
+# (its MTP head); MTP=0 turns it off.
+#
+#   docker compose -f sage-a1.5-fp8.yaml up -d
+#
+# Overrides go in .env (see .env.example) or the shell.
+services:
+  sage-a1.5-fp8:
+    extends:
+      file: common.yaml
+      service: strix
+    environment:
+      MTP: ${MTP:-2}
+      REPLAYSSM: ${REPLAYSSM:-1}
+      HF_REPO: InternScience/Sage-A1.5-FP8
+    command:
+      - /models/Sage-A1.5-FP8
+      - --mm-encoder-attn-backend=TRITON_ATTN
+      - --attention-backend=TRITON_ATTN
+      - --kv-cache-dtype=int8_per_token_head
+      - --gpu-memory-utilization=${GPU_UTIL:-0.85}
+      - --max-model-len=${MAX_MODEL_LEN:-131072}
+      - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-8192}
+      - --max-num-seqs=${MAX_NUM_SEQS:-16}

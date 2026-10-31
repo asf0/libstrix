@@ -14,7 +14,7 @@ services:
       HF_REPO: amd/Qwen3.8-27B-Quark-AWQ-MXFP4
     command:
       - /models/Qwen3.8-27B-Quark-AWQ-MXFP4
-      - --language-model-only
+      - --mm-encoder-attn-backend=TRITON_ATTN
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head
       - --gpu-memory-utilization=${GPU_UTIL:-0.85}

@@ -14,7 +14,7 @@ services:
       HF_REPO: Avesed/Qwen3.6-35B-A3B-INT8-W8A8
     command:
       - /models/Qwen3.6-35B-A3B-INT8-W8A8
-      - --language-model-only
+      - --mm-encoder-attn-backend=TRITON_ATTN
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head
       - --gpu-memory-utilization=${GPU_UTIL:-0.85}

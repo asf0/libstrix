@@ -1,6 +1,4 @@
 # gemma-4-26B-A4B bf16.
-# Text only (--language-model-only), as measured in docs/performance.md; the
-# MXFP4 checkpoint's vision tower does not load in vLLM.
 #
 #   docker compose -f gemma-4-26b-a4b-it.yaml up -d
 #
@@ -15,7 +13,7 @@ services:
       HF_REPO: google/gemma-4-26B-A4B-it
     command:
       - /models/gemma-4-26B-A4B-it
-      - --language-model-only
+      - --mm-encoder-attn-backend=TRITON_ATTN
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head
       - --gpu-memory-utilization=${GPU_UTIL:-0.85}

@@ -1,6 +1,6 @@
 # gemma-4-31B MXFP4 (fp4 weights x bf16 activations in libstrix).
-# Text only (--language-model-only), as measured in docs/performance.md; the
-# MXFP4 checkpoint's vision tower does not load in vLLM.
+# Text only (--language-model-only): this checkpoint's vision tower does not
+# load in vLLM.
 #
 #   docker compose -f gemma-4-31b-it-mxfp4.yaml up -d
 #

@@ -198,7 +198,7 @@ tilelang==0.1.10
 timm==1.0.29
 tokenizers==0.23.3
 tqdm==4.70.0
-transformers==5.16.1
+transformers==5.20.2
 truststore==0.10.4
 typer==0.27.2
 typing-inspection==0.4.4

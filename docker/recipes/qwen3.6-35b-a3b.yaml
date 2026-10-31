@@ -14,7 +14,7 @@ services:
       HF_REPO: Qwen/Qwen3.6-35B-A3B
     command:
       - /models/Qwen3.6-35B-A3B
-      - --language-model-only
+      - --mm-encoder-attn-backend=TRITON_ATTN
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head
       - --gpu-memory-utilization=${GPU_UTIL:-0.85}
