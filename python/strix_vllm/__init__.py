@@ -35,6 +35,17 @@ ARCH_GATED = {
 }
 
 
+# Models whose activations leave the fp16 range. The raw FP8 kernels
+# (fp8_wmma_gemm_raw, moe_gemm_fp8_raw) take fp16 activations, so these keep the
+# bf16-activation FP8 kernels: on gemma-4-26B-A4B FP8 the raw expert kernel
+# moved KLD against the same weights in bf16 from 0.000 to 0.23 (2k prefill).
+FP16_ACT_UNSAFE = (
+    "Gemma4ForConditionalGeneration",
+    "Gemma4ForCausalLM",
+    "Gemma4UnifiedForConditionalGeneration",
+)
+
+
 def _model_architectures() -> list[str]:
     """Architectures of the model being loaded; [] outside a vLLM config."""
     from vllm.config import get_current_vllm_config_or_none
@@ -69,6 +80,22 @@ def model_gate(op: str) -> bool:
         "" if on else f" (not measured there; STRIX_ENABLE={op} to try it)",
     )
     return on
+
+
+def fp16_activations_ok(op: str) -> bool:
+    """Whether the model being loaded may run `op`, a kernel that rounds its
+    activations to fp16 (False for FP16_ACT_UNSAFE architectures)."""
+    archs = _model_architectures()
+    ok = not any(a in FP16_ACT_UNSAFE for a in archs)
+    if not ok:
+        from vllm.logger import init_logger
+
+        init_logger(f"vllm.{__name__}").info_once(
+            "libstrix: %s off for %s (activations exceed the fp16 range)",
+            op,
+            archs[0],
+        )
+    return ok
 
 
 def _cache_factor() -> str:
@@ -116,11 +143,24 @@ def register() -> None:
     # directly, and models without GDN layers import nothing else from strix.
     import strix  # noqa: F401
 
-    from strix_vllm import attn, dense_w8, gdn, gemm, int8, linear, moe, mxfp4, norm, qwen4_exp
+    from strix_vllm import (
+        attn,
+        dense_w8,
+        fp8,
+        gdn,
+        gemm,
+        int8,
+        linear,
+        moe,
+        mxfp4,
+        norm,
+        qwen4_exp,
+    )
 
     int8.register()
     linear.register()
     mxfp4.register()
+    fp8.register()
     gemm.register()
     norm.register()
     moe.register()

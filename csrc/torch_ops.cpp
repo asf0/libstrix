@@ -57,6 +57,22 @@ void moe_gemm_w8a16(torch::Tensor& c, const torch::Tensor& a,
                     const std::optional<torch::Tensor>& topk_weights,
                     int64_t top_k, int64_t block_m, int64_t block_n,
                     bool silu_mul, c10::string_view activation);
+void moe_gemm_fp8(torch::Tensor& c, const torch::Tensor& a,
+                    const torch::Tensor& b, const torch::Tensor& scales,
+                    const torch::Tensor& sorted_ids,
+                    const torch::Tensor& expert_ids,
+                    const torch::Tensor& num_post_padded,
+                    const std::optional<torch::Tensor>& topk_weights,
+                    int64_t top_k, int64_t block_m, int64_t block_n,
+                    bool silu_mul, c10::string_view activation);
+void moe_gemm_fp8_raw(torch::Tensor& c, const torch::Tensor& a,
+                    const torch::Tensor& b, const torch::Tensor& scales,
+                    const torch::Tensor& sorted_ids,
+                    const torch::Tensor& expert_ids,
+                    const torch::Tensor& num_post_padded,
+                    const std::optional<torch::Tensor>& topk_weights,
+                    int64_t top_k, int64_t block_m, int64_t block_n,
+                    bool silu_mul, c10::string_view activation);
 void gdn_chunk_fwd_k128_v128_c64_bf16(
     torch::Tensor& o, torch::Tensor& final_state, torch::Tensor& a,
     torch::Tensor& p, torch::Tensor& gc, const torch::Tensor& q,
@@ -107,6 +123,19 @@ torch::Tensor w8a16_skinny_gemm(const at::Tensor& in_a, const at::Tensor& in_b,
                                 const at::Tensor& in_scale,
                                 const std::optional<at::Tensor>& in_bias,
                                 const int64_t CuCount, const int64_t group_size);
+torch::Tensor fp8_skinny_gemm(const at::Tensor& in_a, const at::Tensor& in_b,
+                              const at::Tensor& in_scale,
+                              const std::optional<at::Tensor>& in_bias,
+                              const int64_t CuCount);
+torch::Tensor fp8_dequant(const torch::Tensor& w, const torch::Tensor& scales);
+torch::Tensor fp8_wmma_gemm(const torch::Tensor& w, const torch::Tensor& x,
+                            const torch::Tensor& scales);
+torch::Tensor fp8_wmma_gemm_cfg(const torch::Tensor& w, const torch::Tensor& x,
+                                const torch::Tensor& scales, int64_t cfg);
+torch::Tensor fp8_wmma_gemm_raw(const torch::Tensor& w, const torch::Tensor& x,
+                                const torch::Tensor& scales);
+torch::Tensor fp8_wmma_gemm_raw_cfg(const torch::Tensor& w, const torch::Tensor& x,
+                                    const torch::Tensor& scales, int64_t cfg);
 void gdn_causal_conv1d_w4_bf16(torch::Tensor& out, const torch::Tensor& x,
                                const torch::Tensor& weight,
                                const std::optional<torch::Tensor>& bias,
@@ -184,6 +213,16 @@ TORCH_LIBRARY(strix, m) {
       "Tensor? topk_weights, int top_k, int block_m, int block_n, "
       "bool silu_mul=False, str activation='silu') -> ()");
   m.def(
+      "moe_gemm_fp8(Tensor(a!) c, Tensor a, Tensor b, Tensor scales, "
+      "Tensor sorted_ids, Tensor expert_ids, Tensor num_post_padded, "
+      "Tensor? topk_weights, int top_k, int block_m, int block_n, "
+      "bool silu_mul=False, str activation='silu') -> ()");
+  m.def(
+      "moe_gemm_fp8_raw(Tensor(a!) c, Tensor a, Tensor b, Tensor scales, "
+      "Tensor sorted_ids, Tensor expert_ids, Tensor num_post_padded, "
+      "Tensor? topk_weights, int top_k, int block_m, int block_n, "
+      "bool silu_mul=False, str activation='silu') -> ()");
+  m.def(
       "gdn_chunk_fwd_k128_v128_c64_bf16(Tensor(a!) o, Tensor(b!) final_state, "
       "Tensor(c!) a, Tensor(d!) p, Tensor(e!) gc, "
       "Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, "
@@ -203,6 +242,14 @@ TORCH_LIBRARY(strix, m) {
   m.def(
       "w8a16_skinny_gemm(Tensor in_a, Tensor in_b, Tensor in_scale, "
       "Tensor? in_bias, int CuCount, int group_size) -> Tensor");
+  m.def(
+      "fp8_skinny_gemm(Tensor in_a, Tensor in_b, Tensor in_scale, "
+      "Tensor? in_bias, int CuCount) -> Tensor");
+  m.def("fp8_dequant(Tensor w, Tensor scales) -> Tensor");
+  m.def("fp8_wmma_gemm(Tensor w, Tensor x, Tensor scales) -> Tensor");
+  m.def("fp8_wmma_gemm_cfg(Tensor w, Tensor x, Tensor scales, int cfg) -> Tensor");
+  m.def("fp8_wmma_gemm_raw(Tensor w, Tensor x, Tensor scales) -> Tensor");
+  m.def("fp8_wmma_gemm_raw_cfg(Tensor w, Tensor x, Tensor scales, int cfg) -> Tensor");
   m.def(
       "attn_decode_bf16(Tensor(a!) out, Tensor q, Tensor key_cache, "
       "Tensor value_cache, Tensor seq_lens, Tensor block_table, float scale, "
@@ -260,11 +307,19 @@ TORCH_LIBRARY_IMPL(strix, CUDA, m) {
   m.impl("hc_up_gate_mix_bf16", &strix::hc_up_gate_mix_bf16);
   m.impl("moe_gemm_w4a8", &strix::moe_gemm_w4a8);
   m.impl("moe_gemm_w8a16", &strix::moe_gemm_w8a16);
+  m.impl("moe_gemm_fp8", &strix::moe_gemm_fp8);
+  m.impl("moe_gemm_fp8_raw", &strix::moe_gemm_fp8_raw);
   m.impl("gdn_chunk_fwd_k128_v128_c64_bf16",
          &strix::gdn_chunk_fwd_k128_v128_c64_bf16);
   m.impl("attn_prefill_bf16", &strix::attn_prefill_bf16);
   m.impl("attn_prefill32_bf16", &strix::attn_prefill32_bf16);
   m.impl("w8a16_skinny_gemm", &strix::w8a16_skinny_gemm);
+  m.impl("fp8_skinny_gemm", &strix::fp8_skinny_gemm);
+  m.impl("fp8_dequant", &strix::fp8_dequant);
+  m.impl("fp8_wmma_gemm", &strix::fp8_wmma_gemm);
+  m.impl("fp8_wmma_gemm_cfg", &strix::fp8_wmma_gemm_cfg);
+  m.impl("fp8_wmma_gemm_raw", &strix::fp8_wmma_gemm_raw);
+  m.impl("fp8_wmma_gemm_raw_cfg", &strix::fp8_wmma_gemm_raw_cfg);
   m.impl("w8a8_wmma_gemm", &strix::w8a8_wmma_gemm);
   m.impl("w8a8_wmma_gemm_cfg", &strix::w8a8_wmma_gemm_cfg);
   m.impl("gdn_decode_mtp_bf16", &strix::gdn_decode_mtp_bf16);

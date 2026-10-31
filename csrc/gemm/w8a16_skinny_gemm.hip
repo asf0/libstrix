@@ -78,6 +78,22 @@ __device__ __forceinline__ float __s2float8(__hip_bfloat16 v) {
   return __bfloat162float(v);
 }
 
+template <>
+__device__ __forceinline__ float __s2float8(float v) {
+  return v;
+}
+
+// float8_e4m3fn bytes -> fp16 lanes without a convert: the sign goes to bit
+// 15 and the 7 magnitude bits (exp 4, mant 3) to bits 14..7, which is the fp16
+// of value / 2^8 (e4m3 bias 7, fp16 bias 15; e4m3 subnormals land on fp16
+// subnormals exactly). FP8_RESCALE restores the 2^8 in fp32 with the group
+// scale. Bytes 0 and 1 of `qa` give the two lanes; NaN (0x7f) is not mapped.
+constexpr float FP8_RESCALE = 256.0f;
+__device__ __forceinline__ uint32_t fp8x2_to_half2_bits(uint32_t qa) {
+  return ((qa & 0x7Fu) << 7) | ((qa & 0x80u) << 8) | ((qa & 0x7F00u) << 15) |
+         ((qa & 0x8000u) << 16);
+}
+
 template <typename T>
 __device__ __forceinline__ T __float2s8(float v);
 
@@ -220,12 +236,13 @@ __device__ __forceinline__ void load_act_chunk_into_lds8(
 #if defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
           int UNRL, int N, int GROUP_SIZE = 0, bool CHUNKED = false,
-          uint32_t LDS_LEN = LDS_SIZE / 2>
+          uint32_t LDS_LEN = LDS_SIZE / 2, bool FP8 = false,
+          typename ScaleT = scalar_t>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSplitK_int8_hf_sml_(const int K, const int M, const int Bx, const int By,
                           const uint8_t* B_packed,
                           const scalar_t* __restrict__ A,
-                          const scalar_t* scale,
+                          const ScaleT* scale,
                           const scalar_t* __restrict__ BIAS, scalar_t* C,
                           const int _WvPrGrp, const int CuCount,
                           const int group_stride,
@@ -377,12 +394,20 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
               // One word covers elements k..k+3 in consecutive halves; the
               // group scale is applied at the chunk accumulate below (the
               // int4 sibling's structure: raw values only in the dot).
-              uint32_t lo = 0x64006400u | (qa & 0x000000FFu) |
-                            ((qa << 8) & 0x00FF0000u);
-              uint32_t hi = 0x64006400u | ((qa >> 16) & 0x000000FFu) |
-                            ((qa & 0xFF000000u) >> 8);
-              half2 w01 = __hsub2(*(half2*)(&lo), magic_bias2);
-              half2 w23 = __hsub2(*(half2*)(&hi), magic_bias2);
+              half2 w01, w23;
+              if constexpr (FP8) {
+                uint32_t lo = fp8x2_to_half2_bits(qa);
+                uint32_t hi = fp8x2_to_half2_bits(qa >> 16);
+                w01 = *(half2*)(&lo);
+                w23 = *(half2*)(&hi);
+              } else {
+                uint32_t lo = 0x64006400u | (qa & 0x000000FFu) |
+                              ((qa << 8) & 0x00FF0000u);
+                uint32_t hi = 0x64006400u | ((qa >> 16) & 0x000000FFu) |
+                              ((qa & 0xFF000000u) >> 8);
+                w01 = __hsub2(*(half2*)(&lo), magic_bias2);
+                w23 = __hsub2(*(half2*)(&hi), magic_bias2);
+              }
 
               partial += __builtin_amdgcn_fdot2(
                   *((half2*)(&bigA[n].f[2 * w])), *((half2*)(&w01)), 0.0f,
@@ -394,8 +419,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
             if constexpr (GROUP_SIZE > 0) {
               const int group_pos = (m + y) * num_groups + k_ / GROUP_SIZE;
-              sum[n][y] +=
-                  partial * __s2float8(scale[group_pos]);
+              sum[n][y] += partial * __s2float8(scale[group_pos]) *
+                           (FP8 ? FP8_RESCALE : 1.0f);
             } else {
               sum[n][y] += partial;
             }
@@ -455,7 +480,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
       for (int n = 0; n < N; n++) {
         for (int i = 0; i < YTILE; i++) {
           if constexpr (GROUP_SIZE == 0) {
-            sum[n][i] *= __s2float8(scale[m + i]);
+            sum[n][i] *= __s2float8(scale[m + i]) * (FP8 ? FP8_RESCALE : 1.0f);
           }
           if (BIAS) sum[n][i] += __s2float8(BIAS[(m + i) % Bx + (n % By) * M]);
           C[m + i + n * M] = __float2s8<scalar_t>(sum[n][i]);
@@ -468,11 +493,12 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 #else  // !defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
           int UNRL, int N, int GROUP_SIZE = 0, bool CHUNKED = false,
-          uint32_t LDS_LEN = LDS_SIZE / 2>
+          uint32_t LDS_LEN = LDS_SIZE / 2, bool FP8 = false,
+          typename ScaleT = scalar_t>
 __global__ void wvSplitK_int8_hf_sml_(
     const int K, const int M, const int Bx, const int By,
     const uint8_t* B_packed, const scalar_t* __restrict__ A,
-    const scalar_t* scale, const scalar_t* __restrict__ BIAS, scalar_t* C,
+    const ScaleT* scale, const scalar_t* __restrict__ BIAS, scalar_t* C,
     const int _WvPrGrp, const int CuCount, const int group_stride,
     const int B_row_stride_bytes) {
   UNREACHABLE_CODE
@@ -502,10 +528,15 @@ static int mindiv_int8(int N, int div1, int div2) {
 // dequantization only; there is no zero-point support (that format stores
 // raw uint8 zero points per group and is not needed by W8A16 checkpoints
 // quantized with llm-compressor symmetric schemes).
-torch::Tensor w8a16_skinny_gemm(const at::Tensor& in_a, const at::Tensor& in_b,
-                              const at::Tensor& in_scale,
-                              const std::optional<at::Tensor>& in_bias,
-                              const int64_t CuCount, const int64_t group_size) {
+//
+// fp8 = true: weights are float8_e4m3fn bytes and in_scale is fp32
+// [M, K/128] (a block-scaled checkpoint's [M/128, K/128] scales repeated per
+// row; group_size 128), or fp32 [M] per channel (group_size 0).
+static torch::Tensor skinny_impl(const at::Tensor& in_a, const at::Tensor& in_b,
+                                 const at::Tensor& in_scale,
+                                 const std::optional<at::Tensor>& in_bias,
+                                 const int64_t CuCount, const int64_t group_size,
+                                 const bool fp8) {
   TORCH_CHECK(on_gfx1x_int8(),
               "w8a16_skinny_gemm targets gfx11/gfx12 wave32 GPUs only");
 
@@ -521,10 +552,18 @@ torch::Tensor w8a16_skinny_gemm(const at::Tensor& in_a, const at::Tensor& in_b,
                    ? in_bias->size(0)
                    : 1;
 
-  TORCH_CHECK(in_a.dtype() == at::kByte,
-              "Weights must be uint8 (uint8b128 layout, one byte per element),"
-              " got ",
-              in_a.dtype());
+  if (fp8) {
+    TORCH_CHECK(in_a.dtype() == at::kFloat8_e4m3fn,
+                "Weights must be float8_e4m3fn, got ", in_a.dtype());
+    TORCH_CHECK(group_size == 128 || group_size == 0,
+                "fp8 takes group_size 128 or 0 (per channel), got ", group_size);
+    TORCH_CHECK(in_scale.dtype() == at::kFloat, "fp8 scales must be float32");
+  } else {
+    TORCH_CHECK(in_a.dtype() == at::kByte,
+                "Weights must be uint8 (uint8b128 layout, one byte per "
+                "element), got ",
+                in_a.dtype());
+  }
   TORCH_CHECK(in_a.numel() >= M_in * K_in,
               "Weight tensor must hold at least M*K bytes, got ",
               in_a.numel(), " expected >= ", M_in * K_in);
@@ -539,7 +578,7 @@ torch::Tensor w8a16_skinny_gemm(const at::Tensor& in_a, const at::Tensor& in_b,
   TORCH_CHECK(
       in_b.dtype() == torch::kFloat16 || in_b.dtype() == torch::kBFloat16,
       "Activation must be float16 or bfloat16");
-  TORCH_CHECK(in_scale.dtype() == in_b.dtype(),
+  TORCH_CHECK(fp8 || in_scale.dtype() == in_b.dtype(),
               "Scale dtype must match activation dtype");
   TORCH_CHECK(group_size == 0 || group_size == 32 || group_size == 64 ||
                   group_size == 128,
@@ -597,32 +636,37 @@ torch::Tensor w8a16_skinny_gemm(const at::Tensor& in_a, const at::Tensor& in_b,
 
 // Ragged M (weight rows) must not straddle an m tile when the write happens,
 // so YTILE is snapped to the largest of {4, 2, 1} that divides M.
-#define WVSPLITK_INT8G_LAUNCH(_YTILE, _UNRL, _N, _GS)                        \
+#define WVSPLITK_INT8G_LAUNCH(_YTILE, _UNRL, _N, _GS, _FP8, _ST, _SP)         \
   {                                                                          \
     dim3 block(_THRDS8, 16);                                                 \
     int __wvPrGrp = mindiv_int8(M_in, CuCount * _YTILE, 16);                 \
     if (K_in * N_in <= max_lds_len)                                          \
       wvSplitK_int8_hf_sml_<fptype, _THRDS8, _YTILE, 16, A_CHUNK8, _UNRL,    \
-                            _N, _GS><<<grid, block, 0, stream>>>(            \
-          K_in, M_in, Bx_in, By_in, wptr, aptr, sptr, biasptr, cptr,         \
+                            _N, _GS, false, lds_elems8, _FP8, _ST>           \
+          <<<grid, block, 0, stream>>>(                                      \
+          K_in, M_in, Bx_in, By_in, wptr, aptr, _SP, biasptr, cptr,          \
           __wvPrGrp, CuCount, group_stride_i32, b_row_stride_bytes_i32);     \
     else                                                                     \
       wvSplitK_int8_hf_sml_<fptype, _THRDS8, _YTILE, 16, A_CHUNK8, _UNRL,    \
-                            _N, _GS, /*CHUNKED=*/true, lds_elems8>           \
+                            _N, _GS, /*CHUNKED=*/true, lds_elems8, _FP8, _ST> \
           <<<grid, block, 0, stream>>>(                                     \
-          K_in, M_in, Bx_in, By_in, wptr, aptr, sptr, biasptr, cptr,         \
+          K_in, M_in, Bx_in, By_in, wptr, aptr, _SP, biasptr, cptr,          \
           __wvPrGrp, CuCount, group_stride_i32, b_row_stride_bytes_i32);     \
   }
 
 #define WVSPLIT_INT8G_GS(_YTILE, _UNRL, _N)                                   \
-  if (group_size == 0)                                                        \
-    WVSPLITK_INT8G_LAUNCH(_YTILE, _UNRL, _N, 0)                               \
+  if (fp8 && group_size == 0)                                                 \
+    WVSPLITK_INT8G_LAUNCH(_YTILE, _UNRL, _N, 0, true, float, sptr_f)          \
+  else if (fp8)                                                               \
+    WVSPLITK_INT8G_LAUNCH(_YTILE, _UNRL, _N, 128, true, float, sptr_f)        \
+  else if (group_size == 0)                                                   \
+    WVSPLITK_INT8G_LAUNCH(_YTILE, _UNRL, _N, 0, false, fptype, sptr)          \
   else if (group_size == 32)                                                  \
-    WVSPLITK_INT8G_LAUNCH(_YTILE, _UNRL, _N, 32)                              \
+    WVSPLITK_INT8G_LAUNCH(_YTILE, _UNRL, _N, 32, false, fptype, sptr)         \
   else if (group_size == 64)                                                  \
-    WVSPLITK_INT8G_LAUNCH(_YTILE, _UNRL, _N, 64)                              \
+    WVSPLITK_INT8G_LAUNCH(_YTILE, _UNRL, _N, 64, false, fptype, sptr)         \
   else                                                                        \
-    WVSPLITK_INT8G_LAUNCH(_YTILE, _UNRL, _N, 128)
+    WVSPLITK_INT8G_LAUNCH(_YTILE, _UNRL, _N, 128, false, fptype, sptr)
 
 #define WVSPLIT_INT8G_TILE(_sTY, __N)                                         \
   {                                                                           \
@@ -662,7 +706,9 @@ torch::Tensor w8a16_skinny_gemm(const at::Tensor& in_a, const at::Tensor& in_b,
         const uint8_t* wptr = reinterpret_cast<const uint8_t*>(in_a.data_ptr());
         const fptype* aptr = reinterpret_cast<const fptype*>(in_b.data_ptr());
         const fptype* sptr =
-            reinterpret_cast<const fptype*>(in_scale.data_ptr());
+            fp8 ? nullptr : reinterpret_cast<const fptype*>(in_scale.data_ptr());
+        const float* sptr_f =
+            fp8 ? reinterpret_cast<const float*>(in_scale.data_ptr()) : nullptr;
         const fptype* biasptr =
             (in_bias.has_value() && in_bias->numel() > 0)
                 ? reinterpret_cast<const fptype*>(in_bias->data_ptr())
@@ -697,5 +743,21 @@ torch::Tensor w8a16_skinny_gemm(const at::Tensor& in_a, const at::Tensor& in_b,
 #undef WVSPLITK_INT8G_LAUNCH
 
   return out_c;
+}
+
+torch::Tensor w8a16_skinny_gemm(const at::Tensor& in_a, const at::Tensor& in_b,
+                                const at::Tensor& in_scale,
+                                const std::optional<at::Tensor>& in_bias,
+                                const int64_t CuCount, const int64_t group_size) {
+  return skinny_impl(in_a, in_b, in_scale, in_bias, CuCount, group_size, false);
+}
+
+torch::Tensor fp8_skinny_gemm(const at::Tensor& in_a, const at::Tensor& in_b,
+                              const at::Tensor& in_scale,
+                              const std::optional<at::Tensor>& in_bias,
+                              const int64_t CuCount) {
+  // fp32 [M] scales select the per-channel path, [M, K/128] the block one.
+  return skinny_impl(in_a, in_b, in_scale, in_bias, CuCount,
+                     in_scale.dim() == 1 ? 0 : 128, true);
 }
 }  // namespace strix

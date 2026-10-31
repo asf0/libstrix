@@ -218,6 +218,77 @@ KERNELS: list[Kernel] = [
         {"block_m": (16, 32, 64, 128), "block_n": (64, 128, 256)},
     ),
     Kernel(
+        "moe_gemm_fp8",
+        "moe_gemm_fp8",
+        "expert w13 GEMM over float8_e4m3fn experts [E, N, K]: fp32 128x128 "
+        "block scales [E, N/128, K/128] or one scale per output channel "
+        "([E, N] / [E, N, 1]). e4m3 bytes are decoded to bf16 as they are "
+        "staged into LDS, bf16 activations (W8A16), same fused gate-and-mul "
+        "epilogue as moe_gemm_w8a16. n % 128 == 0, k % 128 == 0",
+        {
+            "silu_mul": True,
+            **_BF16,
+            "weight_dtype": "fp8_e4m3",
+            "weight_bits": 8,
+            "quant": "fp8",
+            "group_size": (0, 128),
+            "activation": ("silu", "gelu_tanh"),
+        },
+        {"block_m": (16, 32, 64, 128), "block_n": (64, 128, 256)},
+    ),
+    Kernel(
+        "moe_gemm_fp8",
+        "moe_gemm_fp8",
+        "expert w2 GEMM over the same FP8 expert layouts, unweighted or with "
+        "the topk weights applied on the output. n % 128 == 0, k % 128 == 0",
+        {
+            "silu_mul": False,
+            **_BF16,
+            "weight_dtype": "fp8_e4m3",
+            "weight_bits": 8,
+            "quant": "fp8",
+            "group_size": (0, 128),
+            "activation": ("silu", "gelu_tanh"),
+        },
+        {"block_m": (16, 32, 64, 128), "block_n": (64, 128, 256)},
+    ),
+    Kernel(
+        "moe_gemm_fp8_raw",
+        "moe_gemm_fp8",
+        "expert w13 GEMM over float8_e4m3fn experts with fp16 activations: the "
+        "e4m3 bytes are widened to fp16 with integer ops only, the fp16 WMMA "
+        "runs on the raw values and the block (or per-channel) scale is applied "
+        "to the fp32 accumulator. The fused gate-and-mul output is fp16, the "
+        "next GEMM's input. n % 128 == 0, k % 128 == 0",
+        {
+            "silu_mul": True,
+            "dtype": "fp16",
+            "weight_dtype": "fp8_e4m3",
+            "weight_bits": 8,
+            "quant": "fp8",
+            "group_size": (0, 128),
+            "activation": ("silu", "gelu_tanh"),
+        },
+        {"block_m": (16, 32, 64, 128), "block_n": (64, 128, 256)},
+    ),
+    Kernel(
+        "moe_gemm_fp8_raw",
+        "moe_gemm_fp8",
+        "expert w2 GEMM over the same layouts: fp16 activations in, bf16 out, "
+        "unweighted or with the topk weights applied on the output. n % 128 == "
+        "0, k % 128 == 0",
+        {
+            "silu_mul": False,
+            "dtype": "fp16",
+            "weight_dtype": "fp8_e4m3",
+            "weight_bits": 8,
+            "quant": "fp8",
+            "group_size": (0, 128),
+            "activation": ("silu", "gelu_tanh"),
+        },
+        {"block_m": (16, 32, 64, 128), "block_n": (64, 128, 256)},
+    ),
+    Kernel(
         "moe_gemm_w4a16",
         "moe_gemm_w4a16",
         "expert w2 GEMM over the same WNA16 layout, unweighted or with the "
@@ -464,6 +535,80 @@ KERNELS: list[Kernel] = [
             "rows": Range(hi=5),
             "dtype": ("bf16", "fp16"),
         },
+    ),
+    Kernel(
+        "fp8_skinny_gemm",
+        "fp8",
+        "decode GEMM (M <= 5) on float8_e4m3fn weights with 128x128 block "
+        "scales expanded to fp32 [N, K/128], or per-channel fp32 [N] scales; e4m3 "
+        "bytes decode to fp16 lanes with shifts and masks (no convert), ~223 GB/s "
+        "like the int8 kernel. K % 128 == 0 (block), K % 16 (per channel)",
+        {
+            "weight_bits": 8,
+            "weight_dtype": "fp8_e4m3",
+            "group_size": (0, 128),
+            "rows": Range(hi=5),
+            "dtype": ("bf16", "fp16"),
+        },
+    ),
+    Kernel(
+        "fp8_wmma_gemm",
+        "fp8",
+        "mid-size GEMM: float8_e4m3fn weights with 128x128 block scales "
+        "decoded to bf16 as they are staged into LDS, plain bf16 WMMA main "
+        "loop (clone of mxfp4_wmma_gemm). Reads each weight tile once per "
+        "m-block at one byte, against five for dequant + hipBLASLt. Per-channel "
+        "fp32 [N] scales are applied in the epilogue. K % 128 == 0 (block), "
+        "K % 64 (per channel)",
+        {
+            "weight_bits": 8,
+            "weight_dtype": "fp8_e4m3",
+            "group_size": (0, 128),
+            "rows": Range(lo=6),
+            "dtype": "bf16",
+        },
+    ),
+    Kernel(
+        "fp8_wmma_gemm_raw",
+        "fp8",
+        "mid-size GEMM over float8_e4m3fn weights with fp16 activations: the "
+        "e4m3 bytes are widened to fp16 with integer ops only, the fp16 WMMA runs "
+        "on the raw values and each K step is folded into the fp32 accumulator "
+        "with its 128x128 block scale (per-channel [N] scales: once at the end); "
+        "bf16 output. K % 128 == 0 (block), K % 64 (per channel)",
+        {
+            "weight_bits": 8,
+            "weight_dtype": "fp8_e4m3",
+            "group_size": (0, 128),
+            "rows": Range(lo=6),
+            "dtype": "fp16",
+        },
+    ),
+    Kernel(
+        "fp8_wmma_gemm_raw_cfg",
+        "fp8_tile_sweep",
+        "fp8_wmma_gemm_raw on one of the fixed tile configs, for "
+        "bench/kernels/fp8_gemm.py",
+        {"weight_bits": 8, "weight_dtype": "fp8_e4m3", "group_size": (0, 128), "dtype": "fp16"},
+        {"cfg": "0..9"},
+    ),
+    Kernel(
+        "fp8_wmma_gemm_cfg",
+        "fp8_tile_sweep",
+        "fp8_wmma_gemm on one of the fixed tile configs, for "
+        "bench/kernels/fp8_gemm.py",
+        {"weight_bits": 8, "weight_dtype": "fp8_e4m3", "group_size": (0, 128), "dtype": "bf16"},
+        {"cfg": "0..9"},
+    ),
+    Kernel(
+        "fp8_dequant",
+        "fp8_dequant",
+        "float8_e4m3fn [N, K] + 128x128 block or per-channel scales -> bf16 "
+        "[N, K], exact "
+        "(the bf16 holds the same value). For prefill M the plugin decodes "
+        "once and runs hipBLASLt (gfx1151 has no fp8 WMMA)",
+        {"weight_bits": 8, "weight_dtype": "fp8_e4m3", "group_size": (0, 128), "dtype": "bf16"},
+        {"threads": 256},
     ),
     Kernel(
         "w8a8_wmma_gemm",

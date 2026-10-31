@@ -27,7 +27,7 @@ import os
 
 import torch
 
-from strix_vllm import disabled, model_gate
+from strix_vllm import disabled, fp16_activations_ok, model_gate
 
 ROW_PAD = 64  # elements; (K + 64) * 2 bytes has a small power-of-two factor
 
@@ -40,6 +40,74 @@ def strix_blocks(num_tokens: int) -> tuple[int, int]:
     if num_tokens <= 1024:
         return 64, 128
     return 128, 128
+
+
+# Raw FP8 expert tiles per model, keyed by the w13 (n, k):
+# [(max tokens, block_m, block_n)], from bench/kernels/moe_fp8.py --raw with the
+# model's E / top-k / activation and its row padding. Shapes not listed take
+# the Qwen3.6-35B-A3B-FP8 table in fp8_raw_blocks.
+_FP8_RAW_BLOCKS: dict[tuple[int, int], list[tuple[int, int, int]]] = {
+    # gemma-4-26B-A4B FP8 (E=128, top-8, gelu, per-channel, unpadded): 64x128
+    # is 4 % ahead of 64x64 at 1k tokens and 128x128 3 % ahead at 4k. End to
+    # end (same session), 128x128 from 1025 tokens: 2k prefill 0.587 s vs
+    # 0.60 s with 64x128 up to 2048, 8k 2.24 s vs 2.32 s.
+    (1408, 2816): [(64, 16, 64), (256, 32, 64), (1024, 64, 128), (1 << 62, 128, 128)],
+    # LFM2.5-24B-A2B FP8 (E=64, top-4, block, padded): 64x64 from 16 tokens,
+    # 64x128 from 1k (2 % ahead of 64x64).
+    (3072, 2048): [(4, 16, 64), (64, 64, 64), (256, 32, 64), (1 << 62, 64, 128)],
+}
+
+
+def fp8_raw_blocks(num_tokens: int, n: int = 0, k: int = 0) -> tuple[int, int]:
+    """Tiles for the fp16-activation FP8 kernel (moe_gemm_fp8_raw), from
+    bench/kernels/moe_fp8.py --raw (cold weights, padded rows): its cheaper
+    weight decode lets the mid-size tiles win from a few tokens up, and a
+    narrower tile than the bf16-staging kernel's 128x128 at prefill sizes.
+    (n, k) is the w13 shape; models in _FP8_RAW_BLOCKS carry their own rows."""
+    for max_tokens, bm, bn in _FP8_RAW_BLOCKS.get((n, k), ()):
+        if num_tokens <= max_tokens:
+            return bm, bn
+    if num_tokens <= 8:
+        return 16, 64
+    if num_tokens <= 1024:
+        return 64, 64
+    return 64, 128
+
+
+def fp8_blocks(num_tokens: int) -> tuple[int, int]:
+    """(block_m, block_n) for the FP8 expert GEMMs, from bench/kernels/moe_fp8.py
+    (cold weights, padded rows, Qwen3.6-35B-A3B-FP8). Decode is a weight
+    stream: 16x64 reaches ~205 GB/s up to 256 tokens (every expert active), 32x64
+    wins to 1k tokens, and prefill sizes want the 128x128 tile."""
+    if num_tokens <= 256:
+        return 16, 64
+    if num_tokens <= 1024:
+        return 32, 64
+    return 128, 128
+
+
+# Bytes added to each FP8 expert weight row. Rows whose pitch is a multiple of
+# 512 B (K = 2048 for w13, 512 for w2) land on the same DRAM channels in
+# lockstep: Qwen3.6-35B-A3B-FP8's w13 GEMM streamed 38 GB/s at one token and 4.5x
+# that with a 16-byte pad (bench/kernels/moe_fp8.py --pad). 16 keeps the
+# 16-byte vector loads aligned.
+FP8_ROW_PAD = 16
+
+
+def _pad_fp8_rows(w: torch.Tensor) -> torch.Tensor:
+    """[E, N, K] float8 -> the same values as a view of [E, N, K + pad]."""
+    if (
+        w.dim() != 3
+        or w.dtype != torch.float8_e4m3fn
+        or w.size(2) % 512
+        or w.stride(1) != w.size(2)
+    ):
+        return w
+    e, n, k = w.shape
+    buf = torch.empty((e, n, k + FP8_ROW_PAD), dtype=w.dtype, device=w.device)
+    out = buf[:, :, :k]
+    out.copy_(w)
+    return out
 
 
 # int4 experts, (w13 n, k) -> [(max tokens, block_m, block_n)], from
@@ -741,6 +809,200 @@ def _make_int8_experts_cls():
     return StrixInt8Experts
 
 
+def _make_fp8_experts_cls(raw: bool = True):
+    """The FP8 expert path: Qwen3.6-35B-A3B-FP8 and the other block-scaled or
+    per-channel float8_e4m3fn MoE checkpoints.
+
+    vLLM's Triton FP8 MoE quantizes the activations to FP8 and runs an untuned
+    block-scaled Triton GEMM. Strix keeps the activations in bf16 (the class
+    asks the prepare step to defer input quantization, so `hidden_states`
+    arrives bf16) and decodes the FP8 expert weights into LDS in front of a
+    bf16 WMMA loop. As with the int8 path, `oracle/fp8.py` imports
+    TritonExperts inside its selector, so register() rebinds
+    `backend_to_kernel_cls`.
+    """
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
+        TritonExperts,
+    )
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+    from vllm.model_executor.layers.fused_moe.utils import _resize_cache
+
+    _FUSED = (MoEActivation.SILU, MoEActivation.GELU_TANH)
+
+    class StrixFp8Experts(TritonExperts):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Decided while the model is built, when its architecture is known.
+            self._raw = raw and fp16_activations_ok("moe_fp8_raw")
+
+        @property
+        def expects_unquantized_inputs(self) -> bool:
+            return True
+
+        def _scales(self, w, s, name):
+            """fp32 block scales [E, N/128, K/128] or per-channel [E, N], or
+            None when the layout is one the kernel does not take."""
+            e, n, k = w.shape
+            if self.block_shape is not None:
+                if list(self.block_shape) != [128, 128] or n % 128 or k % 128:
+                    return None
+                if s.shape != (e, n // 128, k // 128):
+                    return None
+                return s.to(torch.float32).contiguous()
+            if s.numel() != e * n:
+                return None
+            return s.reshape(e, n).contiguous()
+
+        def _strix_ok(self, hidden_states, w1, w2, activation, expert_map, a1q_scale):
+            checks = {
+                "2d": hidden_states.dim() == 2,
+                "act": hidden_states.dtype == torch.bfloat16 and a1q_scale is None,
+                "w1_fp8": w1.dtype == torch.float8_e4m3fn,
+                "w2_fp8": w2.dtype == torch.float8_e4m3fn,
+                "fp8_w8a8": self.quant_config.use_fp8_w8a8,
+                "scales": (
+                    self.w1_scale is not None
+                    and self.w2_scale is not None
+                    and self._scales(w1, self.w1_scale, "w1") is not None
+                    and self._scales(w2, self.w2_scale, "w2") is not None
+                ),
+                "bias": self.w1_bias is None and self.w2_bias is None,
+                "lora": self._lora_context is None,
+                "expert_map": expert_map is None,
+                "activation": activation in _FUSED,
+                # Block scales need whole 128-K blocks; per-channel only the
+                # kernel's 64-K step (gemma-4's w2 has K = 704).
+                "w13_row": w1.size(2) % (128 if self.block_shape else 64) == 0,
+                "w2_row": w2.size(2) % (128 if self.block_shape else 64) == 0,
+                "n128": w1.size(1) % 128 == 0 and w2.size(1) % 128 == 0,
+                "aligned": w1.stride(1) % 16 == 0 and w2.stride(1) % 16 == 0,
+            }
+            bad = [name for name, ok in checks.items() if not ok]
+            if bad:
+                from vllm.logger import init_logger
+
+                init_logger("vllm.strix").warning_once(
+                    "moe_fp8 falls back to Triton: "
+                    + ", ".join(bad)
+                    + f" | act {hidden_states.dtype} block {self.block_shape}"
+                    + f" w1 {tuple(w1.shape)} w2 {tuple(w2.shape)}"
+                    + f" s1 {None if self.w1_scale is None else tuple(self.w1_scale.shape)}"
+                    + f" s2 {None if self.w2_scale is None else tuple(self.w2_scale.shape)}"
+                )
+            return not bad
+
+        def apply(
+            self,
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation,
+            global_num_experts,
+            expert_map,
+            a1q_scale,
+            a2_scale,
+            workspace13,
+            workspace2,
+            expert_tokens_meta,
+            apply_router_weight_on_input,
+        ):
+            parent = super()
+            fallback = {
+                "output": output,
+                "hidden_states": hidden_states,
+                "w1": w1,
+                "w2": w2,
+                "topk_weights": topk_weights,
+                "topk_ids": topk_ids,
+                "activation": activation,
+                "global_num_experts": global_num_experts,
+                "expert_map": expert_map,
+                "a1q_scale": a1q_scale,
+                "a2_scale": a2_scale,
+                "workspace13": workspace13,
+                "workspace2": workspace2,
+                "expert_tokens_meta": expert_tokens_meta,
+                "apply_router_weight_on_input": apply_router_weight_on_input,
+            }
+            if not self._strix_ok(
+                hidden_states, w1, w2, activation, expert_map, a1q_scale
+            ):
+                return parent.apply(**fallback)
+            num_tokens = hidden_states.size(0)
+            top_k = topk_ids.size(1)
+            # No strix_moe_ok floor here: _MIN_ROWS compares the bf16 kernels,
+            # and vLLM's FP8 Triton MoE is the untuned W8A8 path (4.4 tok/s
+            # decode on Qwen3.6-35B-A3B-FP8), never the faster one.
+            num_experts = w1.size(0)
+            n, k = w1.size(1), w2.size(1)
+            s1 = self._scales(w1, self.w1_scale, "w1")
+            s2 = self._scales(w2, self.w2_scale, "w2")
+            raw = self._raw
+            if raw:
+                bm, bn = fp8_raw_blocks(num_tokens, w1.size(1), w1.size(2))
+            else:
+                bm, bn = fp8_blocks(num_tokens)
+            sorted_ids, expert_ids, num_post = moe_align_block_size(
+                topk_ids, bm, num_experts
+            )
+            slots = num_tokens * top_k
+            cache2 = _resize_cache(workspace13, (slots, n // 2))
+            gemm = torch.ops.strix.moe_gemm_fp8_raw if raw else torch.ops.strix.moe_gemm_fp8
+            x = hidden_states
+            if raw:
+                # fp16 activations in, the fused activation written as fp16 for
+                # the second GEMM to read as-is (same itemsize as the bf16 cache).
+                x = hidden_states.to(torch.float16)
+                cache2 = cache2.view(torch.float16)
+            gemm(
+                cache2,
+                x,
+                w1,
+                s1,
+                sorted_ids,
+                expert_ids,
+                num_post,
+                None,
+                top_k,
+                bm,
+                bn,
+                True,
+                activation.value,
+            )
+            cache3 = _resize_cache(workspace2, (slots, k))
+            weights = (
+                None
+                if apply_router_weight_on_input
+                else topk_weights.reshape(-1).to(torch.float32)
+            )
+            gemm(
+                cache3,
+                cache2,
+                w2,
+                s2,
+                sorted_ids,
+                expert_ids,
+                num_post,
+                weights,
+                1,
+                bm,
+                bn,
+                False,
+                "silu",
+            )
+            self.moe_sum(
+                cache3.view(num_tokens, top_k, k), output, topk_ids, expert_map
+            )
+
+    return StrixFp8Experts
+
+
 def register() -> None:
     from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
     from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
@@ -774,6 +1036,40 @@ def register() -> None:
         # A future upstream change that imports the class inside the selector
         # instead of reading the module global would silently bypass this.
         assert int_wna16.TritonWNA16Experts is cls
+
+    if not disabled("moe_fp8"):
+        from vllm.model_executor.layers.fused_moe.oracle import fp8 as fp8_oracle
+
+        fp8_cls = _make_fp8_experts_cls(raw=not disabled("moe_fp8_raw"))
+        fp8_orig = fp8_oracle.backend_to_kernel_cls
+
+        def _fp8_backend_to_kernel_cls(backend, _orig=fp8_orig, _cls=fp8_cls):
+            if backend == fp8_oracle.Fp8MoeBackend.TRITON:
+                return [_cls]
+            return _orig(backend)
+
+        # fp8.py imports TritonExperts inside the selector too, so the global to
+        # rebind is the selector itself.
+        fp8_oracle.backend_to_kernel_cls = _fp8_backend_to_kernel_cls
+        assert fp8_oracle.backend_to_kernel_cls is _fp8_backend_to_kernel_cls
+
+        # Pad the expert rows once, as the weights are converted to the
+        # backend's runtime format. Callers import the function by name, so the
+        # modules that already hold it are rebound too.
+        import sys
+
+        convert_orig = fp8_oracle.convert_to_fp8_moe_kernel_format
+
+        def _convert(*args, _orig=convert_orig, **kwargs):
+            w13, w2, w13_scale, w2_scale = _orig(*args, **kwargs)
+            backend = kwargs.get("fp8_backend", args[0] if args else None)
+            if backend == fp8_oracle.Fp8MoeBackend.TRITON:
+                w13, w2 = _pad_fp8_rows(w13), _pad_fp8_rows(w2)
+            return w13, w2, w13_scale, w2_scale
+
+        for mod in list(sys.modules.values()):
+            if getattr(mod, "convert_to_fp8_moe_kernel_format", None) is convert_orig:
+                mod.convert_to_fp8_moe_kernel_format = _convert
 
     # Opt-in: a bf16-WMMA W8A16 expert GEMM loses to Triton's int8 WMMA on
     # this checkpoint (prefill -3.7 %, decode x1 -32 %), so it is off unless

@@ -80,6 +80,44 @@ def _(
     return None
 
 
+@torch.library.register_fake("strix::moe_gemm_fp8")
+def _(
+    c,
+    a,
+    b,
+    scales,
+    sorted_ids,
+    expert_ids,
+    num_post_padded,
+    topk_weights,
+    top_k,
+    block_m,
+    block_n,
+    silu_mul=False,
+    activation="silu",
+):
+    return None
+
+
+@torch.library.register_fake("strix::moe_gemm_fp8_raw")
+def _(
+    c,
+    a,
+    b,
+    scales,
+    sorted_ids,
+    expert_ids,
+    num_post_padded,
+    topk_weights,
+    top_k,
+    block_m,
+    block_n,
+    silu_mul=False,
+    activation="silu",
+):
+    return None
+
+
 @torch.library.register_fake("strix::gdn_chunk_fwd_k128_v128_c64_bf16")
 def _(
     o,
@@ -371,6 +409,36 @@ def _(x, w, scales):
 @torch.library.register_fake("strix::mxfp4_dequant")
 def _(w, scales):
     return w.new_empty((w.size(0), w.size(1) * 2), dtype=torch.bfloat16)
+
+
+@torch.library.register_fake("strix::fp8_skinny_gemm")
+def _(in_a, in_b, in_scale, in_bias, cu_count):
+    return in_b.new_empty((in_b.size(0), in_a.size(0)))
+
+
+@torch.library.register_fake("strix::fp8_wmma_gemm")
+def _(w, x, scales):
+    return x.new_empty((x.size(0), w.size(0)))
+
+
+@torch.library.register_fake("strix::fp8_wmma_gemm_cfg")
+def _(w, x, scales, cfg):
+    return x.new_empty((x.size(0), w.size(0)))
+
+
+@torch.library.register_fake("strix::fp8_wmma_gemm_raw")
+def _(w, x, scales):
+    return x.new_empty((x.size(0), w.size(0)), dtype=torch.bfloat16)
+
+
+@torch.library.register_fake("strix::fp8_wmma_gemm_raw_cfg")
+def _(w, x, scales, cfg):
+    return x.new_empty((x.size(0), w.size(0)), dtype=torch.bfloat16)
+
+
+@torch.library.register_fake("strix::fp8_dequant")
+def _(w, scales):
+    return w.new_empty((w.size(0), w.size(1)), dtype=torch.bfloat16)
 
 
 @torch.library.register_fake("strix::w4a16_dequant")

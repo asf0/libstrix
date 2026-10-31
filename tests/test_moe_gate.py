@@ -43,3 +43,44 @@ def test_strix_blocks_are_instantiated():
         assert (str(bm), str(bn)) in instantiated, (
             f"strix_blocks({tokens}) = {bm}x{bn} is not instantiated"
         )
+
+
+def test_fp8_raw_blocks_are_instantiated_and_divide_n():
+    source = (
+        Path(__file__).parents[1] / "csrc" / "moe" / "moe_gemm_w8a16.hip"
+    ).read_text()
+    instantiated = set(re.findall(r"STRIX_MOE_W8\((\d+), (\d+),", source))
+    assert instantiated, "no STRIX_MOE_W8 instantiations found"
+    # (w13 n, w13 k, w2 n) per keyed model, plus an unlisted shape (the default).
+    shapes = [(1408, 2816, 2816), (3072, 2048, 2048), (1024, 2048, 2048)]
+    for n, k, n2 in shapes:
+        for tokens in (1, 4, 8, 9, 64, 65, 256, 257, 1024, 1025, 2048, 2049, 8192):
+            bm, bn = moe.fp8_raw_blocks(tokens, n, k)
+            assert (str(bm), str(bn)) in instantiated, f"{bm}x{bn} not instantiated"
+            assert n % bn == 0 and n2 % bn == 0, f"block_n {bn} does not divide N"
+
+
+def test_fp8_raw_blocks_default_unchanged():
+    # The Qwen3.6-35B-A3B-FP8 table (no keyed entry) and the keyed gemma rows.
+    assert moe.fp8_raw_blocks(1, 1024, 2048) == (16, 64)
+    assert moe.fp8_raw_blocks(512, 1024, 2048) == (64, 64)
+    assert moe.fp8_raw_blocks(4096, 1024, 2048) == (64, 128)
+    assert moe.fp8_raw_blocks(4096, 1408, 2816) == (128, 128)
+    assert moe.fp8_raw_blocks(1000, 1408, 2816) == (64, 128)
+
+
+def test_fp16_activation_gate(monkeypatch):
+    # gemma-4's activations leave the fp16 range: it must not take the raw FP8
+    # kernels (fp16 activations); other architectures keep them.
+    import strix_vllm
+
+    monkeypatch.setattr(
+        strix_vllm, "_model_architectures", lambda: ["Gemma4ForConditionalGeneration"]
+    )
+    assert not strix_vllm.fp16_activations_ok("moe_fp8_raw")
+    monkeypatch.setattr(
+        strix_vllm, "_model_architectures", lambda: ["Qwen3_5MoeForConditionalGeneration"]
+    )
+    assert strix_vllm.fp16_activations_ok("moe_fp8_raw")
+    monkeypatch.setattr(strix_vllm, "_model_architectures", lambda: [])
+    assert strix_vllm.fp16_activations_ok("fp8_raw")
