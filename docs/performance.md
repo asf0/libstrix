@@ -19,24 +19,44 @@ strix over stock; the last two columns are strix's own throughput.
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Qwen3.6-35B-A3B (bf16) | 2.70× | 19.3× | 1.86× | 2.35× | 1,751 / 26.4 |
 | Qwen3.6-35B-A3B INT8 W8A8 | 2.14× | 18.3× | 1.03× | 1.53× | 1,697 / 24.5 |
+| Qwen3.6-35B-A3B FP8 (block-scaled) ⁵ | 10.4× | - | 10.8× | - | 1,688 / 34.8 |
 | Qwen3.8-27B (bf16) | 1.67× | 14.3× | 1.01× | 1.14× | 435 / 3.9 |
 | Qwen3.8-27B INT8 W8A16 + MTP | 2.56× | 14.6× | 2.38× | 2.33× | 430 / 5.7 |
 | Qwen3.8-27B Quark AWQ INT4 | 2.05× | 14.2× | 1.01× | 1.22× | 428 / 8.1 |
+| Qwen3.8-27B FP8 (block-scaled) ⁴ | - | - | 13.5× | - | 434 / 6.4 |
 | LFM2.5-24B-A2B (bf16) | 2.02× | 11.4× | 2.15× | 2.18× | 2,405 / 27.1 ¹ |
+| LFM2.5-24B-A2B FP8 (block-scaled) ⁶ | - | - | - | - | 2,244 / 33.6 ¹ |
+| Muse-Glimmer-30B FP8 (block-scaled) ⁶ | - | - | - | - | 76 / 6.5 ¹ |
+| Sage-A1.5 FP8 (per-channel) ⁷ | - | - | - | - | 1,708 / 30.6 |
+| MiniCPM-V-4.7-35B-A3B FP8 (per-channel) ⁷ ⁸ | - | - | - | - | 1,716 / 30.5 |
 | gemma-4-26B-A4B (bf16) | 4.35× | 31.1× | 1.28× | 3.33× | 1,588 / 21.5 |
 | gemma-4-26B-A4B AWQ 4-bit | 3.87× | 28.2× | 1.36× | 4.28× | 1,499 / 29.6 |
+| gemma-4-26B-A4B FP8 (per-channel) ⁷ | - | - | - | - | 1,520 / 29.8 |
 | gemma-4-31B MXFP4 ² | 2.67× | 21.0× | 6.21× | 6.99× | 296 / 7.3 |
 | gemma-4-31B qat W4A16 | 2.99× | 22.5× | 1.32× | 2.99× | 292 / 8.0 |
-| Qwen3.8-Flash-Next AWQ W4A16 ³ | 1.76× | 2.01× | 1.89× | 1.58× | 1,635 / 25.1 |
+| Qwen3.8-Flash-Next AWQ W4A16 ³ | 1.74× | 1.98× | 1.95× | 1.63× | 1,633 / 20.3 |
 
-¹ LFM2.5 caps context at 131,072; its deep point is 130,048.
-² Stock vLLM runs MXFP4 as fp4 × fp4 emulation on this GPU; strix runs it as
-fp4 weights × bf16 activations. The ratio is against a slow path, not a
-tuned one.
-³ Measured differently from the other rows; see
-[Qwen3.8-Flash-Next](#qwen38-flash-next-awq-w4a16) below. In short: bf16 KV,
-16k prefill chunks, the n-gram table streamed from disk, and a baseline that
-keeps the libstrix GDN causal conv.
+¹ LFM2.5 and Muse-Glimmer cap context at 131,072; their deep point is 130,048.
+
+² Stock runs MXFP4 as fp4 × fp4 emulation on this GPU, strix as fp4 weights ×
+bf16 activations, so the ratio is against a slow path.
+
+³ Measured differently; see [Qwen3.8-Flash-Next](#qwen38-flash-next-awq-w4a16)
+(bf16 KV, 16k prefill chunks, n-gram table read from disk, which makes single
+requests stall now and then; a baseline that keeps the libstrix GDN conv).
+
+⁴ Stock decodes this checkpoint at 0.57 tok/s (untuned Triton FP8 GEMM, one
+short-context run); no other stock points were run.
+
+⁵ Stock was measured at 2k and 8k only: 341 / 309 tok/s prefill, 4.4 tok/s
+decode.
+
+⁶ compressed-tensors block FP8; stock speed not measured.
+
+⁷ compressed-tensors per-channel FP8. Stock vLLM has no FP8 kernel for this
+format on gfx1151 and fails at start-up, so there is no stock number.
+
+⁸ Text only; the vision path is not measured.
 
 What it means:
 
@@ -47,31 +67,72 @@ What it means:
   every gemma at depth. On the 27B bf16, the Quark AWQ 27B and the 35B W8A8,
   decode is at parity with stock: nothing the plugin replaces dominates their
   decode step.
+- **FP8** decodes from the one-byte weights (W8A16). The 27B FP8 goes from
+  0.57 to 7.7 tok/s and matches the INT8 27B at every depth. The FP8 MoE models
+  decode 1.2-1.5× faster than their bf16 versions (35B 47 vs 32.8 tok/s at 2k),
+  with prefill 1-14 % behind bf16 (the FP8 weights are decoded to bf16 for the
+  large prefill GEMMs; gemma-4 also runs the slower bf16-activation kernels).
 - **No configuration is slower than stock**, single stream or batched
   (lowest: 0.98× at x16 on the 35B W8A8, inside run-to-run noise).
 
 ## Depth, strix only
 
-Prefill and decode tok/s, single stream, int8 KV. The 256k runs use
-`--gpu-memory-utilization 0.72` (the default 0.80 leaves under 10 GB of host
-memory at that depth). The 27B bf16 checkpoint does not fit 256k.
+Prefill and decode tok/s, single stream, `--gpu-memory-utilization 0.80`
+(0.72 at 256k, which leaves the host 10 GB of RAM at that depth; GPU memory is
+host RAM here). The memory setting sizes the KV cache only; it does not change
+these single-stream numbers (see Method). The README's KV-capacity table uses
+0.85, the Docker recipes' setting.
+
+int8 KV (`int8_per_token_head`, the serving dtype):
 
 | model | prefill 2k / 32k / 128k / 256k | decode 2k / 32k / 128k / 256k |
 | --- | --- | --- |
 | Qwen3.6-35B-A3B | 3,589 / 3,331 / 1,751 / 1,085 | 32.8 / 31.0 / 26.4 / 22.1 |
 | Qwen3.6-35B-A3B W8A8 | 3,221 / 3,133 / 1,697 / 1,059 | 29.7 / 28.4 / 24.5 / 20.9 |
+| Qwen3.6-35B-A3B FP8 ⁵ | 3,543 / 3,102 / 1,688 / 1,052 | 47.2 / 43.2 / 34.8 / 27.7 |
 | Qwen3.8-27B (bf16) | 709 / 611 / 435 / - | 4.4 / 4.3 / 3.9 / - |
 | Qwen3.8-27B INT8 + MTP | 692 / 603 / 430 / 312 | 7.8 / 7.2 / 5.7 / 5.5 |
+| Qwen3.8-27B FP8 ⁴ | 658 / 610 / 434 / 318 | 7.7 / 7.4 / 6.4 / 5.5 |
 | Qwen3.8-27B Quark AWQ | 688 / 598 / 428 / 312 | 13.0 / 11.4 / 8.1 / 5.8 |
-| LFM2.5-24B-A2B | 5,124 / 4,613 / 2,405 / - | 38.3 / 34.7 / 27.1 / - |
+| LFM2.5-24B-A2B ¹ | 5,124 / 4,613 / 2,405 / - | 38.3 / 34.7 / 27.1 / - |
+| LFM2.5-24B-A2B FP8 ¹ ⁶ | 4,948 / 4,052 / 2,244 / - | 52.5 / 46.3 / 33.6 / - |
+| Muse-Glimmer-30B FP8 ¹ ⁶ | 499 / 220 / 76 / - | 7.4 / 6.9 / 6.5 / - |
+| Sage-A1.5 FP8 ⁷ | 3,750 / 3,189 / 1,708 / 1,066 | 40.0 / 37.1 / 30.6 / 25.0 |
+| MiniCPM-V-4.7 FP8 ⁷ ⁸ | 3,795 / 3,196 / 1,716 / 1,067 | 39.6 / 36.9 / 30.5 / 24.8 |
 | gemma-4-26B-A4B | 3,877 / 3,071 / 1,588 / 971 | 25.9 / 24.7 / 21.5 / 18.5 |
 | gemma-4-26B-A4B AWQ | 3,358 / 2,769 / 1,499 / 934 | 38.2 / 35.6 / 29.6 / 24.1 |
+| gemma-4-26B-A4B FP8 ⁷ | 3,327 / 2,802 / 1,520 / 945 | 38.7 / 36.1 / 29.8 / 24.4 |
 | gemma-4-31B MXFP4 | 542 / 462 / 296 / 200 | 9.7 / 8.9 / 7.3 / 5.9 |
 | gemma-4-31B qat W4A16 | 535 / 452 / 292 / 198 | 10.8 / 10.0 / 8.1 / 6.4 |
-| Qwen3.8-Flash-Next AWQ ³ | 1,422 / 1,644 / 1,635 / - | 24.7 / 25.4 / 25.1 / - |
 
-Decode here is without speculation; the 27B checkpoint's MTP head is not
-used in these runs.
+bf16 KV (256k does not fit with bf16 KV):
+
+| model | prefill 2k / 32k / 128k | decode 2k / 32k / 128k |
+| --- | --- | --- |
+| Qwen3.6-35B-A3B | 3,581 / 3,393 / 1,799 | 32.6 / 29.5 / 22.8 |
+| Qwen3.6-35B-A3B W8A8 | 3,214 / 3,173 / 1,733 | 29.3 / 27.1 / 21.4 |
+| Qwen3.6-35B-A3B FP8 ⁵ | 3,531 / 3,137 / 1,722 | 46.6 / 40.5 / 28.8 |
+| Qwen3.8-27B (bf16) | 677 / 604 / 406 | 4.4 / 4.2 / 3.7 |
+| Qwen3.8-27B INT8 + MTP | 694 / 608 / 413 | 7.7 / 6.9 / 5.0 |
+| Qwen3.8-27B FP8 ⁴ | 664 / 638 / 421 | 7.7 / 7.1 / 5.8 |
+| Qwen3.8-27B Quark AWQ | 690 / 604 / 408 | 12.9 / 10.6 / 6.6 |
+| LFM2.5-24B-A2B ¹ | 5,007 / 4,593 / 2,404 | 38.3 / 34.7 / 26.8 |
+| LFM2.5-24B-A2B FP8 ¹ ⁶ | 4,972 / 4,149 / 2,261 | 52.7 / 46.0 / 33.0 |
+| Muse-Glimmer-30B FP8 ¹ ⁶ | 580 / 328 / 136 | 7.5 / 7.1 / 6.7 |
+| Sage-A1.5 FP8 ⁷ | 3,738 / 3,236 / 1,749 | 39.6 / 35.2 / 25.9 |
+| MiniCPM-V-4.7 FP8 ⁷ ⁸ | 3,785 / 3,247 / 1,754 | 39.2 / 34.8 / 25.8 |
+| gemma-4-26B-A4B | 3,591 / 3,063 / 1,485 | 24.6 / 23.2 / 18.5 |
+| gemma-4-26B-A4B AWQ | 3,395 / 2,864 / 1,554 | 37.2 / 33.2 / 24.6 |
+| gemma-4-26B-A4B FP8 ⁷ | 3,378 / 2,968 / 1,581 | 37.7 / 33.6 / 24.8 |
+| gemma-4-31B MXFP4 | 492 / 469 / 303 | 9.4 / 8.3 / 6.1 |
+| gemma-4-31B qat W4A16 | 542 / 460 / 299 | 10.4 / 9.1 / 6.6 |
+| Qwen3.8-Flash-Next AWQ ³ | 1,407 / 1,599 / 1,633 | 25.5 / 21.9 / 20.3 |
+
+Decode here is without speculation; the MTP heads are not used in these runs.
+
+Sage-A1.5 decodes slower than the 35B FP8 (40 vs 47 tok/s at 2k) because its
+checkpoint keeps the linear-attention projections in bf16. Muse-Glimmer's
+prefill falls off with depth because of its attention, not the FP8 linears.
 
 ## Batched decode
 
@@ -83,15 +144,23 @@ sequences on head 256 / GQA 8, stock Triton above that).
 | model | KV | x4 @2k | x4 @8k | x16 @2k | x16 @8k |
 | --- | --- | ---: | ---: | ---: | ---: |
 | LFM2.5-24B-A2B | int8 | 36 → **78** (2.17×) | 34 → **74** (2.15×) | 111 → **181** (1.63×) | 90 → **153** (1.71×) |
+| LFM2.5-24B-A2B-FP8 ⁶ | int8 | - → **127** (-) | - → **108** (-) | - → **291** (-) | - → **255** (-) |
+| Muse-Glimmer-30B-FP8-block ⁶ | int8 | - → **30** (-) | - → **29** (-) | - → **112** (-) | - → **109** (-) |
+| Sage-A1.5-FP8 ⁷ | int8 | - → **122** (-) | - → **101** (-) | - → **231** (-) | - → **215** (-) |
+| MiniCPM-V-4.7-35B-A3B-FP8 ⁸ | int8 | - → **101** (-) | - → **101** (-) | - → **294** (-) | - → **206** (-) |
 | Qwen3.6-35B-A3B | bf16 | 41 → **93** (2.25×) | 38 → **79** (2.12×) | 97 → **164** (1.68×) | 83 → **141** (1.69×) |
 | Qwen3.6-35B-A3B | int8 | 39 → **97** (2.51×) | 37 → **82** (2.20×) | 92 → **167** (1.82×) | 84 → **152** (1.82×) |
 | Qwen3.6-35B-A3B-INT8-W8A8 | bf16 | 80 → **80** (1.00×) | 68 → **70** (1.04×) | 170 → **167** (0.98×) | 146 → **153** (1.05×) |
 | Qwen3.6-35B-A3B-INT8-W8A8 | int8 | 78 → **84** (1.08×) | 72 → **78** (1.08×) | 183 → **180** (0.98×) | 153 → **167** (1.09×) |
+| Qwen3.6-35B-A3B-FP8 ⁵ | bf16 | - → **103** (-) | - → **100** (-) | - → **243** (-) | - → **193** (-) |
+| Qwen3.6-35B-A3B-FP8 ⁵ | int8 | - → **107** (-) | - → **107** (-) | - → **255** (-) | - → **213** (-) |
 | Qwen3.8-27B | int8 | 17 → **17** (1.02×) | 16 → **17** (1.06×) | 57 → **60** (1.06×) | 49 → **58** (1.17×) |
 | Qwen3.8-27B-INT8-W8A16-MTP | int8 | 13 → **29** (2.30×) | 12 → **28** (2.30×) | 46 → **96** (2.09×) | 40 → **84** (2.08×) |
+| Qwen3.8-27B-FP8 ⁴ | int8 | - → **29** (-) | - → **28** (-) | - → **100** (-) | - → **93** (-) |
 | Qwen3.8-27B-Quark-AWQ-INT4-W4A16 | int8 | 47 → **50** (1.05×) | 41 → **45** (1.11×) | 100 → **122** (1.21×) | 79 → **104** (1.31×) |
 | gemma-4-26B-A4B-it | int8 | 40 → **67** (1.67×) | 33 → **67** (2.02×) | 86 → **158** (1.85×) | 74 → **175** (2.36×) |
 | gemma-4-26B-A4B-it-AWQ-4bit | int8 | 56 → **99** (1.77×) | 43 → **86** (1.99×) | 100 → **230** (2.29×) | 78 → **225** (2.89×) |
+| gemma-4-26B-A4B-it-FP8-dynamic ⁷ | int8 | - → **102** (-) | - → **103** (-) | - → **254** (-) | - → **263** (-) |
 | gemma-4-31B-it-MXFP4 | int8 | 6 → **29** (5.19×) | 5 → **28** (5.46×) | 14 → **92** (6.43×) | 12 → **83** (6.81×) |
 | gemma-4-31B-it-qat-w4a16-ct | int8 | 21 → **39** (1.84×) | 15 → **37** (2.38×) | 22 → **104** (4.72×) | 17 → **93** (5.45×) |
 | Qwen3.8-Flash-Next-AWQ-W4A16 ³ | bf16 | 37 → **44** (1.18×) | 32 → **40** (1.26×) | 81 → **96** (1.18×) | 78 → **90** (1.16×) |
@@ -107,12 +176,21 @@ Qwen3.8-27B INT8 W8A16 with MTP k=2, int8 KV, 131k context, 40 concurrent
 sequences, gmu 0.7, driven by `vllm bench serve` with 80 requests of 2,048
 tokens in / 1,024 out.
 
-| metric | strix |
-| --- | ---: |
-| output throughput | 123.3 tok/s |
-| total throughput | 369.9 tok/s |
-| TPOT mean / median / p99 | 240 / 228 / 552 ms |
-| TTFT median | 13.8 s |
+| metric | 27B INT8 W8A16 + MTP | 27B FP8 + MTP ⁴ | 35B-A3B FP8 + MTP ⁵ | Sage-A1.5 FP8 + MTP ⁷ |
+| --- | ---: | ---: | ---: | ---: |
+| output throughput | 123.3 tok/s | 115.4 tok/s | 300.1 tok/s | 227.3 tok/s |
+| total throughput | 369.9 tok/s | 346.1 tok/s | 900.2 tok/s | 681.8 tok/s |
+| TPOT mean / median / p99 | 240 / 228 / 552 ms | 259 / 238 / 561 ms | 109 / 106 / 176 ms | 143 / 133 / 248 ms |
+| TTFT median | 13.8 s | 10.8 s | 2.3 s | 2.1 s |
+
+p99 TPOT is the slowest one or two of 80 requests and varies between runs
+(27B FP8: 462-561 ms over four runs, mean within 3 %). Sage trails the 35B FP8
+for the reason above and a lower MTP acceptance on random prompts (1.62 vs 2.25
+tokens per step).
+
+FP8 MoE checkpoints need `VLLM_ROCM_USE_AITER_MOE=0` when the server script
+exports `VLLM_ROCM_USE_AITER=1`: vLLM then demands the AITER FP8 MoE backend,
+which does not support this GPU, and the engine fails at start-up.
 
 ## Accuracy: KLD against stock
 
@@ -134,8 +212,21 @@ the same argmax. PPL deltas are only comparable within a row.
 | | 128k | 98.3% | 2.673 → 2.673 | 0.0022 | 0.0068 |
 | Qwen3.8-27B Quark AWQ | 2k | 98.3% | 3.865 → 3.874 | 0.0065 | 0.0067 |
 | | 32k | 98.2% | 3.469 → 3.476 | 0.0015 | 0.0052 |
+| Qwen3.8-27B FP8 ⁴ | 2k | 97.4% | 3.807 → 3.806 | 0.0032 | 0.0092 |
+| Qwen3.6-35B-A3B FP8 ⁵ | 2k | 97.0% | 3.648 → 3.671 | 0.0080 | 0.030 |
+| | 32k | 97.0% | 3.324 → 3.331 | 0.0060 | 0.018 |
 | LFM2.5-24B-A2B | 2k | 94.2% | 6.488 → 6.509 | 0.034 | 0.094 |
 | | 32k | 95.5% | 5.711 → 5.798 | 0.023 | 0.082 |
+| LFM2.5-24B-A2B FP8 ⁶ | 2k | 90.2% | 6.404 → 6.687 | 0.077 | 0.25 |
+| | 32k | 91.1% | 5.867 → 6.025 | 0.080 | 0.20 |
+| Muse-Glimmer-30B FP8 ⁶ | 2k | 98.3% | 3.894 → 3.893 | 0.0030 | 0.0096 |
+| | 32k | 98.3% | 3.324 → 3.329 | 0.0023 | 0.0079 |
+| Sage-A1.5 FP8 ⁷ ⁹ | 2k | 96.9% | 3.869 → 3.882 | 0.0049 | 0.015 |
+| | 32k | 97.3% | 3.401 → 3.408 | 0.0038 | 0.013 |
+| MiniCPM-V-4.7 FP8 ⁷ ⁹ | 2k | 97.6% | 3.720 → 3.739 | 0.0052 | 0.022 |
+| | 32k | 97.8% | 3.420 → 3.435 | 0.0025 | 0.0095 |
+| gemma-4-26B-A4B FP8 ⁷ ¹⁰ | 2k | 100% | 14.34 → 14.34 | 0.0000 | 0.0000 |
+| | 32k | 90.6% | 42.97 → 43.00 | 0.17 | 0.68 |
 | gemma-4-26B-A4B | 2k | 85.5% | 16.33 → 16.50 | 0.28 | 1.28 |
 | | 32k | 88.4% | 51.95 → 55.06 | 0.22 | 1.00 |
 | | 128k | 88.5% | 28.95 → 33.80 | 0.20 | 0.98 |
@@ -150,11 +241,31 @@ the same argmax. PPL deltas are only comparable within a row.
 | | 32k | 96.8% | 3.056 → 3.074 | 0.0091 | 0.037 |
 | | 128k | 98.1% | 2.442 → 2.443 | 0.0078 | 0.029 |
 
+⁹ Stock cannot load per-channel FP8 here, so its side is an exact bf16 copy of
+the same weights.
+
+¹⁰ Against the plugin on an exact bf16 copy of the same weights, so only the FP8
+path differs. gemma-4 runs the bf16-activation FP8 kernels: its activations
+overflow fp16, and the fp16 (raw) ones put it at 0.23 here.
+
 Reading it:
 
 - **Qwen3.6 and Qwen3.8-27B are at the noise floor.** Two stock runs of the 27B INT8 differ by
   0.0006 on their own; every Qwen row is within a few times that, with
   97-99% top-1 agreement at every depth.
+- **Qwen3.6-35B-A3B FP8** (0.006-0.008) is above the bf16 35B (0.003-0.005) for
+  the same reason as the 27B FP8: stock quantizes activations to FP8, the plugin
+  keeps them in bf16. Against the stock bf16 model the plugin is the closer of
+  the two (table below). The speed fixes that kept the arithmetic (row padding, tile table)
+  left every number bit-identical, since each output sums over K in the same
+  order whatever the tile; the raw-decode kernels (exact fp16 weights, scale on
+  the fp32 accumulator) moved KLD by less than 0.001.
+- **Qwen3.8-27B FP8** (0.0032 at 2k) is slightly above the INT8 row. The two
+  sides are different arithmetic: vLLM quantizes activations to FP8 and
+  multiplies FP8 × FP8, the plugin keeps them in bf16. Perplexity is unchanged
+  (-0.04%). Stock was run at 2k only; a 32k stock prefill was not attempted.
+  The table below scores the plugin against stock bf16 instead, which is the
+  quantization error plus the kernels.
 - **Qwen3.8-Flash-Next** (0.008-0.019) is above the 27B floor. Its MoE GEMM
   quantizes activations to int8 per 128-group (`moe_w4a8`), which is a different
   arithmetic, not a bf16 reordering. Perplexity is unchanged at 2k and 128k
@@ -173,6 +284,53 @@ Reading it:
 - **gemma-4-31B qat** sits at its own floor: stock's Triton W4A16 kernel is
   split-K with a varying reduction order, so two stock runs differ by 0.014.
 
+### Qwen3.8-27B-FP8 against stock bf16
+
+The plugin on the FP8 checkpoint, scored against the stock bf16 Qwen3.8-27B
+reference sequences (same wikitext tails, top-20 logprobs). This is quantization
+plus kernels, not kernel error alone.
+
+| depth | top-1 | PPL bf16 stock → FP8 strix | KLD mean | KLD p95 |
+| ---: | ---: | --- | ---: | ---: |
+| 2k | 97.3% | 3.798 → 3.813 | 0.0043 | 0.0122 |
+| 32k | 97.9% | 3.360 → 3.390 | 0.0051 | 0.0095 |
+
+GSM8K (greedy, n = 250, plugin on): 238 correct. The bf16 27B scores 237 stock
+and 235 with the plugin. Stock FP8 was not run: at 0.57 tok/s decode it
+would take hours.
+
+### The compressed-tensors FP8 checkpoints
+
+- **LFM2.5 FP8** (0.08) differs because stock rounds activations to FP8 and the
+  plugin does not: against the bf16 LFM2.5 at 2k the plugin is the closer of
+  the two (KLD 0.078 vs 0.092 for stock FP8).
+- **gemma-4-26B FP8** is bit-identical to its bf16 weights at 2k. At 32k the
+  scored tail is a 512-token last chunk, which the fused FP8 kernel takes (it
+  applies the scale in fp32 to the exact FP8 values; the bf16 copy holds
+  rounded weights). Sending those rows through the dequant + hipBLASLt path
+  instead makes 32k bit-identical too (KLD 0.0000, 100 % top-1), so the 0.17 is
+  that rounding difference, which gemma amplifies as it does for the bf16
+  checkpoint (0.2-0.3 above).
+- **Sage-A1.5 and MiniCPM-V-4.7** (0.004-0.005) sit at the bf16 35B's level.
+- GSM8K (n = 250, plugin on): Muse-Glimmer 224, LFM2.5 202, Sage 236 (bf16
+  Qwen3.6-35B: 237-238), gemma-4-26B 242, MiniCPM-V-4.7 242.
+
+### Qwen3.6-35B-A3B-FP8 against stock bf16
+
+Same method: the plugin and stock vLLM on the FP8 checkpoint, each scored against
+the stock bf16 Qwen3.6-35B-A3B reference sequences.
+
+| depth | side | top-1 | PPL (bf16 stock → FP8) | KLD mean | KLD p95 |
+| ---: | --- | ---: | --- | ---: | ---: |
+| 2k | strix | 95.9% | 3.688 → 3.695 | 0.0090 | 0.031 |
+| 2k | stock | 96.3% | 3.688 → 3.681 | 0.0114 | 0.043 |
+| 32k | strix | 96.3% | 3.306 → 3.307 | 0.0070 | 0.021 |
+| 32k | stock | 95.6% | 3.306 → 3.308 | 0.0084 | 0.027 |
+
+The plugin is closer to bf16 than stock FP8 at both depths (KLD 17-21% lower).
+GSM8K (n = 250, plugin on): 240 correct; the bf16 35B scores 237 and 238 with
+the plugin and MTP. The 128k point was not run for this model.
+
 ## Method
 
 - One request per depth in a fresh engine per config: prompt of exactly that
@@ -180,8 +338,15 @@ Reading it:
   depth / TTFT; decode is 1000 / ms per step. Depths below 64k run twice and
   report the second.
 - `--max-num-seqs 1`, prefix caching off, prefill chunk 8,192 tokens,
-  `--gpu-memory-utilization 0.80` (0.72 at 256k).
+  `--gpu-memory-utilization 0.80` (0.72 at 256k). The setting does not move
+  single-stream speed: Qwen3.6-35B-A3B-FP8 at 0.80 and 0.85 (int8 KV, same
+  session) measured 0.578 / 0.577 s prefill and 21.20 / 21.18 ms decode at 2k,
+  2.094 / 2.095 s and 21.71 / 21.69 ms at 8k.
 - Batched: N sequences decode together after a 2k or 8k context, 64 steps.
+- Qwen3.6-35B-A3B-FP8 has stock points at 2k and 8k only (see its table).
+- Qwen3.8-27B-FP8 has no stock sweep: stock decodes it at 0.57 tok/s.
+  Its int8-KV depths 2k-128k and its 256k point are separate runs; a first
+  int8-KV pass measured 7-15% slow on one session and was repeated.
 - Stock is measured to 64k on every model and at 128k and 256k on a
   subset: a single stock request at those depths takes 30 minutes to 4
   hours.
@@ -214,6 +379,33 @@ decode tok/s
 | 32,768 | 17.14 | 34.68 | 2.02x | 16.06 | 34.72 | 2.16x |
 | 65,536 | 16.25 | 31.50 | 1.94x | 14.51 | 31.69 | 2.18x |
 | 130,048 | 14.88 | 26.77 | 1.80x | 12.28 | 27.11 | 2.21x |
+
+### LFM2.5-24B-A2B-FP8
+
+Block FP8, 64 experts (top-4) (⁶).
+
+prefill tok/s
+
+| depth | bf16 strix | int8 strix |
+| ---: | ---: | ---: |
+| 2,048 | 4,972 | 4,948 |
+| 8,192 | 5,052 | 5,002 |
+| 16,384 | 4,723 | 4,634 |
+| 32,768 | 4,149 | 4,052 |
+| 65,536 | 3,291 | 3,196 |
+| 130,048 | 2,261 | 2,244 |
+
+decode tok/s
+
+| depth | bf16 strix | int8 strix |
+| ---: | ---: | ---: |
+| 2,048 | 52.72 | 52.53 |
+| 8,192 | 51.15 | 51.26 |
+| 16,384 | 49.32 | 49.52 |
+| 32,768 | 46.02 | 46.31 |
+| 65,536 | 40.54 | 41.11 |
+| 130,048 | 33.04 | 33.64 |
+
 
 ### Qwen3.6-35B-A3B
 
@@ -267,6 +459,37 @@ decode tok/s
 | 131,072 | 13.00 | 21.38 | 1.65x | 12.47 | 24.52 | 1.97x |
 | 261,120 | - | - | - | 7.90 | 20.88 | 2.64x |
 
+### Qwen3.6-35B-A3B-FP8
+
+Block-scaled FP8 (128x128), dense and expert GEMMs. Stock is measured only at 2k and 8k
+(int8 KV, one pass each): 341 / 309 tok/s prefill and 4.37 / 4.32 tok/s decode, against
+the strix int8 column below. The deeper stock points were not run.
+
+prefill tok/s
+
+| depth | bf16 stock | bf16 strix | x | int8 stock | int8 strix | x |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,048 | - | 3,531 | - | 341 | 3,541 | 10.4x |
+| 8,192 | - | 3,906 | - | 309 | 3,884 | 12.6x |
+| 16,384 | - | 3,611 | - | - | 3,581 | - |
+| 32,768 | - | 3,137 | - | - | 3,102 | - |
+| 65,536 | - | 2,464 | - | - | 2,423 | - |
+| 131,072 | - | 1,722 | - | - | 1,688 | - |
+| 261,120 | - | - | - | - | 1,052 | - |
+
+decode tok/s
+
+| depth | bf16 stock | bf16 strix | x | int8 stock | int8 strix | x |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,048 | - | 46.63 | - | 4.37 | 47.18 | 10.8x |
+| 8,192 | - | 45.08 | - | 4.32 | 46.08 | 10.7x |
+| 16,384 | - | 43.51 | - | - | 45.05 | - |
+| 32,768 | - | 40.52 | - | - | 43.19 | - |
+| 65,536 | - | 35.75 | - | - | 39.98 | - |
+| 131,072 | - | 28.77 | - | - | 34.78 | - |
+| 261,120 | - | - | - | - | 27.67 | - |
+
+
 ### Qwen3.8-27B
 
 prefill tok/s
@@ -317,6 +540,36 @@ decode tok/s
 | 131,072 | 2.42 | 4.95 | 2.04x | - | 5.71 | - |
 | 261,120 | - | - | - | - | 5.54 | - |
 
+### Qwen3.8-27B-FP8
+
+Block-scaled FP8 (128x128). Stock is not measured: its Triton FP8 GEMM has no
+tuned config here and decodes at 0.57 tok/s (footnote 4 above), so the stock
+sweep was skipped.
+
+prefill tok/s
+
+| depth | bf16 stock | bf16 strix | x | int8 stock | int8 strix | x |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,048 | - | 664 | - | - | 658 | - |
+| 8,192 | - | 711 | - | - | 682 | - |
+| 16,384 | - | 684 | - | - | 656 | - |
+| 32,768 | - | 638 | - | - | 610 | - |
+| 65,536 | - | 560 | - | - | 537 | - |
+| 131,072 | - | 421 | - | - | 434 | - |
+| 261,120 | - | - | - | - | 318 | - |
+
+decode tok/s
+
+| depth | bf16 stock | bf16 strix | x | int8 stock | int8 strix | x |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,048 | - | 7.68 | - | - | 7.70 | - |
+| 8,192 | - | 7.59 | - | - | 7.65 | - |
+| 16,384 | - | 7.44 | - | - | 7.58 | - |
+| 32,768 | - | 7.14 | - | - | 7.41 | - |
+| 65,536 | - | 6.60 | - | - | 7.05 | - |
+| 131,072 | - | 5.75 | - | - | 6.45 | - |
+| 261,120 | - | - | - | - | 5.48 | - |
+
 ### Qwen3.8-27B-Quark-AWQ-INT4-W4A16
 
 prefill tok/s
@@ -342,6 +595,116 @@ decode tok/s
 | 65,536 | 7.61 | 8.82 | 1.16x | 8.22 | 10.06 | 1.22x |
 | 131,072 | - | 6.63 | - | - | 8.10 | - |
 | 261,120 | - | - | - | - | 5.84 | - |
+
+### Muse-Glimmer-30B-FP8-block
+
+Dense, block FP8 (⁶).
+
+prefill tok/s
+
+| depth | bf16 strix | int8 strix |
+| ---: | ---: | ---: |
+| 2,048 | 580 | 499 |
+| 8,192 | 495 | 374 |
+| 16,384 | 421 | 300 |
+| 32,768 | 328 | 220 |
+| 65,536 | 223 | 141 |
+| 130,048 | 136 | 76 |
+
+decode tok/s
+
+| depth | bf16 strix | int8 strix |
+| ---: | ---: | ---: |
+| 2,048 | 7.47 | 7.45 |
+| 8,192 | 7.38 | 7.34 |
+| 16,384 | 7.26 | 7.17 |
+| 32,768 | 7.06 | 6.92 |
+| 65,536 | 6.92 | 6.75 |
+| 130,048 | 6.71 | 6.51 |
+
+### Sage-A1.5-FP8
+
+Per-channel FP8, Qwen3.6-35B-A3B shapes, linear-attention projections in bf16 (⁷).
+
+prefill tok/s
+
+| depth | bf16 strix | int8 strix |
+| ---: | ---: | ---: |
+| 2,048 | 3,738 | 3,750 |
+| 8,192 | 4,044 | 4,053 |
+| 16,384 | 3,729 | 3,707 |
+| 32,768 | 3,236 | 3,189 |
+| 65,536 | 2,510 | 2,471 |
+| 131,072 | 1,749 | 1,708 |
+| 261,120 | - | 1,066 |
+
+decode tok/s
+
+| depth | bf16 strix | int8 strix |
+| ---: | ---: | ---: |
+| 2,048 | 39.62 | 40.01 |
+| 8,192 | 38.50 | 39.19 |
+| 16,384 | 37.36 | 38.49 |
+| 32,768 | 35.17 | 37.14 |
+| 65,536 | 31.51 | 34.71 |
+| 131,072 | 25.93 | 30.62 |
+| 261,120 | - | 25.03 |
+
+### MiniCPM-V-4.7-35B-A3B-FP8
+
+Per-channel FP8, Qwen3.6-35B-A3B language model (⁷ ⁸).
+
+prefill tok/s
+
+| depth | bf16 strix | int8 strix |
+| ---: | ---: | ---: |
+| 2,048 | 3,785 | 3,795 |
+| 8,192 | 4,082 | 4,049 |
+| 16,384 | 3,757 | 3,712 |
+| 32,768 | 3,247 | 3,196 |
+| 65,536 | 2,524 | 2,475 |
+| 131,072 | 1,754 | 1,716 |
+| 261,120 | - | 1,067 |
+
+decode tok/s
+
+| depth | bf16 strix | int8 strix |
+| ---: | ---: | ---: |
+| 2,048 | 39.18 | 39.60 |
+| 8,192 | 38.12 | 38.86 |
+| 16,384 | 36.99 | 38.21 |
+| 32,768 | 34.84 | 36.86 |
+| 65,536 | 31.24 | 34.50 |
+| 131,072 | 25.75 | 30.49 |
+| 261,120 | - | 24.83 |
+
+### gemma-4-26B-A4B-it-FP8-dynamic
+
+Per-channel FP8, 128 experts (top-8), bf16-activation FP8 kernels (¹⁰) (⁷).
+
+prefill tok/s
+
+| depth | bf16 strix | int8 strix |
+| ---: | ---: | ---: |
+| 2,048 | 3,378 | 3,327 |
+| 8,192 | 3,647 | 3,517 |
+| 16,384 | 3,480 | 3,228 |
+| 32,768 | 2,968 | 2,802 |
+| 65,536 | 2,288 | 2,189 |
+| 131,072 | 1,581 | 1,520 |
+| 261,120 | - | 945 |
+
+decode tok/s
+
+| depth | bf16 strix | int8 strix |
+| ---: | ---: | ---: |
+| 2,048 | 37.72 | 38.72 |
+| 8,192 | 36.89 | 38.17 |
+| 16,384 | 35.70 | 37.44 |
+| 32,768 | 33.62 | 36.10 |
+| 65,536 | 30.00 | 33.70 |
+| 131,072 | 24.75 | 29.83 |
+| 261,120 | - | 24.37 |
 
 ### gemma-4-26B-A4B-it
 
@@ -461,31 +824,40 @@ GDN causal conv, the engine fails at startup: the next n-gram lookup reads
 out-of-range ids. This happens at 8k and at 16k chunks. Strix's own conv is
 a small part of the prefill step, so the ratios are close to plugin-off.
 
+Strix is two sweeps from 2026-10-31 (MTP 2: one). Prefill is the median of
+the requests that did not stall on the n-gram table (⁴); decode is the range
+over all runs, since each decoded token also reads the table.
+
 prefill tok/s
 
 | depth | stock | strix | x | strix + MTP 2 |
 | ---: | ---: | ---: | ---: | ---: |
-| 2,048 | 807 | 1,422 | 1.76x | 1,361 |
-| 8,192 | 792 | 1,602 | 2.02x | 1,301 |
-| 16,384 | 889 | 1,124 ⁴ | 1.26x | 1,526 |
-| 32,768 | 819 | 1,644 | 2.01x | 1,574 |
-| 65,536 | 827 | 1,661 | 2.01x | 1,582 |
-| 131,072 | 827 | 1,635 | 1.98x | 1,492 |
+| 2,048 | 807 | 1,407 | 1.74x | 1,359 |
+| 8,192 | 792 | 1,491 | 1.88x | 1,499 |
+| 16,384 | 889 | 1,534 | 1.73x | 1,563 |
+| 32,768 | 819 | 1,599 | 1.95x | 1,539 |
+| 65,536 | 827 | 1,636 | 1.98x | 1,582 ⁶ |
+| 131,072 | 827 | 1,633 | 1.97x | 1,492 ⁶ |
 
 decode tok/s
 
-| depth | stock | strix | x | strix + MTP 2 ⁵ |
-| ---: | ---: | ---: | ---: | ---: |
-| 2,048 | 13.11 | 24.73 | 1.89x | 33.3 |
-| 8,192 | 13.99 | 25.43 | 1.82x | 30.9 |
-| 16,384 | 15.54 | 26.66 | 1.72x | 32.3 |
-| 32,768 | 14.36 | 25.36 | 1.77x | 33.0 |
-| 65,536 | 16.54 | 26.12 | 1.58x | 51.4 |
-| 131,072 | 14.35 | 25.06 | 1.75x | 35.8 |
+| depth | stock | strix | strix + MTP 2 ⁵ |
+| ---: | ---: | ---: | ---: |
+| 2,048 | 13.11 | 24.7-27.0 | 30.3-50.7 |
+| 8,192 | 13.99 | 21.6-28.6 | 26.8-30.9 |
+| 16,384 | 15.54 | 18.8-26.7 | 22.4-44.4 |
+| 32,768 | 14.36 | 19.6-25.4 | 25.2-33.0 |
+| 65,536 | 16.54 | 25.6-28.4 | 51.0-51.4 |
+| 131,072 | 14.35 | 19.1-25.1 | 26.4-35.8 |
 
-⁴ Reproducible: in a fresh engine, the first 16k request takes 11.0 s
-(1,490 tok/s) and the second, the one reported, takes 14.6 s. No other depth
-shows this.
-⁵ Random-token prompts, so MTP acceptance is low and varies from request to
-request. On real text (the vLLM docs), MTP 2 decodes at 40–43 tok/s, with
-prefill of 1,539 / 1,617 / 1,572 tok/s at 5.6k / 26.9k / 100.5k.
+⁴ The table lives on disk and only ~17 GB of it stays in the page cache, so a
+request now and then waits on reads: 2-10× slower, at a different depth each
+run (176 s instead of ~11 s at 16k in one sweep, 179 s instead of 80 s at 128k
+in the other), with I/O pressure at 94 % while it lasts. The earlier version of
+this table had such a stall at 16k.
+
+⁵ Random-token prompts, so MTP acceptance varies from request to request. On
+real text (the vLLM docs), MTP 2 decodes at 40–43 tok/s, with prefill of
+1,539 / 1,617 / 1,572 tok/s at 5.6k / 26.9k / 100.5k.
+
+⁶ From the 2026-10-29 run; the 2026-10-31 request stalled (⁴).
