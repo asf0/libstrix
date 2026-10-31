@@ -7,7 +7,9 @@ python bench/model/gsm8k_check.py --model M
 
 import argparse
 import json
+import os
 import re
+import sys
 
 from datasets import load_dataset
 from vllm import LLM, SamplingParams
@@ -74,6 +76,15 @@ def main() -> None:
     if args.save:
         with open(args.save, "w") as f:
             json.dump(hits, f)
+    # Interpreter teardown can hang with the EngineCore still busy-polling:
+    # stop it explicitly, then exit without running finalizers.
+    try:
+        llm.llm_engine.engine_core.shutdown(timeout=30)
+    except Exception as e:  # noqa: BLE001
+        print(f"engine shutdown: {e}", file=sys.stderr)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
