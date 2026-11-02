@@ -37,13 +37,15 @@ _MIN_ROWS = int(os.environ.get("STRIX_QSA_UNION_MIN_ROWS", "1024"))
 _MAX_POSITIONS = 131072
 
 
-def _union_ok(q, k_cache, v_cache, logical_indices, block_table) -> bool:
+def _union_shape_ok(q, k_cache, v_cache, logical_indices, block_table) -> bool:
+    """A single-request prefill the union kernel takes, positions aside."""
     return (
         q.shape[0] >= _MIN_ROWS
         and block_table.dim() == 2
         and block_table.shape[0] == 1
-        and block_table.shape[1] * k_cache.shape[1] <= _MAX_POSITIONS
-        and q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+        and q.dtype == torch.bfloat16
+        and k_cache.dtype == v_cache.dtype
+        and k_cache.dtype in (torch.bfloat16, torch.int8)
         and q.dim() == 3
         and q.shape[2] == 256
         and q.stride(2) == 1
@@ -56,8 +58,16 @@ def _union_ok(q, k_cache, v_cache, logical_indices, block_table) -> bool:
     )
 
 
+def _dequant_pages(cache, scale, block_table, tokens):
+    """The request's first `tokens` positions of an int8_per_token_head cache
+    as a contiguous bf16 cache [pages, block, Hkv, 256], scaled in fp32."""
+    pages = block_table[0, : -(-tokens // cache.shape[1])].long()
+    return (cache[pages].float() * scale[pages][..., None]).to(torch.bfloat16)
+
+
 _HC_MIN_ROWS = 512
 _F16 = os.environ.get("STRIX_QSA_UNION_F16", "0") == "1"
+_UNION_ROWS = int(os.environ.get("STRIX_QSA_UNION_ROWS", "16"))
 
 
 _IDX_MIN_ROWS = 128
@@ -189,22 +199,50 @@ def _register_qsa_union() -> None:
     orig = ops.qsa_sparse_paged_attention
 
     def qsa_sparse_paged_attention(
-        q, k_cache, v_cache, logical_indices, block_table, token_to_req, out=None
+        q, k_cache, v_cache, logical_indices, block_table, token_to_req, out=None,
+        k_scale=None, v_scale=None,
     ):
-        if not _union_ok(q, k_cache, v_cache, logical_indices, block_table):
+        int8 = k_cache.dtype == torch.int8
+        scales = {} if k_scale is None else {"k_scale": k_scale, "v_scale": v_scale}
+        if (int8 and k_scale is None) or not _union_shape_ok(
+            q, k_cache, v_cache, logical_indices, block_table
+        ):
             return orig(
-                q, k_cache, v_cache, logical_indices, block_table, token_to_req, out
+                q, k_cache, v_cache, logical_indices, block_table, token_to_req, out,
+                **scales,
             )
+        # The union bitmap covers positions < 131072. A cache that cannot hold
+        # more needs no check; otherwise the request's own length decides
+        # (the largest selected position, one host sync), so a server with a
+        # longer --max-model-len still takes the union kernel up to 128k.
+        # An int8 cache and STRIX_QSA_UNION_F16 need that length anyway: the
+        # kernel gathers from a compact fp16 copy of the visible K/V.
+        capacity = block_table.shape[1] * k_cache.shape[1]
+        tokens = 0
+        if int8 or _F16 or capacity > _MAX_POSITIONS:
+            tokens = int(logical_indices.max()) + 1
+            if tokens <= 0:  # nothing selected: the Triton kernel writes zeros
+                return orig(
+                    q, k_cache, v_cache, logical_indices, block_table, token_to_req,
+                    out, **scales,
+                )
+        if tokens > _MAX_POSITIONS or (int8 and _UNION_ROWS != 16):
+            if not int8:
+                return orig(
+                    q, k_cache, v_cache, logical_indices, block_table, token_to_req, out
+                )
+            # Past the union bitmap, int8: the Triton kernel reads bf16 K/V 2.3x
+            # faster than int8 (16k rows, 2k selected, 32k context: 227 vs
+            # 531 ms per layer), so dequantize the request's pages once.
+            k16 = _dequant_pages(k_cache, k_scale, block_table, tokens)
+            v16 = _dequant_pages(v_cache, v_scale, block_table, tokens)
+            pages = torch.arange(k16.shape[0], device=q.device, dtype=torch.int32)
+            return orig(q, k16, v16, logical_indices, pages[None], token_to_req, out)
         if out is None:
             out = torch.empty_like(q)
-        # STRIX_QSA_UNION_F16=1: gather from a compact fp16 copy of the
-        # visible K/V instead of the paged bf16 cache (one extra pass per
-        # layer). The token count comes from the selection itself.
-        tokens = 0
-        if _F16:
-            tokens = int(logical_indices.max()) + 1
         torch.ops.strix.qsa_union_attn_bf16(
-            out, q, k_cache, v_cache, logical_indices, block_table[0], tokens
+            out, q, k_cache, v_cache, logical_indices, block_table[0],
+            tokens if (int8 or _F16) else 0, k_scale, v_scale,
         )
         return out
 

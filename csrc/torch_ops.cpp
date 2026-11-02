@@ -34,12 +34,16 @@ void qsa_indexer_bf16(torch::Tensor& logits, torch::Tensor& visible,
                       int64_t compress_ratio, double score_divisor);
 void qsa_kv_to_f16(torch::Tensor& k16, torch::Tensor& v16,
                    const torch::Tensor& key_cache, const torch::Tensor& value_cache,
-                   const torch::Tensor& block_table, int64_t tokens);
+                   const torch::Tensor& block_table, int64_t tokens,
+                   const std::optional<torch::Tensor>& k_scale,
+                   const std::optional<torch::Tensor>& v_scale);
 void qsa_union_attn_bf16(torch::Tensor& out, const torch::Tensor& q,
                          const torch::Tensor& key_cache,
                          const torch::Tensor& value_cache,
                          const torch::Tensor& indices,
-                         const torch::Tensor& block_table, int64_t tokens = 0);
+                         const torch::Tensor& block_table, int64_t tokens,
+                         const std::optional<torch::Tensor>& k_scale,
+                         const std::optional<torch::Tensor>& v_scale);
 void moe_act_quant_i8(const torch::Tensor& x, torch::Tensor& q, torch::Tensor& sa);
 void moe_gemm_w4a8(torch::Tensor& c, const torch::Tensor& qa,
                    const torch::Tensor& sa, const torch::Tensor& w,
@@ -198,10 +202,12 @@ TORCH_LIBRARY(strix, m) {
   // Qwen3.8-Flash-Next QSA sparse attention over row unions (single request).
   m.def(
       "qsa_kv_to_f16(Tensor(a!) k16, Tensor(b!) v16, Tensor key_cache, "
-      "Tensor value_cache, Tensor block_table, int tokens) -> ()");
+      "Tensor value_cache, Tensor block_table, int tokens, Tensor? k_scale=None, "
+      "Tensor? v_scale=None) -> ()");
   m.def(
       "qsa_union_attn_bf16(Tensor(a!) out, Tensor q, Tensor key_cache, "
-      "Tensor value_cache, Tensor indices, Tensor block_table, int tokens=0) -> ()");
+      "Tensor value_cache, Tensor indices, Tensor block_table, int tokens=0, "
+      "Tensor? k_scale=None, Tensor? v_scale=None) -> ()");
   // int8 activations per (row, 128-element group) for moe_gemm_w4a8.
   m.def("moe_act_quant_i8(Tensor x, Tensor(a!) q, Tensor(b!) sa) -> ()");
   m.def(

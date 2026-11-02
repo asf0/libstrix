@@ -28,7 +28,9 @@
 namespace strix {
 void qsa_kv_to_f16(torch::Tensor& k16, torch::Tensor& v16,
                    const torch::Tensor& key_cache, const torch::Tensor& value_cache,
-                   const torch::Tensor& block_table, int64_t tokens);
+                   const torch::Tensor& block_table, int64_t tokens,
+                   const std::optional<torch::Tensor>& k_scale,
+                   const std::optional<torch::Tensor>& v_scale);
 namespace {
 
 constexpr int kMaxWords = 4096;   // bitmap words: positions < 131072
@@ -313,7 +315,10 @@ __attribute__((amdgpu_waves_per_eu(8))) void qsa_union_attn_kernel(
 }  // namespace
 
 // out, q: [rows, Hq, 256] bf16 (last dim contiguous), Hq = 12 * Hkv;
-// key_cache / value_cache: [num_blocks, block_size, Hkv, 256] bf16 views;
+// key_cache / value_cache: [num_blocks, block_size, Hkv, 256] bf16 views, or
+// int8 views of an int8_per_token_head cache with k_scale / v_scale fp32
+// [num_blocks, block_size, Hkv] (dequantized into the compact fp16 copy, so
+// compact_tokens must be the request's length);
 // indices: [rows, width] int32 request-relative token positions, -1 padded;
 // block_table: [max_blocks] int32 of the one request. Positions must be below
 // 131072 (the union bitmap); the caller keeps longer requests on Triton.
@@ -322,11 +327,16 @@ void qsa_union_attn_bf16(torch::Tensor& out, const torch::Tensor& q,
                          const torch::Tensor& value_cache,
                          const torch::Tensor& indices,
                          const torch::Tensor& block_table,
-                         int64_t compact_tokens = 0) {
+                         int64_t compact_tokens,
+                         const std::optional<torch::Tensor>& k_scale,
+                         const std::optional<torch::Tensor>& v_scale) {
+  const bool int8 = key_cache.scalar_type() == at::kChar;
   TORCH_CHECK(q.scalar_type() == at::kBFloat16 && out.scalar_type() == at::kBFloat16 &&
-                  key_cache.scalar_type() == at::kBFloat16 &&
-                  value_cache.scalar_type() == at::kBFloat16,
-              "qsa_union_attn_bf16: bf16 q, out and caches");
+                  (int8 || key_cache.scalar_type() == at::kBFloat16) &&
+                  value_cache.scalar_type() == key_cache.scalar_type(),
+              "qsa_union_attn_bf16: bf16 q and out, bf16 or int8 caches");
+  TORCH_CHECK(!int8 || compact_tokens > 0,
+              "an int8 cache goes through the compact fp16 copy: pass its tokens");
   TORCH_CHECK(indices.scalar_type() == at::kInt && block_table.scalar_type() == at::kInt,
               "int32 indices and block table");
   TORCH_CHECK(q.dim() == 3 && q.size(2) == 256 && q.stride(2) == 1 && out.stride(2) == 1,
@@ -355,6 +365,8 @@ void qsa_union_attn_bf16(torch::Tensor& out, const torch::Tensor& q,
     const int v = e ? std::atoi(e) : 16;
     return v == 4 || v == 8 ? v : 16;
   }();
+  TORCH_CHECK(!int8 || rows_per == 16,
+              "an int8 cache needs 16-row groups (the compact fp16 kernel)");
   const int groups = int((rows + rows_per - 1) / rows_per);
   const int64_t u_cap = (int64_t(rows_per) * width + 3) / 4 * 4;
   auto opts = q.options();
@@ -384,7 +396,8 @@ void qsa_union_attn_bf16(torch::Tensor& out, const torch::Tensor& q,
     auto half_opts = q.options().dtype(at::kHalf);
     k16 = at::empty({compact_tokens * kv_width}, half_opts);
     v16 = at::empty({compact_tokens * kv_width}, half_opts);
-    qsa_kv_to_f16(k16, v16, key_cache, value_cache, block_table, compact_tokens);
+    qsa_kv_to_f16(k16, v16, key_cache, value_cache, block_table, compact_tokens,
+                  k_scale, v_scale);
     ksrc = k16.data_ptr();
     vsrc = v16.data_ptr();
   }
