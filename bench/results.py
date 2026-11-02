@@ -14,7 +14,7 @@ Raw logs stay disposable under profiles/logs/.
 `has` exits 0 if a matching row exists, 1 if not. --strix-disable none means
 the plugin is on (STRIX_DISABLE unset or empty); omit the flag to match any.
 Models are matched by checkpoint directory name. The default DB is
-profiles/results.db, overridden by --db or $STRIX_RESULTS_DB. WAL mode and one
+profiles/results.db, always (the functions take a path only for tests). WAL mode and one
 short transaction per call keep a second process (a collector while a job
 records) from blocking.
 """
@@ -67,7 +67,7 @@ CREATE INDEX IF NOT EXISTS runs_model ON runs(model, git_commit);
 
 
 def db_path(db: str | os.PathLike | None = None) -> Path:
-    return Path(db or os.environ.get("STRIX_RESULTS_DB") or DEFAULT_DB)
+    return Path(db or DEFAULT_DB)
 
 
 def connect(db: str | os.PathLike | None = None) -> sqlite3.Connection:
@@ -266,7 +266,7 @@ def _kwargs(a: argparse.Namespace) -> dict:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--db", help=f"default {DEFAULT_DB} or $STRIX_RESULTS_DB")
+    p.add_argument("--db", help=f"tests only; always {DEFAULT_DB} otherwise")
     sub = p.add_subparsers(dest="cmd", required=True)
     _filters(sub.add_parser("has", help="exit 0 if a matching result exists"))
     s = sub.add_parser("show", help="print matching results")

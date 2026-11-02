@@ -41,7 +41,6 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
     p.add_argument("--labels", help="phase labels json for analyze_trace.py")
-    p.add_argument("--db", help="results DB (default profiles/results.db)")
     p.add_argument("--prefill", default="8192", help="'' skips the prefill phases")
     p.add_argument("--decode-batches", default="1,4,16")
     p.add_argument(
@@ -103,7 +102,7 @@ def main() -> None:
         "after the profile starts, then record ACTIVE",
     )
     args = p.parse_args()
-    run_id = results.start_run(__file__, args.model, db=args.db)
+    run_id = results.start_run(__file__, args.model)
 
     def rec(phase, metric, value, label, depth, batch):
         results.record(
@@ -115,7 +114,6 @@ def main() -> None:
             depth=depth,
             batch=batch,
             kv_dtype=args.kv_cache_dtype,
-            db=args.db,
         )
 
     def write_labels() -> None:

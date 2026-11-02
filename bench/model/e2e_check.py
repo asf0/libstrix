@@ -46,9 +46,8 @@ def main() -> None:
         "and bfloat16 over a long greedy generation is the accuracy check for "
         "halving the state traffic",
     )
-    p.add_argument("--db", help="results DB (default profiles/results.db)")
     args = p.parse_args()
-    run_id = results.start_run(__file__, args.model, db=args.db)
+    run_id = results.start_run(__file__, args.model)
 
     llm = LLM(
         model=args.model,
@@ -103,7 +102,6 @@ def main() -> None:
                 "mamba_ssm_cache_dtype": args.mamba_ssm_cache_dtype,
                 "batch": args.batch,
             },
-            db=args.db,
         )
     print("SAMPLE:", result[0]["text"][:300].replace("\n", " "))
 

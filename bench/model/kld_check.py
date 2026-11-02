@@ -114,11 +114,10 @@ def main() -> None:
     )
     p.add_argument("--kv-cache-dtype", default="auto")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.80)
-    p.add_argument("--db", help="results DB (default profiles/results.db)")
     args = p.parse_args()
     if not args.compare and not args.corpus:
         p.error("a reference run needs --corpus or $STRIX_WIKITEXT")
-    run_id = results.start_run(__file__, args.model, db=args.db)
+    run_id = results.start_run(__file__, args.model)
 
     def rec(phase, metric, value, label, extra=None):
         results.record(
@@ -130,7 +129,6 @@ def main() -> None:
             depth=args.depth,
             kv_dtype=args.kv_cache_dtype,
             extra=extra,
-            db=args.db,
         )
 
     seq_len = args.depth + args.continuation
