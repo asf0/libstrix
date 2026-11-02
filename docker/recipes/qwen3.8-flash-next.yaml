@@ -25,3 +25,7 @@ services:
       - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-16384}
       - --max-num-seqs=${MAX_NUM_SEQS:-4}
       - --no-enable-prefix-caching
+      # Tool calls and reasoning come back parsed, as chat clients expect.
+      - --enable-auto-tool-choice
+      - --tool-call-parser=qwen3_coder
+      - --reasoning-parser=qwen3

@@ -70,8 +70,18 @@ Use the AWQ W4A16 checkpoint; bf16 does not fit.
 
 `flint-fp8`, `flint-fp8-dflash2` and `lfm2.5-24b-a2b-fp8-dspark` need the
 strix-vllm fork: it runs Flint on ROCm, and hands Flint's and LFM2.5's hidden
-states to their draft models. vLLM has no tool or reasoning parser for Flint,
-so its recipes set none.
+states to their draft models. Flint writes `<think>` blocks and `<tool_call>`
+calls in the GLM layout, so its recipes use the `glm45` tool and reasoning
+parsers.
+
+Every recipe sets the tool-call and reasoning parsers its chat template needs
+(`qwen3_coder` + `qwen3` for Qwen and Sage, `gemma4`, `lfm2` + `deepseek_r1`,
+`glm45`, `muse_glimmer`, `qwen3_coder` + `minicpmv`), so chat clients that send
+`tool_choice: auto` work and the thinking comes back as `reasoning` instead of
+in the answer. `minicpm-v-4.7-35b-a3b-fp8` also sets
+`--default-chat-template-kwargs` to turn thinking on: its template leaves
+thinking off unless asked, and then the answer has no `</think>` for the
+parser to split on.
 
 ## Memory guard
 

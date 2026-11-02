@@ -20,3 +20,10 @@ services:
       - --max-model-len=${MAX_MODEL_LEN:-131072}
       - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-8192}
       - --max-num-seqs=${MAX_NUM_SEQS:-16}
+      # Tool calls and reasoning come back parsed, as chat clients expect.
+      - --enable-auto-tool-choice
+      - --tool-call-parser=qwen3_coder
+      - --reasoning-parser=minicpmv
+      # The template turns thinking off unless asked; with it off the answer
+      # carries no </think> and the reasoning parser files all of it as reasoning.
+      - '--default-chat-template-kwargs={"enable_thinking": true}'
