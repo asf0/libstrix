@@ -13,6 +13,9 @@
 #   docker build --build-context strix-vllm-local=/tmp/strix-vllm.git ...
 
 ARG UBUNTU=ubuntu:26.04
+# The builder stage starts from this: the local `toolchain` stage by default,
+# or a prebuilt toolchain image (CI passes ghcr.io/asf0/strix-vllm-toolchain:<hash>).
+ARG TOOLCHAIN=toolchain
 
 # Empty unless --build-context strix-vllm-local=... replaces it.
 FROM scratch AS strix-vllm-local
@@ -40,10 +43,10 @@ ENV ROCM_PATH=${SP}/_rocm_sdk_devel \
     VLLM_TARGET_DEVICE=rocm \
     PYTORCH_ROCM_ARCH=gfx1151
 
-FROM base AS builder
-ARG STRIX_VLLM_REPO=https://github.com/asf0/strix-vllm.git
-ARG STRIX_VLLM_REF=gfx1151
-ARG MAX_JOBS=8
+# Everything that depends only on the pins below (docker/constraints.txt,
+# docker/patch_tensorizer.py), not on the fork or libstrix: built once and
+# reused by .github/workflows/image.yml.
+FROM base AS toolchain
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 RUN pip install --extra-index-url https://stable.repo.amd.com/rocm/whl-next/ \
@@ -66,6 +69,11 @@ RUN pip install --no-deps --ignore-requires-python -r /tmp/constraints.txt \
 # (PEP 649) no longer materializes; without this `import vllm` fails.
 COPY docker/patch_tensorizer.py /tmp/patch_tensorizer.py
 RUN python /tmp/patch_tensorizer.py
+
+FROM ${TOOLCHAIN} AS builder
+ARG STRIX_VLLM_REPO=https://github.com/asf0/strix-vllm.git
+ARG STRIX_VLLM_REF=gfx1151
+ARG MAX_JOBS=8
 RUN --mount=type=bind,from=strix-vllm-local,target=/mnt/strix-vllm \
     if git -C /mnt/strix-vllm rev-parse --git-dir >/dev/null 2>&1; then \
         git -c safe.directory='*' clone /mnt/strix-vllm /src/strix-vllm; \
