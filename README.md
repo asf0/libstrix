@@ -75,231 +75,45 @@ Each recipe serves `/models/<folder>` and downloads the model's Hugging Face
 repo into `CACHE` when the folder is missing (gated repos such as gemma-4 need
 `HF_TOKEN` in `.env`). Run one model at a time; each takes most of the 128 GB.
 
-Memory at the default `GPU_UTIL=0.85`, from each recipe's startup log: the
-weights, the KV cache left after them, and how many full 131k-token requests
-that cache holds at once. Multimodal checkpoints serve images
-(`--mm-encoder-attn-backend=TRITON_ATTN`); the vision encoder and its input
-budget take 1-2 GiB of KV. Every recipe marked ✓ answered a text and an image
-request in this configuration.
+See [docs/docker.md](docs/docker.md) for every recipe with its memory and KV
+capacity, the settings you can override (`GPU_UTIL`, `MAX_MODEL_LEN`, `MTP`,
+`SPEC_TOKENS`, ...), the memory guard and how to build the image.
 
-| recipe | model | weights | KV cache | KV tokens | 131k requests | images |
-| --- | --- | ---: | ---: | ---: | ---: | :---: |
-| `qwen3.8-flash-next` | wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 (n-gram table streamed from disk, MTP 2) | 80.8 GiB | 10.8 GiB | 362,862 | 2.8 | ✓ |
-| `qwen3.6-35b-a3b` | Qwen/Qwen3.6-35B-A3B (MTP 2) | 71.0 GiB | 20.2 GiB | 1,555,257 | 11.9 | ✓ |
-| `qwen3.6-35b-a3b-fp8` | Qwen/Qwen3.6-35B-A3B-FP8 (MTP 2) | 35.6 GiB | 55.7 GiB | 4,305,813 | 32.9 | ✓ |
-| `qwen3.6-35b-a3b-int8-w8a8` | Avesed/Qwen3.6-35B-A3B-INT8-W8A8 (MTP 2) | 36.6 GiB | 55.3 GiB | 4,270,599 ¹ | 32.6 ¹ | ¹ |
-| `sage-a1.5-fp8` | InternScience/Sage-A1.5-FP8 (MTP 2) | 37.5 GiB | 53.6 GiB | 4,144,883 | 31.6 | ✓ |
-| `minicpm-v-4.7-35b-a3b-fp8` | openbmb/MiniCPM-V-4.7-35B-A3B-FP8 | 36.1 GiB | 56.1 GiB | 5,484,012 | 41.8 | ✓ |
-| `qwen3.8-27b` | Qwen/Qwen3.8-27B (MTP 2) | 53.3 GiB | 43.5 GiB | 1,148,369 | 8.8 | ✓ |
-| `qwen3.8-27b-fp8` | Qwen/Qwen3.8-27B-FP8 (MTP 2) | 30.3 GiB | 66.5 GiB | 1,754,577 | 13.4 | ✓ |
-| `qwen3.8-27b-int8-w8a16-mtp` | lued/Qwen3.8-27B-INT8-W8A16-MTP (MTP 2, 40 sequences) | 30.6 GiB | 65.4 GiB | 1,726,277 | 13.2 | ✓ |
-| `qwen3.8-27b-quark-awq-int4-w4a16` | amd/Qwen3.8-27B-Quark-AWQ-INT4-W4A16 | 17.7 GiB | 79.3 GiB | 2,375,139 | 18.1 | ✓ |
-| `qwen3.8-27b-quark-awq-mxfp4` | amd/Qwen3.8-27B-Quark-AWQ-MXFP4 (not benchmarked) | 17.0 GiB | 80.8 GiB | 2,419,790 ¹ | 18.5 ¹ | ¹ |
-| `lfm2.5-24b-a2b` | LiquidAI/LFM2.5-24B-A2B | 46.2 GiB | 52.4 GiB | 5,170,005 | 39.4 | text model |
-| `lfm2.5-24b-a2b-fp8` | LiquidAI/LFM2.5-24B-A2B-FP8 | 23.4 GiB | 75.3 GiB | 7,422,755 | 56.6 | text model |
-| `muse-glimmer-30b-fp8-block` | RedHatAI/Muse-Glimmer-30B-FP8-block | 33.2 GiB | 64.1 GiB | 7,046,883 | 53.8 | ✓ |
-| `gemma-4-26b-a4b-it` | google/gemma-4-26B-A4B-it | 49.5 GiB | 48.6 GiB | 1,506,660 ¹ | 11.5 ¹ | ¹ |
-| `gemma-4-26b-a4b-it-awq-4bit` | cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit | 16.6 GiB | 80.7 GiB | 2,503,285 | 19.1 | ✓ |
-| `gemma-4-26b-a4b-it-fp8-dynamic` | RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic | 25.9 GiB | 71.8 GiB | 2,225,946 | 17.0 | ✓ |
-| `gemma-4-31b-it-mxfp4` | amd/gemma-4-31B-it-MXFP4 | 17.8 GiB | 79.9 GiB | 619,182 | 4.7 | text only ² |
-| `gemma-4-31b-it-qat-w4a16-ct` | google/gemma-4-31B-it-qat-w4a16-ct | 19.9 GiB | 73.8 GiB | 571,739 | 4.4 | ✓ |
-
-¹ Not on this machine, so not re-measured with images on: the numbers are the
-earlier text-only ones and will be 1-2 GiB of KV lower. The checkpoint ships
-its vision weights, so the recipe serves images.
-
-² Its vision tower does not load in vLLM, so the recipe stays
-`--language-model-only`.
-
-Overrides go in `.env` or the shell: `GPU_UTIL` (default 0.85), `MAX_MODEL_LEN`,
-`MAX_NUM_SEQS`, `MAX_BATCHED_TOKENS`, `MTP` (draft tokens, `0` = off),
-`REPLAYSSM` (`1` keeps one GDN state per request under MTP; on in the Qwen
-GDN recipes that use MTP), `SERVED_MODEL_NAME`, `STRIX_DISABLE`,
-`STRIX_ENABLE` (see [Using it with vLLM](#using-it-with-vllm)), `HF_TOKEN`,
-`PORT`, and `EXTRA_ARGS` (appended to `vllm serve`). `CACHE` keeps the compile
-caches, so later starts skip recompiling; the container runs as root, so
-removing it needs `sudo`.
-
-A run that asks for more memory than the machine has does not fail cleanly
-here: the kernel OOM-kills the host. The entrypoint therefore stops vLLM (exit
-137) when host `MemAvailable` drops below `STRIX_MIN_AVAIL_GB` (default 10) or
-when less than `STRIX_MIN_GPU_FREE_GB` (default 14) of the GPU cap is left;
-the driver fails a few GB before the cap, while `MemAvailable` still looks
-fine. `0` turns a check off. Every recipe passed both checks at 0.85 with the
-117 GiB cap above.
-
-To build the image yourself (about 40 minutes, mostly vLLM's C++):
-`docker/build-and-push.sh` (or `docker build -f docker/Dockerfile .` from the
-repo root).
+The image ships the [strix-vllm](https://github.com/asf0/strix-vllm) fork
+rather than stock vLLM: it streams Qwen3.8-Flash-Next's n-gram table from
+disk and gives its QSA layers an int8 KV cache, runs Flint on ROCm, supports
+`--use-replayssm` on the Qwen GDN models, hands Flint's and LFM2.5's hidden
+states to their DFlash 2 and DSpark drafts, and gives draft models their own
+KV cache pool. The kernels themselves run on stock vLLM.
 
 ## Using it with vLLM
 
 Installing the package registers the `vllm.general_plugins` entry point
 `strix`. It activates only on ROCm + gfx1151 and logs a single line when it
-does. `STRIX_DISABLE=all`, or a comma-separated list of the names below, keeps
-vLLM's own kernels for A/B runs.
-
-`dense_w8` and `moe_w4a8` change numerics or memory and were measured on
-Qwen3.8-Flash-Next only, so they turn on for that architecture
-(`Qwen4Exp*`) alone and log `libstrix: <op> on/off for <arch>` at load.
-`STRIX_ENABLE=dense_w8,moe_w4a8` turns them on for another model;
-`STRIX_DISABLE` still wins. `dense_w8` stops adding int8 copies at
-`STRIX_DENSE_W8_MAX_GB` (default 12).
-
-| `STRIX_DISABLE` name | kernel | replaces | when |
-| --- | --- | --- | --- |
-| `rms_norm_gated` | `gdn_gated_rmsnorm_h128_bf16` | `RMSNormGated` (GDN output norm) | bf16, 128 channels |
-| `moe_pad` | (weight layout) | MoE expert weight storage | padded row pitch at `create_weights`; vLLM's own ROCm padding is undone by #46009 |
-| `moe_gemm` | `moe_gemm_bf16` | both expert GEMMs in `TritonExperts`, gate-and-mul fused into w13 | bf16, no quant/LoRA/bias/EP, SiLU or GELU-tanh |
-| `moe_w4a16` | `moe_gemm_w4a16` | both expert GEMMs in `TritonWNA16Experts` (compressed-tensors int4), gate-and-mul fused into w13 | uint4, group 32/64/128, bf16 scales, no zero-point/bias/LoRA/EP; TRITON backend only |
-| `moe_w8a16` | `moe_gemm_w8a16` | both expert GEMMs in the int8 MoE path (`oracle/int8.py`, `TritonExperts`), gate-and-mul fused into w13. **Opt-in (`STRIX_MOE_W8A16=1`): measured slower than Triton's int8 WMMA on Qwen3.6-35B-A3B-INT8-W8A8** | int8 [E, N, K] experts, one scale per output channel (fp32/bf16/fp16), bf16 activations (W8A16), no bias/LoRA/EP, K % 64 == 0, N % 128 == 0; TRITON backend only |
-| `moe_fp8` | `moe_gemm_fp8_raw` (`moe_gemm_fp8` with `STRIX_DISABLE=moe_fp8_raw`) | both expert GEMMs in vLLM's Triton FP8 MoE (`oracle/fp8.py`, `TritonExperts`), gate-and-mul fused into w13; the experts class defers input quantization, so activations stay unrounded (W8A16) instead of being quantized to FP8. The raw kernel widens the e4m3 bytes to fp16 with integer ops, runs the fp16 WMMA and applies the scale to the fp32 accumulator | float8_e4m3fn [E, N, K] with fp32 128x128 block scales [E, N/128, K/128] (K % 128 == 0) or one scale per output channel (K % 64 == 0), no bias/LoRA/EP, N % 128 == 0; TRITON backend only. Expert rows are padded by 16 bytes as the weights are loaded: a K = 2048 pitch streamed w13 at 38 GB/s, 4.5x slower. Serving scripts that export `VLLM_ROCM_USE_AITER=1` also need `VLLM_ROCM_USE_AITER_MOE=0` |
-| `gdn_chunk` | `gdn_chunk_fwd_k128_v128_c64_bf16` | `ChunkGatedDeltaRule` (FLA chunk prefill) | head 128, bf16, no in-kernel l2norm |
-| `gdn_conv` | `gdn_causal_conv1d_w4_bf16`, `gdn_post_conv_bf16` | `causal_conv1d_fn` and `fused_post_conv_prep` in the GDN prefill path (module globals rebound) | width 4, bf16 x/state, heads 128, L2 norm on, plain g |
-| `gemm_rows` | (hipBLASLt, sliced) | `rocm_unquantized_gemm` for bf16 linears with K >= 16384 | runs > 1024 rows as 1024-row slices (31 -> 41 TFLOPS on 27B MLP down at 8k rows) |
-| `attn_prefill` | `attn_prefill_bf16` | `TRITON_ATTN` impl for prefill and speculative verify | head 64 GQA 4 (LFM2.5), head 256 GQA 2/6/8, head 512 GQA 8 (Gemma-4 full layers), bf16 or int8 KV (`int8_per_token_head`), causal, no window/sinks |
-| `attn_decode` | `attn_decode_bf16` | `TRITON_ATTN` impl for pure-decode batches | head 256 GQA 2 (sliding window), head 512 GQA 8 (Gemma-4), bf16 or int8 KV |
-| `attn_decode` | fork's Triton `unified_attention` (vendored) | `unified_attention` inside `TRITON_ATTN` for every batch strix kernels skip | the fork's gfx1151 split-KV decode, pooled-KV buffer loads, prefill configs |
-| `w8a16` | `w8a16_skinny_gemm` (M <= 5), `w8a8_wmma_gemm` | compressed-tensors W8A16 linears (`MPLinearKernel`, first in the ROCm list) | uint8b128 symmetric, per-channel or group 128, K % 128 == 0 |
-| `w8a8` | `w8a8_wmma_gemm` | compressed-tensors W8A8 int8 linears (`Int8ScaledMMLinearKernel`, first in the ROCm int8 list) | int8 per-channel weights, dynamic per-token activations (quantized per 128-group inside the op), symmetric, K % 128 == 0 |
-| `w4a16` | `w4a8_wmma_gemm` (M > 5), `w4a16_wmma_gemm` (g32, M > 128), vLLM's `wvSplitK_int4_g` (M <= 5) | `RDNAHybridW4A16LinearKernel` prefill (Triton) for symmetric int4 | uint4b8, group 128 / 32 / per-channel, K % 128 == 0; vLLM's packed layout, no extra weight copy |
-| `fp8` | `fp8_skinny_gemm` (M <= 5), `fp8_wmma_gemm_raw` (M <= 256; `STRIX_DISABLE=fp8_raw` keeps the bf16-staging `fp8_wmma_gemm`) and `fp8_wmma_gemm` (M < 768), `fp8_dequant` + hipBLASLt (M >= 768, in 1024-row slices when K >= 16384) | vLLM's block-scaled FP8 linear (`TritonFp8BlockScaledMMKernel`, no tuned config here: 0.57 tok/s decode on the 27B) | float8_e4m3fn weights with 128x128 block scales (K % 128 == 0) or per-channel scales (compressed-tensors `channel`, K % 64 == 0; vLLM's `_POSSIBLE_FP8_KERNELS` list, `STRIX_DISABLE=fp8_channel` keeps stock), bf16 activations (W8A16, the per-token activation quantize is skipped); weights stay one byte each, block scales are also kept expanded per row (3 % more) |
-| `mxfp4` | `mxfp4_gemv` (M <= 2), `mxfp4_wmma_gemm` | `EmulationMxfp4LinearKernel` for Quark MXFP4 linears | fp4 weights + e8m0 scales used in place, bf16 activations (W4A16), K % 128 == 0 |
-| `moe_w4a8` | `moe_gemm_w4a8` + `moe_act_quant_i8` | takes over the WNA16 expert GEMMs from `moe_w4a16` for batch >= 1024 tokens: int8 activations per (row, 128-group) on the iu8 WMMA, int4 -> int8 at the LDS commit (1.2-1.34x the W4A16 tile at 16k Qwen3.8-Flash-Next tokens) | uint4, **group 128**, no zero-point/bias/LoRA/EP, bf16 activations, K % 128 == 0; TRITON backend only |
-| `qsa_union` | `qsa_union_attn_bf16` | Qwen4Exp QSA sparse attention (`qsa_sparse_paged_attention`) for a single-request prefill of >= 1024 rows: 16 consecutive rows share one union of their selected tokens (1.5x the gfx1151 Triton kernel, more as the context grows) | head_dim 256, GQA 12, bf16, one request, positions < 131072; `STRIX_QSA_UNION_F16=1` gathers from a compact fp16 K/V copy instead (needs a host sync) |
-| `qsa_indexer` | `qsa_indexer_bf16` | the QSA indexer's paged scores (`qsa_mqa_paged`) for a single-request prefill of >= 128 rows (1.7-1.9x the tl.dot kernel) | 4 indexer heads, head_dim 128, one KV head, bf16, one request |
-| `hc_up_gate_mix` | `hc_up_gate_mix_bf16` | Qwen4Exp hyper-connection up projection fused with `hc_gate_mix` (6.7 -> 5.2 ms per site at 16k rows, no gate in memory) | hc_count 4, bf16, K % 64 == 0, batch >= 512 rows |
-| `dense_w8` | `w8a16_skinny_gemm` on int8 copies | **decode** copies of unquantized bf16 linears and the LM head: the bf16 weight stays for prefill, batches of <= 5 rows read an int8 copy (Qwen3.8-Flash-Next decode 51 -> 37 ms/step; GSM8K 93 vs 92) | bf16 2-D weights, K % 16 == 0; each copy is checked against bf16 at load |
-
-Some swaps live in code that `torch.compile` traces. vLLM keys its compile
-caches on its own env vars and config only, so the plugin adds
-`STRIX_VLLM_CACHE_KEY` (a digest of `STRIX_DISABLE`, `STRIX_ENABLE` and the
-plugin source) to vLLM's cache key; without it, a graph traced with the plugin
-off could be replayed with it on.
-
-### The kernel table
-
-`python/strix/registry.py` is the source of truth for what this library can
-do: one row per kernel, the geometry it takes (`constraints`) and how it is
-built (`spec`: tile, staging, why).
-
-- `strix.kernels()` dumps the table, `strix.ops()` groups it by op.
-- `strix.explain(op, **geometry)` says why a shape matches a row or not.
-- `strix.select(op, **geometry)` returns the kernel a caller should use, or
-  `None` to keep vLLM's own path.
-- `strix.geometries(op, *keys)` returns the shape points a family covers.
-
-The plugin builds its dispatch gates from the table rather than repeating
-them: `python/strix_vllm/attn.py` reads the (head_dim, GQA) pairs it routes
-from `geometries()`, and `tests/test_registry.py` fails if a `torch.ops.strix`
-registration has no row.
-
-### Against upstream vLLM
-
-Nothing here needs patched vLLM sources. `bench/upstream.sh <cmd>` runs a
-command against a stock upstream checkout named by `VLLM_UPSTREAM` that has
-the installed build's `vllm/*.so` copied in and its own `vllm/_version.py`
-(the version is part of the compile-cache key). It also puts the ROCm SDK's
-bundled `amdsmi` on `PYTHONPATH`, which upstream needs to detect ROCm on this
-APU.
-
-### Qwen3.8-Flash-Next
-
-This model is the exception: its 102 GB n-gram (engram) table does not fit in
-128 GB next to the weights. The [strix-vllm](https://github.com/asf0/strix-vllm)
-fork (branch `gfx1151`) streams the table from disk, so run it there with the
-plugin installed. Use the AWQ W4A16 checkpoint; bf16 does not fit.
-
-```sh
-vllm serve /path/to/Qwen3.8-Flash-Next-AWQ-W4A16 \
-  --engram-config '{"disk_offload": true}' --mm-encoder-attn-backend TRITON_ATTN \
-  --gpu-memory-utilization 0.80 --max-model-len 131072 \
-  --max-num-batched-tokens 16384 --no-enable-prefix-caching \
-  --speculative-config '{"method": "mtp", "num_speculative_tokens": 2}'
-```
-
-- `--gpu-memory-utilization 0.80` (the measured numbers) leaves page cache
-  for the table rows; a lower setting prefills slower. 0.85 (the Docker
-  recipe, 363k tokens of KV with images on, 414k text-only) and 0.88 (531k
-  text-only) prefill and decode at the same speed, but 0.88 leaves only about 11 GiB of host memory free, 1 GiB above
-  the container's guard.
-- 16k prefill chunks are the measured best; 32k is not faster.
-- MTP 2 costs about 4 % prefill and more than doubles decode (18 -> 40-43
-  tok/s on real text). Drop `--speculative-config` for prefill-only work.
-- Keep `gdn_conv` enabled: with vLLM's own GDN causal conv this model fails at
-  startup (out-of-range n-gram ids), so `STRIX_DISABLE=all` does not run.
-- The fork's [engram docs](https://github.com/asf0/strix-vllm/blob/gfx1151/docs/features/engram.md#disk-offload)
-  describe the disk path and its debugging switches.
+does. `STRIX_DISABLE=all`, or a comma-separated list of kernel names, keeps
+vLLM's own kernels for A/B runs; `STRIX_ENABLE` turns on the ones that are
+off by default. [docs/kernels.md](docs/kernels.md) lists every kernel, what
+it replaces and when it applies, plus how to add one.
 
 ## Results
 
-Stock upstream vLLM (`899a1689e2`, unpatched) with and without the plugin on
-one gfx1151 APU, single stream, int8 KV. Speedup is plugin over stock; the
-last column is the plugin's own throughput. Full tables, batched decode,
-serving and accuracy are in [docs/performance.md](docs/performance.md).
+Against stock upstream vLLM on one gfx1151 APU, single stream, int8 KV
+(full tables in [docs/performance.md](docs/performance.md)):
 
-| model | prefill 2k / 64k | decode 2k / 64k | 128k prefill / decode tok/s |
-| --- | ---: | ---: | ---: |
-| Qwen3.6-35B-A3B | 2.7× / 19.3× | 1.86× / 2.35× | 1,751 / 26.4 |
-| Qwen3.6-35B-A3B W8A8 | 2.1× / 18.3× | 1.03× / 1.53× | 1,697 / 24.5 |
-| Qwen3.8-27B bf16 | 1.7× / 14.3× | 1.01× / 1.14× | 435 / 3.9 |
-| Qwen3.8-27B INT8 (W8A16) | 2.6× / 14.6× | 2.38× / 2.33× | 430 / 5.7 |
-| Qwen3.8-27B Quark INT4 | 2.1× / 14.2× | 1.01× / 1.22× | 428 / 8.1 |
-| Qwen3.8-27B FP8 (block-scaled) ² | - / - | 13.5× / - | 434 / 6.4 |
-| Qwen3.6-35B-A3B FP8 (block-scaled) ³ | 10.4× / - | 10.8× / - | 1,688 / 34.8 |
-| LFM2.5-24B-A2B | 2.0× / 11.4× | 2.15× / 2.18× | 2,405 / 27.1 |
-| LFM2.5-24B-A2B FP8 (block-scaled) ⁴ | - / - | - / - | 2,244 / 33.6 |
-| Muse-Glimmer-30B FP8 (block-scaled) ⁴ | - / - | - / - | 76 / 6.5 |
-| Sage-A1.5 FP8 (per-channel) ⁵ | - / - | - / - | 1,708 / 30.6 |
-| MiniCPM-V-4.7 FP8 (per-channel) ⁵ | - / - | - / - | 1,716 / 30.5 |
-| gemma-4-26B-A4B FP8 (per-channel) ⁵ | - / - | - / - | 1,520 / 29.8 |
-| gemma-4-26B-A4B | 4.4× / 31.1× | 1.28× / 3.33× | 1,588 / 21.5 |
-| gemma-4-26B-A4B AWQ | 3.9× / 28.2× | 1.36× / 4.28× | 1,499 / 29.6 |
-| gemma-4-31B MXFP4 | 2.7× / 21.0× | 6.21× / 6.99× | 296 / 7.3 |
-| gemma-4-31B W4A16 | 3.0× / 22.5× | 1.32× / 2.99× | 292 / 8.0 |
-| Qwen3.8-Flash-Next AWQ ¹ | 1.7× / 2.0× | 1.95× / 1.63× | 1,633 / 20.3 |
-
-¹ On the strix-vllm fork with bf16 KV and 16k chunks, against everything-off
-except `gdn_conv` (see [above](#qwen38-flash-next)). Decode is without MTP.
-With MTP 2 on real text it decodes at 40-43 tok/s and prefills at
-1,540-1,620 tok/s from 5.6k to 100k tokens. Batched decode gains 1.16-1.26×.
-
-² Stock vLLM decodes this checkpoint at 0.57 tok/s (one run, short context,
-before the FP8 kernels), so the stock prefill and deep-context points were not
-run; the 13.5× compares that run with the 2k decode.
-
-³ Stock vLLM was measured at 2k and 8k only (341 / 309 tok/s prefill, 4.4 tok/s
-decode); the deeper points were not run. The experts are FP8 too, so this row
-exercises `moe_fp8`. Decode is 1.4× the bf16 checkpoint's (47 vs 32.8 tok/s at
-2k).
-
-⁴ compressed-tensors block FP8; stock speed not measured.
-
-⁵ compressed-tensors per-channel FP8, which stock vLLM cannot run on gfx1151.
-
-Prefill gains grow with context: at 256k the 35B prefills in 241 s against
-7,568 s stock. Decode doubles where the plugin replaces the dominant op and
-is at parity elsewhere; no configuration, single stream or batched, is
-slower than stock. KLD against stock is at the noise floor on the Qwen3.6
-and Qwen3.8-27B checkpoints (0.001-0.006, 97-99 % top-1). Qwen3.8-Flash-Next
-sits higher (0.008-0.019, 97-98 % top-1, perplexity within 0.6 %), most likely because its
-MoE GEMM quantizes activations to int8. gemma-4-26B drifts further (0.2),
-which `docs/performance.md` explains. Serving the 27B INT8 + MTP at 40
-sequences gives 123 output tok/s, and the 27B FP8 + MTP gives 116. The FP8
-27B scores KLD 0.0032 against stock FP8 at 2k, 0.004-0.005 against stock bf16
-(97-98 % top-1) and 238/250 on GSM8K with the plugin on (bf16: 237 / 235
-stock / plugin).
-
-Earlier measurements (before the re-run above),
-with MTP k=2 and the plugin (decode x1 / x4 / x16 tok/s): 35B 56 / 118 / 210,
-27B bf16 10.6 / 40 / 132, Quark INT4 26.6 / 73 / 125. GSM8K (plugin off vs
-on, paired, n = 250 unless noted) shows no significant change on any of
-them: 35B 1254 / 1249 (n = 1319), 27B 237 / 235, Quark 241 / 238, Gemma 247
-/ 247, LFM2.5 196 / 197, 35B + MTP 237 / 238.
-
-Not covered: LFM2.5 NVFP4 (vLLM forces Marlin for weight-only NVFP4 on ROCm)
-and `--use-replayssm` for Qwen GDN, which is a vLLM core change (upstream
-rejects the flag for Qwen3.5 layers).
+- **Prefill** 1.7-4.4× faster at 2k and 11-31× at 64k (Flash-Next 2.4×,
+  against a different baseline; Flint FP8 8.8× at 2k); at 256k the 35B
+  prefills in 241 s against 7,568 s stock.
+- **Decode** 1.9-2.4× on the 35B, LFM2.5 and the INT8 27B, 3-7× on gemma-4 at
+  64k, 4.6× on Flint FP8, 13.5× on the FP8 27B, and at parity on the bf16 and
+  AWQ 27B and the 35B W8A8. No configuration, single stream or batched, is
+  slower than stock, apart from Qwen3.8-Flash-Next's short prompts on its
+  disk-backed n-gram table.
+- **Accuracy:** KLD against stock 0.001-0.006 on Qwen3.6 and Qwen3.8-27B (97-99 %
+  top-1), higher on Flash-Next and gemma-4-26B; GSM8K unchanged within noise on
+  every model checked.
+- **Speculative decoding:** DFlash 2 decodes the FP8 27B at 29.6 tok/s (7.7
+  without a draft, 16.4 with MTP 2) and the FP8 35B at 85.1 (45.7 / 63.5);
+  LFM2.5's DSpark draft takes it from 51.7 to 66.7 tok/s.
 
 ## Tests and benchmarks
 
@@ -322,27 +136,6 @@ which of the three dominates decides the next tile change.
 accuracy A/B checks with and without the plugin; `bench/model/kld_check.py`
 needs a wikitext-2-raw directory via `--corpus` or `STRIX_WIKITEXT`.
 
-## Hardware notes that shaped the kernels
-
-- Rows 4-16 KiB apart read at the same column offset camp on the same DRAM
-  channels (4-8x slower). Pad weight row pitch, or order the grid so the
-  head / feature index varies fastest.
-- Keep staging registers in `ext_vector_type` vectors and check
-  `-Rpass-analysis=kernel-resource-usage` for scratch: `uint4` arrays spilled.
-- Use `strix::barrier()` for LDS hand-offs (explicit `lgkmcnt(0)`).
-
-## Adding a kernel
-
-1. `csrc/<family>/<entry_point>.hip`, geometry in the name, checks that reject
-   a mismatch.
-2. Declare and register it in `csrc/torch_ops.cpp`; add a fake impl in
-   `python/strix/__init__.py`.
-3. Add a row to `python/strix/registry.py`.
-4. Test against a torch reference in `tests/`, benchmark against vLLM's
-   current kernel in `bench/`.
-5. Hook it up in `python/strix_vllm/` behind `select()` with fallback to the
-   parent class.
-
 ## Layout
 
 ```
@@ -354,6 +147,8 @@ bench/model/    model-level checks: phase profiling, KLD, e2e and GSM8K A/B
 tools/          trace analysis and kernel tuning helpers
 tests/          per-kernel correctness against torch references
 ```
+
+Conventions for docs, recipes and model names are in [AGENTS.md](AGENTS.md).
 
 ## License
 

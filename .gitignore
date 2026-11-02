@@ -13,6 +13,7 @@ docker/recipes/cache/
 docker/recipes/models/
 
 # Local working notes, not published
+CLAUDE.local.md
 NOTES.md
 docs/handoff.md
 bench/suite/
