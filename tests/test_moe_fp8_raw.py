@@ -154,3 +154,33 @@ def test_channel_k64(tokens, block_m, block_n, gemm, raw):
     peak = ref.abs().amax()
     tol = 2e-3 if out_dtype == torch.float16 else 1e-2
     torch.testing.assert_close(c.float() / peak, ref / peak, rtol=0, atol=tol)
+
+
+@pytest.mark.parametrize("scheme", ["block", "channel"])
+@pytest.mark.parametrize("tokens", [1, 40, 300])
+@pytest.mark.parametrize("block_m,block_n", [(16, 64), (64, 64), (64, 128), (128, 128)])
+def test_w13_bf16_intermediate(tokens, block_m, block_n, scheme):
+    """A bf16 c keeps the fused silu(gate) * up bf16 (FP16_INTER_UNSAFE
+    models): here scaled so that it passes the fp16 maximum, which the fp16
+    output would turn into inf (Flint's reached 90,112)."""
+    n, k = 1024, 2048
+    torch.manual_seed(0)
+    w, scales, b = make_weights(n, k, scheme)
+    topk_ids = torch.stack(
+        [torch.randperm(E, device="cuda")[:TOP_K] for _ in range(tokens)]
+    )
+    a = torch.randn(tokens, k, device="cuda", dtype=torch.float16) * 64
+    sorted_ids, expert_ids, num_post = align(topk_ids, block_m, E)
+    args = (sorted_ids, expert_ids, num_post, None, TOP_K, block_m, block_n, True, "silu")
+    c = torch.full((tokens * TOP_K, n // 2), float("nan"), device="cuda", dtype=torch.bfloat16)
+    torch.ops.strix.moe_gemm_fp8_raw(c, a, w, scales, *args)
+    ref = reference(a, b, topk_ids, TOP_K, None)
+    ref = F.silu(ref[:, : n // 2]) * ref[:, n // 2 :]
+    assert ref.abs().amax() > 65504, "the case must leave the fp16 range"
+    assert torch.isfinite(c).all()
+    peak = ref.abs().amax()
+    torch.testing.assert_close(c.float() / peak, ref / peak, rtol=0, atol=1e-2)
+    # The fp16 output overflows on the same inputs.
+    c16 = torch.empty_like(c, dtype=torch.float16)
+    torch.ops.strix.moe_gemm_fp8_raw(c16, a, w, scales, *args)
+    assert not torch.isfinite(c16).all()

@@ -27,7 +27,9 @@ def build(q_lens, ctx_lens, hq, hkv, block_size, seed=0, hd=256):
     return q, key_cache, value_cache, cu, torch.tensor(seq_lens, device="cuda"), table
 
 
-def reference(q, key_cache, value_cache, cu, seq_lens, table, scale, window_left=-1):
+def reference(
+    q, key_cache, value_cache, cu, seq_lens, table, scale, window_left=-1, sinks=None
+):
     hq, hkv = q.size(1), key_cache.size(2)
     bs = key_cache.size(1)
     out = torch.empty_like(q, dtype=torch.float32)
@@ -47,7 +49,13 @@ def reference(q, key_cache, value_cache, cu, seq_lens, table, scale, window_left
             s.masked_fill_(
                 qpos[None, :, None] - pos[None, None, :] > window_left, float("-inf")
             )
-        out[a:b] = torch.einsum("htk,khd->thd", s.softmax(-1), v)
+        if sinks is not None:
+            # One extra logit per head (unscaled), dropped after the softmax.
+            sink = sinks.float()[:, None, None].expand(-1, b - a, 1)
+            p = torch.cat([s, sink], -1).softmax(-1)[..., :-1]
+        else:
+            p = s.softmax(-1)
+        out[a:b] = torch.einsum("htk,khd->thd", p, v)
     return out
 
 
@@ -226,4 +234,74 @@ def test_int8_kv_matches_dequantized_reference(hq, hkv, q_lens, ctx_lens, num_sp
     k_dq = (k_q.float() * k_s[..., None]).bfloat16()
     v_dq = (v_q.float() * v_s[..., None]).bfloat16()
     ref = reference(q, k_dq, v_dq, cu, seq_lens, table, scale)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+# Flint: head_dim 128, 32 q / 4 kv heads (G=8), learned attention sinks, and a
+# 513-key sliding window (window_left 512) on most layers; shrunk to 40 here
+# so short sequences cross it. bf16 and int8 KV.
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens",
+    [([64], [0]), ([37], [0]), ([100, 5, 17], [0, 40, 300]), ([200], [700])],
+)
+@pytest.mark.parametrize("window_left", [-1, 40, 512])
+@pytest.mark.parametrize("use_sinks", [False, True])
+@pytest.mark.parametrize("int8", [False, True])
+def test_h128_g8_sinks_window(q_lens, ctx_lens, window_left, use_sinks, int8):
+    q, kc, vc, cu, seq_lens, table = build(q_lens, ctx_lens, 32, 4, 16, hd=128)
+    scale = 128**-0.5
+    sinks = (torch.randn(32, device="cuda") * 2).float() if use_sinks else None
+    out = torch.full_like(q, float("nan"))
+    if int8:
+        k_q, k_s = quantize(kc, 16, 4)
+        v_q, v_s = quantize(vc, 16, 4)
+        strix.attn_prefill(
+            out, q, k_q, v_q, cu, seq_lens, table, scale, 1, window_left, k_s, v_s,
+            sinks=sinks,
+        )
+        kc = (k_q.float() * k_s[..., None]).bfloat16()
+        vc = (v_q.float() * v_s[..., None]).bfloat16()
+    else:
+        strix.attn_prefill(
+            out, q, kc, vc, cu, seq_lens, table, scale, 1, window_left, sinks=sinks
+        )
+    ref = reference(q, kc, vc, cu, seq_lens, table, scale, window_left, sinks)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+def test_sinks_refuse_split_kv():
+    q, kc, vc, cu, seq_lens, table = build([4], [600], 32, 4, 16, hd=128)
+    sinks = torch.zeros(32, device="cuda")
+    with pytest.raises(RuntimeError, match="sinks need num_splits == 1"):
+        strix.attn_prefill(
+            torch.empty_like(q), q, kc, vc, cu, seq_lens, table, 0.1, 4, sinks=sinks
+        )
+
+
+# Flint decode: head 128 GQA 8, sinks folded in on the single-pass epilogue
+# and, with split-KV, once in the segment reduce; 513-key window shrunk to 40.
+@pytest.mark.parametrize("ctx_lens", [[0], [70, 200, 3], [500, 31, 1000, 64]])
+@pytest.mark.parametrize("num_splits", [1, 4])
+@pytest.mark.parametrize("window_left", [-1, 40])
+@pytest.mark.parametrize("use_sinks", [False, True])
+@pytest.mark.parametrize("int8", [False, True])
+def test_h128_g8_decode_sinks(ctx_lens, num_splits, window_left, use_sinks, int8):
+    q_lens = [1] * len(ctx_lens)
+    q, kc, vc, cu, seq_lens, table = build(q_lens, ctx_lens, 32, 4, 16, hd=128)
+    scale = 128**-0.5
+    sinks = (torch.randn(32, device="cuda") * 2).float() if use_sinks else None
+    out = torch.full_like(q, float("nan"))
+    if int8:
+        kq, ks = quantize(kc, 16, 4)
+        vq, vs = quantize(vc, 16, 4)
+        strix.attn_decode(
+            out, q, kq, vq, seq_lens, table, scale, num_splits, window_left, ks, vs,
+            sinks=sinks,
+        )
+        kc, vc = kq.float() * ks[..., None], vq.float() * vs[..., None]
+    else:
+        strix.attn_decode(
+            out, q, kc, vc, seq_lens, table, scale, num_splits, window_left, sinks=sinks
+        )
+    ref = reference(q, kc, vc, cu, seq_lens, table, scale, window_left, sinks)
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)

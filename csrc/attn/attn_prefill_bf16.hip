@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
-// Causal paged attention for prefill: head_dim D = 64 (GQA 4, LFM2.5), 256
-// (GQA 6 or 8) or 512 (GQA 8, Gemma-4 full-attention layers), bf16 Q/KV, any
-// KV block size.
+// Causal paged attention for prefill: head_dim D = 64 (GQA 4, LFM2.5), 128
+// (GQA 8, Flint), 256 (GQA 6 or 8) or 512 (GQA 8, Gemma-4 full-attention
+// layers), bf16 Q/KV, any KV block size. Optional attention sinks (one learned
+// logit per query head that joins every softmax denominator, as in vLLM's
+// Triton kernel) on unsplit launches.
 // Varlen over cu_seqlens_q; the queries of a sequence are its last q_len
 // positions of seq_lens[n] keys.
 //
@@ -97,7 +99,7 @@ attn_prefill_kernel(
     int64_t sk_b, int64_t sk_s, int64_t sk_h, int64_t sv_b, int64_t sv_s,
     int64_t sv_h, int64_t sc_b, int64_t sc_s, int64_t sc_h, float scale_log2,
     int win_left, int nseg, float* __restrict__ o_part,
-    float* __restrict__ ml_part) {
+    float* __restrict__ ml_part, const float* __restrict__ sinks) {
   constexpr int kHalf = dims_per_wave(D);
   constexpr int kHD = D, W = D / kHalf;  // waves per head
   constexpr int kPK = kHD + 8;     // LDS pitch of the K tile [key][d]
@@ -451,7 +453,15 @@ attn_prefill_kernel(
       ml_part[2 * r + 1] = l_run;
     }
   } else if (lo < rows) {
-    const float inv = 1.f / l_run;
+    float inv = 1.f / l_run;
+    if (sinks != nullptr) {
+      // The sink is one more logit (natural-log units, unscaled) in the
+      // softmax: fold it into the final max and sum.
+      const float s2 = sinks[h] * 1.4426950408889634f;
+      const float m_fin = fmaxf(m_run, s2);
+      const float a = __builtin_amdgcn_exp2f(m_run - m_fin);
+      inv = a / (l_run * a + __builtin_amdgcn_exp2f(s2 - m_fin));
+    }
     uint16_t* orow = out + int64_t(q0 + local0 + lo) * so_t + h * so_h + half * kHalf;
 #pragma unroll
     for (int dt = 0; dt < kHalf / 16; ++dt)
@@ -504,9 +514,11 @@ void attn_prefill_bf16(torch::Tensor& out, const torch::Tensor& q,
                        const torch::Tensor& seq_lens,
                        const torch::Tensor& block_table,
                        const torch::Tensor& tile_offsets, int64_t max_tiles,
-                       double scale, int64_t num_splits, int64_t window_left) {
+                       double scale, int64_t num_splits, int64_t window_left,
+                       const std::optional<torch::Tensor>& sinks) {
   const int64_t d = q.size(-1);
-  TORCH_CHECK(d == 64 || d == 256 || d == 512, "head_dim must be 64, 256 or 512");
+  TORCH_CHECK(d == 64 || d == 128 || d == 256 || d == 512,
+              "head_dim must be 64, 128, 256 or 512");
   TORCH_CHECK(q.scalar_type() == at::kBFloat16 && q.size(-1) == d &&
                   q.stride(-1) == 1,
               "q must be bf16 with a contiguous head_dim");
@@ -572,6 +584,16 @@ void attn_prefill_bf16(torch::Tensor& out, const torch::Tensor& q,
     ml_part = torch::empty({q.size(0), hq, num_splits, 2}, f32);
   }
   float* op = num_splits > 1 ? o_part.data_ptr<float>() : nullptr;
+  const float* sink_ptr = nullptr;
+  if (sinks.has_value()) {
+    // The split-KV reduce does not apply sinks; verify batches with sinks
+    // stay on vLLM's kernel.
+    TORCH_CHECK(num_splits == 1, "sinks need num_splits == 1");
+    TORCH_CHECK(sinks->scalar_type() == at::kFloat && sinks->dim() == 1 &&
+                    sinks->size(0) == hq && sinks->is_contiguous(),
+                "sinks must be contiguous fp32 [Hq]");
+    sink_ptr = sinks->data_ptr<float>();
+  }
   float* mp = num_splits > 1 ? ml_part.data_ptr<float>() : nullptr;
 
   auto stream_grid = [&](int hpb) {
@@ -595,7 +617,8 @@ void attn_prefill_bf16(torch::Tensor& out, const torch::Tensor& q,
       out.stride(1), key_cache.stride(0), key_cache.stride(1),               \
       key_cache.stride(2), value_cache.stride(0), value_cache.stride(1),     \
       value_cache.stride(2), sc_b, sc_s, sc_h, scale_log2,                   \
-      static_cast<int>(window_left), static_cast<int>(num_splits), op, mp)
+      static_cast<int>(window_left), static_cast<int>(num_splits), op, mp, \
+      sink_ptr)
 // Every tile exchanges its cross-wave score partials in fp16 (XT): ~5e-4
 // relative on a partial, the order of P's own bf16 rounding, and the LDS
 // and VGPRs it frees are worth 2-4 % at 256 and make HPB 8 fit at 512.
@@ -615,8 +638,11 @@ void attn_prefill_bf16(torch::Tensor& out, const torch::Tensor& q,
   /* 64 (LFM2.5): one wave per head, all four heads of a KV head per block; */ \
   /* BN 32 (185 VGPRs) beat 64 by 12% at 8k. */                                \
   else if (d == 64 && g == 4) STRIX_ATTN(64, 4, 4, 32, float, false, Q8);     \
+  /* 128 (Flint, 32 q / 4 kv heads): one wave per head, all eight heads of  */ \
+  /* a KV head per block, like the 64 row.                                  */ \
+  else if (d == 128 && g == 8) STRIX_ATTN(128, 8, 8, 32, float, false, Q8);   \
   else TORCH_CHECK(false, "attn_prefill_bf16: head_dim ", d, " GQA ", g,      \
-                   " not built (64: 4; 256: 2, 6, 8; 512: 8)")
+                   " not built (64: 4; 128: 8; 256: 2, 6, 8; 512: 8)")
   if (q8) {
     STRIX_ATTN_CONFIGS(true);
   } else {
@@ -626,6 +652,7 @@ void attn_prefill_bf16(torch::Tensor& out, const torch::Tensor& q,
 #undef STRIX_ATTN
   if (num_splits > 1) {
     auto reduce = d == 64    ? attn_split_reduce_kernel<64>
+                  : d == 128 ? attn_split_reduce_kernel<128>
                   : d == 256 ? attn_split_reduce_kernel<256>
                              : attn_split_reduce_kernel<512>;
     reduce<<<dim3(q.size(0), hq), d, 0, stream>>>(

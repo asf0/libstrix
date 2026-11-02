@@ -29,7 +29,13 @@ def disabled(op: str) -> bool:
 # STRIX_ENABLE names them: tuning them for one model cannot change another.
 ARCH_GATED = {
     # int8 decode copies of bf16 linears: +50 % of the dense weight memory.
-    "dense_w8": ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM"),
+    # Flint: decode 43.4 -> 61.8 tok/s at 2k (+1.7 GiB); GSM8K 228 / 227
+    # of 250 off / on, McNemar p = 1.0.
+    "dense_w8": (
+        "Qwen4ExpForConditionalGeneration",
+        "Qwen4ExpForCausalLM",
+        "FlintForCausalLM",
+    ),
     # int8 activations in the int4 MoE GEMM.
     "moe_w4a8": ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM"),
 }
@@ -44,6 +50,13 @@ FP16_ACT_UNSAFE = (
     "Gemma4ForCausalLM",
     "Gemma4UnifiedForConditionalGeneration",
 )
+
+# Models whose expert input fits fp16 but whose fused silu(gate) * up does not:
+# the w13 GEMM stays on the raw fp16-activation kernel and writes that
+# intermediate as bf16, and only w2 takes the bf16-activation kernel. Flint:
+# expert input |x| <= 3,104, intermediate up to 90,112 (one layer call in
+# 3,008), which as fp16 gave NaN logits (one repeated token per prompt).
+FP16_INTER_UNSAFE = ("FlintForCausalLM",)
 
 
 def _model_architectures() -> list[str]:
@@ -80,6 +93,11 @@ def model_gate(op: str) -> bool:
         "" if on else f" (not measured there; STRIX_ENABLE={op} to try it)",
     )
     return on
+
+
+def fp16_intermediate_unsafe() -> bool:
+    """Whether the model being loaded is in FP16_INTER_UNSAFE."""
+    return any(a in FP16_INTER_UNSAFE for a in _model_architectures())
 
 
 def fp16_activations_ok(op: str) -> bool:

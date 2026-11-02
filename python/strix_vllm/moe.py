@@ -27,7 +27,12 @@ import os
 
 import torch
 
-from strix_vllm import disabled, fp16_activations_ok, model_gate
+from strix_vllm import (
+    disabled,
+    fp16_activations_ok,
+    fp16_intermediate_unsafe,
+    model_gate,
+)
 
 ROW_PAD = 64  # elements; (K + 64) * 2 bytes has a small power-of-two factor
 
@@ -837,6 +842,9 @@ def _make_fp8_experts_cls(raw: bool = True):
             super().__init__(*args, **kwargs)
             # Decided while the model is built, when its architecture is known.
             self._raw = raw and fp16_activations_ok("moe_fp8_raw")
+            # Raw w13 with a bf16 intermediate, bf16-activation w2 (see
+            # FP16_INTER_UNSAFE).
+            self._raw_w2 = self._raw and not fp16_intermediate_unsafe()
 
         @property
         def expects_unquantized_inputs(self) -> bool:
@@ -956,10 +964,12 @@ def _make_fp8_experts_cls(raw: bool = True):
             gemm = torch.ops.strix.moe_gemm_fp8_raw if raw else torch.ops.strix.moe_gemm_fp8
             x = hidden_states
             if raw:
-                # fp16 activations in, the fused activation written as fp16 for
-                # the second GEMM to read as-is (same itemsize as the bf16 cache).
+                # fp16 activations in. The fused activation is written as fp16
+                # for a raw w2 to read as-is (same itemsize as the bf16 cache),
+                # or kept bf16 when it can leave the fp16 range.
                 x = hidden_states.to(torch.float16)
-                cache2 = cache2.view(torch.float16)
+                if self._raw_w2:
+                    cache2 = cache2.view(torch.float16)
             gemm(
                 cache2,
                 x,
@@ -981,7 +991,10 @@ def _make_fp8_experts_cls(raw: bool = True):
                 if apply_router_weight_on_input
                 else topk_weights.reshape(-1).to(torch.float32)
             )
-            gemm(
+            gemm2 = (
+                gemm if not raw or self._raw_w2 else torch.ops.strix.moe_gemm_fp8
+            )
+            gemm2(
                 cache3,
                 cache2,
                 w2,

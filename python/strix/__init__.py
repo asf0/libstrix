@@ -206,6 +206,7 @@ def _(
     scale,
     num_splits,
     window_left=-1,
+    sinks=None,
 ):
     return None
 
@@ -223,6 +224,7 @@ def attn_prefill(
     window_left: int = -1,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Causal paged attention for prefill (no host sync).
 
@@ -232,8 +234,11 @@ def attn_prefill(
     num_splits > 1 splits each 16-query tile's keys (split-KV), for short
     queries (decode, speculative verify) over long contexts.
 
+    sinks: optional fp32 [Hq] attention-sink logits (one extra, unscaled
+    logit per query head in every softmax, as in vLLM); num_splits must be 1.
+
     q, out: [T, Hq, D]; caches: [blocks, block_size, Hkv, D] views, D = 64
-    (GQA 4), 256 (GQA 2 / 6 / 8) or 512 (GQA 8); the queries of sequence n are
+    (GQA 4), 128 (GQA 8), 256 (GQA 2 / 6 / 8) or 512 (GQA 8); the queries of sequence n are
     the last q_len of its seq_lens[n] positions. The caches are bf16, or int8
     with k_scale/v_scale ([blocks, block_size, Hkv] fp32) as the dequant
     scales, one per (key, head) - vLLM's int8_per_token_head layout.
@@ -258,6 +263,7 @@ def attn_prefill(
         scale,
         num_splits,
         window_left,
+        sinks,
     )
     return out
 
@@ -329,6 +335,7 @@ def _(
     window_left=-1,
     k_scale=None,
     v_scale=None,
+    sinks=None,
 ):
     return None
 
@@ -345,11 +352,14 @@ def attn_decode(
     window_left: int = -1,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Paged attention for one query token per sequence (decode), split-KV.
 
     q, out: [N, Hq, D]; caches: [blocks, block_size, Hkv, D] views; the query
-    is position seq_lens[n] - 1. Built for (D, GQA) = (256, 2), (512, 8).
+    is position seq_lens[n] - 1. Built for (D, GQA) = (128, 8), (256, 2),
+    (256, 6), (256, 8), (512, 8). sinks: optional fp32 [Hq] attention-sink
+    logits (one unscaled logit per query head, as in vLLM).
     The caches are bf16, or int8 with k_scale/v_scale
     ([blocks, block_size, Hkv] fp32) as the dequant scales, one per (key,
     head) - vLLM's int8_per_token_head layout.
@@ -366,6 +376,7 @@ def attn_decode(
         window_left,
         k_scale,
         v_scale,
+        sinks,
     )
     return out
 

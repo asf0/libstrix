@@ -27,6 +27,9 @@
 // activation is written as fp16 for the next GEMM to read as-is. This is ~3x
 // less ALU per staged weight than the bf16-staging path above (profiles:
 // the w13 GEMM at 8k tokens was 40 % slower than the bf16 checkpoint's).
+// A bf16 c instead makes the fused activation bf16: for models whose
+// silu(gate) * up leaves the fp16 range (Flint reached 90,112), the w13 GEMM
+// stays raw and only w2 takes the bf16-staging kernel.
 //
 // ACT fuses vLLM's {silu,gelu_tanh}_and_mul into the w13 GEMM exactly as the
 // other two kernels do: W rows are [gate (N/2); up (N/2)], a block's BN rows
@@ -79,7 +82,7 @@ __global__ __launch_bounds__(WAVES_M* WAVES_N* kWave) void moe_gemm_w8a16_kernel
     const int32_t* __restrict__ num_post_padded, const float* __restrict__ topk_w,
     int64_t num_valid, int top_k, int k_dim, int s_f16, int s_f32, int64_t lda,
     int64_t ldw, int64_t w_expert_stride, int64_t s_expert_stride,
-    int64_t s_row_stride, int64_t ldc, int n_half) {
+    int64_t s_row_stride, int64_t ldc, int n_half, int c_bf16) {
   constexpr bool RAW = WFMT >= kWFp8ChannelRaw;
   constexpr bool BLOCK_RAW = WFMT == kWFp8BlockRaw;
   constexpr int kThreads = WAVES_M * WAVES_N * kWave;
@@ -369,7 +372,7 @@ __global__ __launch_bounds__(WAVES_M* WAVES_N* kWave) void moe_gemm_w8a16_kernel
           for (int j = 0; j < FN; ++j) {
             const float g = acc[i][j][e];
             const float u = s_up[r * kHalf + col0 + j * 16 + acc_col(lane)];
-            if constexpr (RAW) {
+            if (RAW && !c_bf16) {
               // The next GEMM reads this as fp16.
               const __half h = __float2half(moe_gate<ACT>(g) * u);
               crow[j * 16] = *reinterpret_cast<const uint16_t*>(&h);
@@ -417,6 +420,7 @@ struct MoeW8Launch {
   int top_k, k_dim, s_f16, s_f32;
   int64_t lda, ldw, w_expert_stride, s_expert_stride, s_row_stride, ldc;
   int n_half;
+  int c_bf16;
   dim3 grid;
   hipStream_t stream;
 };
@@ -428,7 +432,7 @@ inline void launch_moe_w8(const MoeW8Launch& m) {
           m.c, m.a, m.w, m.scales, m.sorted_ids, m.expert_ids,
           m.num_post_padded, m.topk_w, m.num_valid, m.top_k, m.k_dim, m.s_f16,
           m.s_f32, m.lda, m.ldw, m.w_expert_stride, m.s_expert_stride,
-          m.s_row_stride, m.ldc, m.n_half);
+          m.s_row_stride, m.ldc, m.n_half, m.c_bf16);
 }
 
 }  // namespace
@@ -449,9 +453,12 @@ static void moe_gemm_impl(torch::Tensor& c, const torch::Tensor& a,
   const bool s_f16 = scales.scalar_type() == at::kHalf;
   const bool s_f32 = scales.scalar_type() == at::kFloat;
   // Raw: fp16 activations in, fp16 out when the activation is fused (the next
-  // GEMM's input) and bf16 out otherwise.
+  // GEMM's input) and bf16 out otherwise; a bf16 c keeps the fused activation
+  // bf16 for models whose intermediate leaves the fp16 range.
   const at::ScalarType a_type = raw ? at::kHalf : at::kBFloat16;
-  const at::ScalarType c_type = raw && silu_mul ? at::kHalf : at::kBFloat16;
+  const bool c_bf16 = c.scalar_type() == at::kBFloat16;
+  const at::ScalarType c_type =
+      raw && silu_mul && !c_bf16 ? at::kHalf : at::kBFloat16;
   TORCH_CHECK(a.scalar_type() == a_type &&
                   w.scalar_type() == (fp8 ? at::kFloat8_e4m3fn : at::kChar) &&
                   (scales.scalar_type() == at::kBFloat16 || s_f16 || s_f32) &&
@@ -532,6 +539,7 @@ static void moe_gemm_impl(torch::Tensor& c, const torch::Tensor& a,
       block ? scales.stride(1) : 0,
       c.stride(0),
       int(n / 2),
+      int(c_bf16),
       grid,
       stream};
 #define STRIX_MOE_W8_ACT(BM, BN, WM, WN, WF)                                  \

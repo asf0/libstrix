@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Paged attention for decode (one query token per sequence), bf16 Q/KV,
-// optional sliding window, split-KV over key segments.
+// optional sliding window, split-KV over key segments, optional attention
+// sinks (one learned logit per query head in every softmax, as in vLLM's
+// Triton kernel; folded in once, after the segments are combined).
 //
 // One block owns one (sequence, KV head, key segment) and all G query heads of
 // that KV head. Keys are processed KC at a time: the K/V chunk is staged in
@@ -33,7 +35,8 @@ __global__ __launch_bounds__(KT) void attn_decode_kernel(
     int64_t so_h, int64_t sk_b, int64_t sk_s, int64_t sk_h, int64_t sv_b,
     int64_t sv_s, int64_t sv_h, int64_t ss_b, int64_t ss_s, int64_t ss_h,
     float scale_log2, int win_left, int nseg,
-    float* __restrict__ o_part, float* __restrict__ ml_part) {
+    float* __restrict__ o_part, float* __restrict__ ml_part,
+    const float* __restrict__ sinks) {
   constexpr int OPT = G * D / KT;   // output values per thread
   constexpr int kChunkLoads = (KC * D / 8 + KT - 1) / KT;  // guarded
   static_assert(G * D % KT == 0 && D % OPT == 0 && OPT % 2 == 0);
@@ -254,7 +257,14 @@ __global__ __launch_bounds__(KT) void attn_decode_kernel(
       ml_part[2 * r + 1] = s_l[o_h];
     }
   } else {
-    const float inv = 1.f / s_l[o_h];
+    float inv = 1.f / s_l[o_h];
+    if (sinks != nullptr) {
+      // The sink is one more (unscaled, natural-log) logit in the softmax.
+      const float s2 = sinks[h] * 1.4426950408889634f, m = s_m[o_h];
+      const float m_fin = fmaxf(m, s2);
+      const float a = __builtin_amdgcn_exp2f(m - m_fin);
+      inv = a / (s_l[o_h] * a + __builtin_amdgcn_exp2f(s2 - m_fin));
+    }
     uint16_t* orow = out + n * so_t + h * so_h + o_d;
 #pragma unroll
     for (int i = 0; i < OPT; i += 2)
@@ -267,7 +277,7 @@ template <int D>
 __global__ __launch_bounds__(D) void attn_decode_reduce_kernel(
     uint16_t* __restrict__ out, const float* __restrict__ o_part,
     const float* __restrict__ ml_part, int nseg, int hq, int64_t so_t,
-    int64_t so_h) {
+    int64_t so_h, const float* __restrict__ sinks) {
   const int64_t row = int64_t(blockIdx.x) * hq + blockIdx.y;
   const float* ml = ml_part + row * nseg * 2;
   float m = -INFINITY;
@@ -277,6 +287,13 @@ __global__ __launch_bounds__(D) void attn_decode_reduce_kernel(
     const float w = ml[2 * s] == -INFINITY ? 0.f : exp2f(ml[2 * s] - m);
     l += w * ml[2 * s + 1];
     acc += w * o_part[(row * nseg + s) * D + threadIdx.x];
+  }
+  if (sinks != nullptr) {
+    const float s2 = sinks[blockIdx.y] * 1.4426950408889634f;
+    const float m_fin = fmaxf(m, s2);
+    const float a = m == -INFINITY ? 0.f : exp2f(m - m_fin);
+    acc *= a;
+    l = l * a + exp2f(s2 - m_fin);
   }
   out[blockIdx.x * so_t + blockIdx.y * so_h + threadIdx.x] =
       static_cast<uint16_t>(pack_bf16x2(acc / l, 0.f) & 0xffffu);
@@ -296,7 +313,8 @@ void attn_decode_bf16(torch::Tensor& out, const torch::Tensor& q,
                       const torch::Tensor& block_table, double scale,
                       int64_t num_splits, int64_t window_left,
                       const std::optional<torch::Tensor>& k_scale,
-                      const std::optional<torch::Tensor>& v_scale) {
+                      const std::optional<torch::Tensor>& v_scale,
+                      const std::optional<torch::Tensor>& sinks) {
   const int64_t d = q.size(-1), nseq = q.size(0);
   TORCH_CHECK(q.scalar_type() == at::kBFloat16 && q.size(-1) == d &&
                   q.stride(-1) == 1,
@@ -352,6 +370,13 @@ void attn_decode_bf16(torch::Tensor& out, const torch::Tensor& q,
   }
   float* op = num_splits > 1 ? o_part.data_ptr<float>() : nullptr;
   float* mp = num_splits > 1 ? ml_part.data_ptr<float>() : nullptr;
+  const float* sink_ptr = nullptr;
+  if (sinks.has_value()) {
+    TORCH_CHECK(sinks->scalar_type() == at::kFloat && sinks->dim() == 1 &&
+                    sinks->size(0) == hq && sinks->is_contiguous(),
+                "sinks must be contiguous fp32 [Hq]");
+    sink_ptr = sinks->data_ptr<float>();
+  }
   auto stream = at::hip::getCurrentHIPStream();
   const float scale_log2 = static_cast<float>(scale) * 1.4426950408889634f;
   const dim3 grid(nseq, hkv, num_splits);
@@ -369,7 +394,8 @@ void attn_decode_bf16(torch::Tensor& out, const torch::Tensor& q,
       out.stride(1), key_cache.stride(0), key_cache.stride(1),               \
       key_cache.stride(2), value_cache.stride(0), value_cache.stride(1),     \
       value_cache.stride(2), sc_b, sc_s, sc_h, scale_log2,                   \
-      static_cast<int>(window_left), static_cast<int>(num_splits), op, mp)
+      static_cast<int>(window_left), static_cast<int>(num_splits), op, mp,  \
+      sink_ptr)
   // Gemma-4 sliding (256, GQA 2) plus (256, 8) for the 35B and 27B bf16,
   // which otherwise fall back to Triton decode. GQA 6 (the served 27B INT8)
   // cannot use this kernel: its layout needs G*KC to divide 256 threads and
@@ -380,22 +406,26 @@ void attn_decode_bf16(torch::Tensor& out, const torch::Tensor& q,
     else if (d == 256 && g == 8) STRIX_DECODE(256, 8, 32, true, 256);
     else if (d == 256 && g == 6) STRIX_DECODE(256, 6, 32, true, 192);
     else if (d == 512 && g == 8) STRIX_DECODE(512, 8, 16, true, 256);
+    else if (d == 128 && g == 8) STRIX_DECODE(128, 8, 32, true, 256);
     else TORCH_CHECK(false, "attn_decode_bf16 int8: head_dim ", d, " GQA ", g,
-                     " not built (256: 2, 6, 8; 512: 8)");
+                     " not built (128: 8; 256: 2, 6, 8; 512: 8)");
   } else {
     if (d == 256 && g == 2) STRIX_DECODE(256, 2, 32, false, 256);
     else if (d == 256 && g == 8) STRIX_DECODE(256, 8, 32, false, 256);
     else if (d == 256 && g == 6) STRIX_DECODE(256, 6, 32, false, 192);
     else if (d == 512 && g == 8) STRIX_DECODE(512, 8, 16, false, 256);
+    else if (d == 128 && g == 8) STRIX_DECODE(128, 8, 32, false, 256);
     else TORCH_CHECK(false, "attn_decode_bf16: head_dim ", d, " GQA ", g,
-                     " not built (256: 2, 6, 8; 512: 8)");
+                     " not built (128: 8; 256: 2, 6, 8; 512: 8)");
   }
 #undef STRIX_DECODE
   if (num_splits > 1) {
-    auto reduce = d == 256 ? attn_decode_reduce_kernel<256> : attn_decode_reduce_kernel<512>;
+    auto reduce = d == 128   ? attn_decode_reduce_kernel<128>
+                  : d == 256 ? attn_decode_reduce_kernel<256>
+                             : attn_decode_reduce_kernel<512>;
     reduce<<<dim3(nseq, hq), d, 0, stream>>>(
         reinterpret_cast<uint16_t*>(out.data_ptr()), op, mp,
-        static_cast<int>(num_splits), hq, out.stride(0), out.stride(1));
+        static_cast<int>(num_splits), hq, out.stride(0), out.stride(1), sink_ptr);
   }
 }
 

@@ -98,7 +98,8 @@ void attn_prefill_bf16(torch::Tensor& out, const torch::Tensor& q,
                             const torch::Tensor& block_table,
                             const torch::Tensor& tile_offsets,
                             int64_t max_tiles, double scale,
-                            int64_t num_splits, int64_t window_left);
+                            int64_t num_splits, int64_t window_left,
+                            const std::optional<torch::Tensor>& sinks);
 void attn_decode_bf16(torch::Tensor& out, const torch::Tensor& q,
                       const torch::Tensor& key_cache,
                       const torch::Tensor& value_cache,
@@ -106,7 +107,8 @@ void attn_decode_bf16(torch::Tensor& out, const torch::Tensor& q,
                       const torch::Tensor& block_table, double scale,
                       int64_t num_splits, int64_t window_left,
                       const std::optional<torch::Tensor>& k_scale,
-                      const std::optional<torch::Tensor>& v_scale);
+                      const std::optional<torch::Tensor>& v_scale,
+                      const std::optional<torch::Tensor>& sinks);
 torch::Tensor w4a16_wmma_gemm(const torch::Tensor& x, const torch::Tensor& w,
                               const torch::Tensor& scales,
                               const std::optional<torch::Tensor>& bias,
@@ -233,7 +235,7 @@ TORCH_LIBRARY(strix, m) {
       "Tensor value_cache, Tensor? k_scale, Tensor? v_scale, "
       "Tensor cu_seqlens_q, Tensor seq_lens, "
       "Tensor block_table, Tensor tile_offsets, int max_tiles, float scale, "
-      "int num_splits, int window_left=-1) -> ()");
+      "int num_splits, int window_left=-1, Tensor? sinks=None) -> ()");
   m.def(
       "attn_prefill32_bf16(Tensor(a!) out, Tensor q, Tensor key_cache, "
       "Tensor value_cache, Tensor cu_seqlens_q, Tensor seq_lens, "
@@ -254,7 +256,7 @@ TORCH_LIBRARY(strix, m) {
       "attn_decode_bf16(Tensor(a!) out, Tensor q, Tensor key_cache, "
       "Tensor value_cache, Tensor seq_lens, Tensor block_table, float scale, "
       "int num_splits, int window_left=-1, Tensor? k_scale=None, "
-      "Tensor? v_scale=None) -> ()");
+      "Tensor? v_scale=None, Tensor? sinks=None) -> ()");
   m.def(
       "w4a16_wmma_gemm(Tensor x, Tensor w, Tensor scales, Tensor? bias, "
       "int group_size) -> Tensor");

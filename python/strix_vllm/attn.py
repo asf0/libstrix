@@ -23,7 +23,8 @@ from strix_vllm import disabled
 # Which (head_dim, GQA) pairs each kernel takes comes from the registry table
 # (python/strix/registry.py), so the gate here cannot drift from the geometry
 # the HIP dispatch accepts. Resolved once, on first use.
-#   prefill: head 64 G4 (LFM2.5), 256 GQA 2/6/8, 512 G8
+#   prefill: head 64 G4 (LFM2.5), 128 G8 (Flint, with sinks), 256 GQA 2/6/8,
+#            512 G8
 #   decode:  head 256 GQA 2 (Gemma-4 sliding), 256 G8 (35B, <= 2 sequences),
 #            512 G8 (Gemma-4 full layers)
 #   verify:  the split-KV prefill variant, head 256 GQA 6 only
@@ -53,6 +54,8 @@ def _cfgs(kind: str) -> frozenset[tuple[int, int]]:
             "verify": {"split_kv": True},
             "decode_bf16": {"kv_dtype": "bf16"},
             "decode_int8": {"kv_dtype": "int8"},
+            "prefill_sinks": {"sinks": True},
+            "decode_sinks": {"sinks": True},
         }.get(kind, {})
         _CFGS[kind] = frozenset(strix.geometries(op, "head_dim", "gqa", **where))
     return _CFGS[kind]
@@ -116,14 +119,20 @@ def _classes():
             cfg = (self.head_size, self.num_queries_per_kv)
             # Which kernel a batch gets depends on max_query_len, so both
             # halves of the gate are resolved per (head_dim, GQA) here.
-            self._prefill_ok = cfg in _cfgs("prefill")
+            # Sinks (Flint): only the prefill and decode rows built for them;
+            # the split-KV verify does not apply sinks, so verify batches stay
+            # on vLLM's kernel.
+            sinks = self.sinks is not None
+            self._prefill_ok = cfg in _cfgs("prefill_sinks" if sinks else "prefill")
             # STRIX_DISABLE=attn_decode keeps the vendored Triton kernel and
             # must keep this one switched off with it.
-            self._decode_ok = not disabled("attn_decode") and cfg in _cfgs("decode")
+            self._decode_ok = not disabled("attn_decode") and cfg in _cfgs(
+                "decode_sinks" if sinks else "decode"
+            )
             self._decode_bf16 = cfg in _cfgs("decode_bf16")
             self._decode_int8 = cfg in _cfgs("decode_int8")
             self._decode_max_seqs = DECODE_MAX_SEQS.get(cfg)
-            self._verify_ok = cfg in _cfgs("verify")
+            self._verify_ok = not sinks and cfg in _cfgs("verify")
             # int8_per_token_head KV (the served teacher-corpus config) runs
             # the prefill kernel on the byte cache and its inline scales.
             self._kv_int8_ok = self._kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
@@ -138,7 +147,6 @@ def _classes():
                     or (self.sliding_window[0] >= 0 and self.sliding_window[1] == 0)
                 )
                 and not self.logits_soft_cap
-                and self.sinks is None
                 and self.chunk_lookback == -1
             )
 
@@ -218,6 +226,7 @@ def _classes():
                     window_left,
                     k_scale,
                     v_scale,
+                    self.sinks,
                 )
                 return output
             # Windowed layers (Gemma-4 sliding, head 256 GQA 2) prefill here
@@ -268,6 +277,7 @@ def _classes():
                 window_left,
                 k_scale,
                 v_scale,
+                self.sinks,
             )
             return output
 

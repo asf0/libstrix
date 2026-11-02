@@ -456,6 +456,24 @@ KERNELS: list[Kernel] = [
         {"hpb": 4, "bn": 32},
     ),
     Kernel(
+        "attn_prefill_bf16",
+        "attn_prefill",
+        "head 128 GQA 8 (Flint, 32 q / 4 kv heads, 513-key sliding window on "
+        "most layers): one wave per head, all eight heads of a KV head per "
+        "block, BN 32; attention sinks fold into the final max and sum",
+        {
+            "head_dim": 128,
+            "gqa": 8,
+            **_BF16,
+            "kv_dtype": ("bf16", "int8"),
+            "split_kv": False,
+            "window": (True, False),
+            "causal": True,
+            "sinks": (True, False),
+        },
+        {"hpb": 8, "bn": 32},
+    ),
+    Kernel(
         "attn_prefill32_bf16",
         "attn_prefill32",
         "NOT ROUTED: D=512 prefill with 32 query columns per K/V stage. Warps "
@@ -520,6 +538,22 @@ KERNELS: list[Kernel] = [
             **_BF16,
             "kv_dtype": ("bf16", "int8"),
             "window": (False,),
+        },
+        {"block": 32},
+    ),
+    Kernel(
+        "attn_decode_bf16",
+        "attn_decode",
+        "head 128 GQA 8 (Flint), bf16 or int8 KV, 513-key sliding window or "
+        "full layers; attention sinks folded in after the segments combine",
+        {
+            "head_dim": 128,
+            "gqa": 8,
+            "queries": 1,
+            **_BF16,
+            "kv_dtype": ("bf16", "int8"),
+            "window": (True, False),
+            "sinks": (True, False),
         },
         {"block": 32},
     ),
