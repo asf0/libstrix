@@ -1,18 +1,19 @@
-# gemma-4-26B-A4B FP8 (per-channel, dynamic activations).
+# Qwen3.6-35B-A3B INT8 W8A8. MTP 2 by default (its MTP head); MTP=0 turns it off.
 #
-#   docker compose -f gemma-4-26b-a4b-it-fp8-dynamic.yaml up -d
+#   docker compose -f qwen3.6-35b-a3b-w8a8.yaml up -d
 #
 # Overrides go in .env (see .env.example) or the shell.
 services:
-  gemma-4-26b-a4b-it-fp8-dynamic:
+  qwen3.6-35b-a3b-w8a8:
     extends:
       file: common.yaml
       service: strix
     environment:
-      MTP: ${MTP:-0}
-      HF_REPO: RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic
+      MTP: ${MTP:-2}
+      REPLAYSSM: ${REPLAYSSM:-1}
+      HF_REPO: Avesed/Qwen3.6-35B-A3B-INT8-W8A8
     command:
-      - /models/gemma-4-26B-A4B-it-FP8-dynamic
+      - /models/Qwen3.6-35B-A3B-INT8-W8A8
       - --mm-encoder-attn-backend=TRITON_ATTN
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head

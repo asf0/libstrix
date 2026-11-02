@@ -1,19 +1,18 @@
-# Qwen3.6-35B-A3B INT8 W8A8. MTP 2 by default (its MTP head); MTP=0 turns it off.
+# gemma-4-26B-A4B bf16.
 #
-#   docker compose -f qwen3.6-35b-a3b-int8-w8a8.yaml up -d
+#   docker compose -f gemma-4-26b-a4b.yaml up -d
 #
 # Overrides go in .env (see .env.example) or the shell.
 services:
-  qwen3.6-35b-a3b-int8-w8a8:
+  gemma-4-26b-a4b:
     extends:
       file: common.yaml
       service: strix
     environment:
-      MTP: ${MTP:-2}
-      REPLAYSSM: ${REPLAYSSM:-1}
-      HF_REPO: Avesed/Qwen3.6-35B-A3B-INT8-W8A8
+      MTP: ${MTP:-0}
+      HF_REPO: google/gemma-4-26B-A4B-it
     command:
-      - /models/Qwen3.6-35B-A3B-INT8-W8A8
+      - /models/gemma-4-26B-A4B-it
       - --mm-encoder-attn-backend=TRITON_ATTN
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head

@@ -2,11 +2,11 @@
 # config (MTP 2, 40 sequences, 131k, int8 KV), with RecoverSSM
 # (--use-replayssm) so MTP keeps one GDN state per request.
 #
-#   docker compose -f qwen3.8-27b-int8-w8a16-mtp.yaml up -d
+#   docker compose -f qwen3.8-27b-int8.yaml up -d
 #
 # Overrides go in .env (see .env.example) or the shell.
 services:
-  qwen3.8-27b-int8-w8a16-mtp:
+  qwen3.8-27b-int8:
     extends:
       file: common.yaml
       service: strix

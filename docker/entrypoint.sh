@@ -2,8 +2,9 @@
 # `vllm serve <model> <flags>` for the recipes in recipes/. A first argument
 # that is a command on PATH runs instead (`... bash`, `... python -c`).
 # The model folder falls back to $HF_REPO (downloaded into /cache/huggingface)
-# when it is not mounted under /models. MTP=<n> adds the MTP speculative config
-# (plus --use-replayssm when REPLAYSSM=1),
+# when it is not mounted under /models. MTP=<n> adds the MTP speculative config.
+# REPLAYSSM=1 adds --use-replayssm whenever the run speculates (MTP, or a
+# --speculative-config in the recipe, e.g. DFlash 2),
 # EXTRA_ARGS (word-split) are appended last and win over the recipe's flags.
 #
 # gfx1151 GPU memory is host RAM, and the kernel cannot reclaim it: a run that
@@ -26,11 +27,19 @@ if [ ! -e "$model" ] && [ -n "${HF_REPO:-}" ]; then
   model=$HF_REPO
 fi
 spec=()
+speculates=0
 if [ -n "${MTP:-}" ] && [ "$MTP" != 0 ]; then
   spec=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP}")
-  # RecoverSSM: one GDN state per request instead of one per draft position
-  # (Qwen3.5-family GDN models; the recipes that support it set REPLAYSSM=1).
-  [ "${REPLAYSSM:-0}" = 1 ] && spec+=(--use-replayssm)
+  speculates=1
+fi
+for arg in "$@"; do
+  case $arg in --speculative-config*) speculates=1 ;; --use-replayssm) speculates=0; break ;; esac
+done
+# ReplaySSM: one GDN state per request instead of one per draft position, which
+# frees KV cache (Qwen3.5-family GDN models; the recipes that support it set
+# REPLAYSSM=1). Skipped when the recipe already passes the flag itself.
+if [ "$speculates" = 1 ] && [ "${REPLAYSSM:-0}" = 1 ]; then
+  spec+=(--use-replayssm)
 fi
 echo "strix-vllm: vllm $(cut -c1-10 /opt/strix/strix-vllm.ref)," \
   "libstrix $(cut -c1-10 /opt/strix/libstrix.ref), model $model" >&2

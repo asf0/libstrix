@@ -1,0 +1,27 @@
+# Qwen3.8-27B FP8 (block-scaled) + DFlash 2 draft.
+# Speculative decoding with the DFlash 2 block-diffusion draft
+# (incoai/Qwen3.8-27B-DFlash2, mounted next to the target under /models). SPEC_TOKENS
+# sets the draft tokens per step (the draft's block size minus one at most).
+#
+#   docker compose -f qwen3.8-27b-fp8-dflash2.yaml up -d
+#
+# Overrides go in .env (see .env.example) or the shell.
+services:
+  qwen3.8-27b-fp8-dflash2:
+    extends:
+      file: common.yaml
+      service: strix
+    environment:
+      MTP: 0
+      REPLAYSSM: ${REPLAYSSM:-1}
+      HF_REPO: Qwen/Qwen3.8-27B-FP8
+    command:
+      - /models/Qwen3.8-27B-FP8
+      - '--speculative-config={"method": "dflash", "model": "/models/Qwen3.8-27B-DFlash2", "num_speculative_tokens": ${SPEC_TOKENS:-7}}'
+      - --mm-encoder-attn-backend=TRITON_ATTN
+      - --attention-backend=TRITON_ATTN
+      - --kv-cache-dtype=int8_per_token_head
+      - --gpu-memory-utilization=${GPU_UTIL:-0.85}
+      - --max-model-len=${MAX_MODEL_LEN:-131072}
+      - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-8192}
+      - --max-num-seqs=${MAX_NUM_SEQS:-16}

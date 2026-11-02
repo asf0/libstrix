@@ -1,0 +1,26 @@
+# LFM2.5-24B-A2B FP8 (block-scaled) + DSpark draft, text only. Context caps at
+# 131,072. Speculative decoding with the DSpark draft
+# (LiquidAI/LFM2.5-24B-A2B-DSpark, mounted next to the target under /models).
+# SPEC_TOKENS sets the draft tokens per step (at most 9: the draft's block size);
+# 4 is the fastest for one request, 6 for several at once.
+#
+#   docker compose -f lfm2.5-24b-a2b-fp8-dspark.yaml up -d
+#
+# Overrides go in .env (see .env.example) or the shell.
+services:
+  lfm2.5-24b-a2b-fp8-dspark:
+    extends:
+      file: common.yaml
+      service: strix
+    environment:
+      MTP: 0
+      HF_REPO: LiquidAI/LFM2.5-24B-A2B-FP8
+    command:
+      - /models/LFM2.5-24B-A2B-FP8
+      - '--speculative-config={"method": "dspark", "model": "/models/LFM2.5-24B-A2B-DSpark", "num_speculative_tokens": ${SPEC_TOKENS:-4}}'
+      - --attention-backend=TRITON_ATTN
+      - --kv-cache-dtype=int8_per_token_head
+      - --gpu-memory-utilization=${GPU_UTIL:-0.85}
+      - --max-model-len=${MAX_MODEL_LEN:-131072}
+      - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-8192}
+      - --max-num-seqs=${MAX_NUM_SEQS:-16}

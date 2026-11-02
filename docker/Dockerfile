@@ -5,9 +5,17 @@
 #
 #   docker build -f docker/Dockerfile -t strix-vllm .
 #
-# STRIX_VLLM_REF pins the fork; libstrix is the build context.
+# STRIX_VLLM_REF pins the fork; libstrix is the build context. A local fork
+# checkout (commits not on GitHub yet) comes in as the named context
+# strix-vllm-local, a git repository (docker/build-and-push.sh passes a bare
+# clone with STRIX_VLLM_LOCAL=/path/to/strix-vllm):
+#
+#   docker build --build-context strix-vllm-local=/tmp/strix-vllm.git ...
 
 ARG UBUNTU=ubuntu:26.04
+
+# Empty unless --build-context strix-vllm-local=... replaces it.
+FROM scratch AS strix-vllm-local
 
 FROM ${UBUNTU} AS base
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -58,7 +66,12 @@ RUN pip install --no-deps --ignore-requires-python -r /tmp/constraints.txt \
 # (PEP 649) no longer materializes; without this `import vllm` fails.
 COPY docker/patch_tensorizer.py /tmp/patch_tensorizer.py
 RUN python /tmp/patch_tensorizer.py
-RUN git clone --filter=blob:none "$STRIX_VLLM_REPO" /src/strix-vllm \
+RUN --mount=type=bind,from=strix-vllm-local,target=/mnt/strix-vllm \
+    if git -C /mnt/strix-vllm rev-parse --git-dir >/dev/null 2>&1; then \
+        git -c safe.directory='*' clone /mnt/strix-vllm /src/strix-vllm; \
+    else \
+        git clone --filter=blob:none "$STRIX_VLLM_REPO" /src/strix-vllm; \
+    fi \
     && git -C /src/strix-vllm checkout "$STRIX_VLLM_REF" \
     && git -C /src/strix-vllm rev-parse HEAD > /src/strix-vllm.ref
 # The fork clone has no upstream release tags; stamp the release it is based on

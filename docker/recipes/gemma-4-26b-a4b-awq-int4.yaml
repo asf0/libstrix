@@ -1,10 +1,10 @@
 # gemma-4-26B-A4B AWQ 4-bit.
 #
-#   docker compose -f gemma-4-26b-a4b-it-awq-4bit.yaml up -d
+#   docker compose -f gemma-4-26b-a4b-awq-int4.yaml up -d
 #
 # Overrides go in .env (see .env.example) or the shell.
 services:
-  gemma-4-26b-a4b-it-awq-4bit:
+  gemma-4-26b-a4b-awq-int4:
     extends:
       file: common.yaml
       service: strix
