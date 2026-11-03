@@ -23,3 +23,5 @@ services:
       - --enable-auto-tool-choice
       - --tool-call-parser=lfm2
       - --reasoning-parser=deepseek_r1
+      # Sampling defaults (LFM2.5 generation_config.json); a request's own values win.
+      - '--override-generation-config={"temperature": 0.1, "top_k": 50, "repetition_penalty": 1.05}'

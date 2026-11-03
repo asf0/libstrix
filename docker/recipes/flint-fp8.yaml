@@ -24,3 +24,5 @@ services:
       - --enable-auto-tool-choice
       - --tool-call-parser=glm45
       - --reasoning-parser=glm45
+      # Sampling defaults (its generation_config.json); a request's own values win.
+      - '--override-generation-config={"temperature": 1.0, "top_p": 0.95, "top_k": 20}'

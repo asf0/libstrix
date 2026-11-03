@@ -27,3 +27,5 @@ services:
       # The template turns thinking off unless asked; with it off the answer
       # carries no </think> and the reasoning parser files all of it as reasoning.
       - '--default-chat-template-kwargs={"enable_thinking": true}'
+      # Sampling defaults (its generation_config.json); a request's own values win.
+      - '--override-generation-config={"temperature": 1.0, "top_p": 0.95, "top_k": 20}'

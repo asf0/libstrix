@@ -59,8 +59,10 @@ def check(target: str) -> dict:
         with Server(recipe, env) as s:
             res.update(s.startup_numbers())
             res["kernels"] = s.kernels()
-            # 1024 tokens: a checkpoint that always reasons first (Muse-Glimmer has
-            # no switch to turn it off) needs room before its answer.
+            # 1024 tokens for every request: a checkpoint that always reasons first
+            # (Muse-Glimmer has no switch to turn it off) needs room before its
+            # answer, and Qwen3.6-35B-A3B FP8 thinks for ~600 tokens before a
+            # tool call.
             t = text_of(s.chat("Reply with one word: hello.", max_tokens=1024))
             res["text"] = "ok" if "hello" in t.lower() else f"FAIL: {t[:80]!r}"
             if "--language-model-only" in cmd:
@@ -75,11 +77,19 @@ def check(target: str) -> dict:
                     t = text_of(r)
                     res["image"] = "ok" if "red" in t.lower() else f"FAIL: {t[:80]!r}"
             if "--tool-call-parser" in cmd:
-                r = s.chat("What is the weather in Paris right now? Use the tool.",
-                           max_tokens=256, thinking=True, tools=TOOLS, tool_choice="auto")
-                calls = r["choices"][0]["message"].get("tool_calls") if "choices" in r else None
-                good = bool(calls) and calls[0]["function"]["name"] == "get_weather" \
-                    and "paris" in calls[0]["function"]["arguments"].lower()
+                # The recipe's sampling defaults, as a chat client gets them:
+                # Sage-A1.5 greedy reasons in circles and never calls the tool.
+                # Sampled, a thinking model sometimes still runs out of tokens
+                # first (Sage: 1 in 8), so up to 3 tries.
+                for _ in range(3):
+                    r = s.chat("What is the weather in Paris right now? Use the tool.",
+                               max_tokens=1024, thinking=True, recipe_sampling=True,
+                               tools=TOOLS, tool_choice="auto")
+                    calls = r["choices"][0]["message"].get("tool_calls") if "choices" in r else None
+                    good = bool(calls) and calls[0]["function"]["name"] == "get_weather" \
+                        and "paris" in calls[0]["function"]["arguments"].lower()
+                    if good:
+                        break
                 res["tool_call"] = "ok" if good else f"FAIL: {json.dumps(r)[:120]}"
             if "--reasoning-parser" in cmd:
                 r = s.chat("What is 17 * 23?", max_tokens=1024, thinking=True)

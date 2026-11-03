@@ -158,12 +158,21 @@ class Server:
         except urllib.error.HTTPError as e:
             return {"error": {"code": e.code, "message": e.read().decode()[:500]}}
 
-    def chat(self, content, max_tokens: int = 512, thinking: bool = False, **extra) -> dict:
+    # Plain greedy decoding: overrides every sampling default a recipe sets
+    # (--override-generation-config), penalties included, since those change
+    # the argmax too. Measurements compare runs token for token.
+    GREEDY = {"temperature": 0, "top_p": 1.0, "top_k": -1, "min_p": 0.0,
+              "presence_penalty": 0.0, "frequency_penalty": 0.0, "repetition_penalty": 1.0}
+
+    def chat(self, content, max_tokens: int = 512, thinking: bool = False,
+             recipe_sampling: bool = False, **extra) -> dict:
+        """recipe_sampling=True sends no sampling fields, so the request runs
+        with the recipe's defaults, as a chat client's would."""
         body = {
             "model": self.model,
             "messages": [{"role": "user", "content": content}],
             "max_tokens": max_tokens,
-            "temperature": 0,
+            **({} if recipe_sampling else self.GREEDY),
             "chat_template_kwargs": {"enable_thinking": thinking},
             **extra,
         }

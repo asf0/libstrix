@@ -97,6 +97,11 @@ A `-dflash2` or `-dspark` recipe sits directly under its base recipe.
 - Multimodal checkpoints serve images with
   `--mm-encoder-attn-backend=TRITON_ATTN`; use `--language-model-only` only
   when the vision tower does not load.
+- Sampling defaults come from the model card (thinking mode) or the
+  checkpoint's `generation_config.json`, as the last command line:
+  `'--override-generation-config={...}'`. List the family in the sampling
+  table in `docs/docker.md`. Measurements stay greedy: `Server.chat` sends
+  neutral sampling unless `recipe_sampling=True`.
 - A new or changed recipe gets its row in `docs/docker.md` from its own
   startup log at `GPU_UTIL=0.85`: weights (`Model loading took`), KV cache
   (`Available KV cache memory`), KV tokens (`GPU KV cache size`) and 131k

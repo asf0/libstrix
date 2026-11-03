@@ -83,6 +83,23 @@ in the answer. `minicpm-v-4.7-35b-a3b-fp8` also sets
 thinking off unless asked, and then the answer has no `</think>` for the
 parser to split on.
 
+Every recipe except Muse-Glimmer (greedy, `do_sample: false` in its
+`generation_config.json`) sets the model card's sampling defaults with
+`--override-generation-config`, so a client that sends no sampling fields gets
+them even when the checkpoint folder has no `generation_config.json`. A
+request's own values win.
+
+| family | temperature | top_p | top_k | other |
+| --- | ---: | ---: | ---: | --- |
+| Qwen3.6-35B-A3B (bf16, W8A8, FP8), Sage-A1.5 | 1.0 | 0.95 | 20 | presence_penalty 1.5 |
+| MiniCPM-V-4.7, Qwen3.8-27B (all), Qwen3.8-Flash-Next, Flint | 1.0 | 0.95 | 20 | |
+| LFM2.5-24B-A2B (bf16, FP8) | 0.1 | | 50 | repetition_penalty 1.05 |
+| gemma-4 (all) | 1.0 | 0.95 | 64 | |
+
+Sage-A1.5 needs them for tool calls: greedy, it reasons in circles past 4,096
+tokens without calling the tool; with its defaults it called it in 7 of 8
+tries, after 52-251 tokens.
+
 ## Memory guard
 
 GPU memory here is host RAM, so a run that asks for too much does not fail

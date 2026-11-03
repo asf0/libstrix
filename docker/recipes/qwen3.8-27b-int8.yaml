@@ -27,3 +27,5 @@ services:
       - --enable-auto-tool-choice
       - --tool-call-parser=qwen3_coder
       - --reasoning-parser=qwen3
+      # Sampling defaults (Qwen3.8 model card, thinking mode); a request's own values win.
+      - '--override-generation-config={"temperature": 1.0, "top_p": 0.95, "top_k": 20}'
