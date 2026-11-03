@@ -27,12 +27,13 @@ request in this configuration.
 | `qwen3.8-27b-awq-mxfp4` | amd/Qwen3.8-27B-Quark-AWQ-MXFP4 (not benchmarked) | 17.9 GiB | 79.5 GiB | 2,380,901 | 18.2 | ✓ |
 | `qwen3.8-27b-fp8` | Qwen/Qwen3.8-27B-FP8 (MTP 2) | 30.3 GiB | 66.5 GiB | 1,864,797 | 14.2 | ✓ |
 | `qwen3.8-27b-fp8-dflash2` | Qwen/Qwen3.8-27B-FP8 + incoai/Qwen3.8-27B-DFlash2 (7 draft tokens) | 33.6 GiB | 61.6 GiB | 1,737,503 | 13.3 | ✓ |
-| `qwen3.8-flash-next` | wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 (n-gram table streamed from disk, MTP 2) | 80.8 GiB | 10.9 GiB | 612,463 | 4.7 | ✓ |
+| `qwen3.8-flash-next` | wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 (n-gram table streamed from disk, MTP 2) | 80.8 GiB | 10.9 GiB | 607,697 | 4.6 | ✓ |
+| `qwen3.8-flash-next-dflash2` | wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 + incoai/Qwen3.8-Flash-Next-DFlash2 (4 draft tokens) | 77.0 GiB | 14.1 GiB | 627,020 | 4.8 | ✓ |
 | `lfm2.5-24b-a2b` | LiquidAI/LFM2.5-24B-A2B | 46.2 GiB | 52.4 GiB | 5,169,781 | 39.4 | text model |
 | `lfm2.5-24b-a2b-fp8` | LiquidAI/LFM2.5-24B-A2B-FP8 | 23.4 GiB | 75.3 GiB | 7,422,739 | 56.6 | text model |
 | `lfm2.5-24b-a2b-fp8-dspark` | LiquidAI/LFM2.5-24B-A2B-FP8 + LiquidAI/LFM2.5-24B-A2B-DSpark (4 draft tokens) | 24.1 GiB | 73.8 GiB | 4,837,780 | 36.9 | text model |
 | `muse-glimmer-30b-fp8` | RedHatAI/Muse-Glimmer-30B-FP8-block | 33.2 GiB | 64.1 GiB | 7,046,883 | 53.8 | ✓ |
-| `muse-glimmer-30b-fp8-dflash2` | RedHatAI/Muse-Glimmer-30B-FP8-block + incoai/Muse-Glimmer-30B-DFlash2 (15 draft tokens) | 38.5 GiB | 57.4 GiB | 5,479,374 | 41.8 | ✓ |
+| `muse-glimmer-30b-fp8-dflash2` | RedHatAI/Muse-Glimmer-30B-FP8-block + incoai/Muse-Glimmer-30B-DFlash2 (15 draft tokens) | 38.5 GiB | 56.4 GiB | 5,380,274 | 41.0 | ✓ |
 | `flint-fp8` | HawkBearPig/flint-FP8-BF16 | 41.4 GiB | 56.9 GiB | 2,981,019 | 22.7 | text model |
 | `flint-fp8-dflash2` | HawkBearPig/flint-FP8-BF16 + incoai/Flint-DFlash2 (3 draft tokens) | 42.9 GiB | 54.6 GiB | 2,667,556 | 20.4 | text model |
 | `gemma-4-26b-a4b` | google/gemma-4-26B-A4B-it | 50.5 GiB | 47.2 GiB | 1,462,860 | 11.2 | ✓ |
@@ -56,16 +57,18 @@ table does not fit next to the weights, so the fork streams it from disk
 Use the AWQ W4A16 checkpoint; bf16 does not fit.
 
 - `GPU_UTIL=0.85` leaves page cache for the table rows; lower prefills slower.
-  0.88 holds more KV (807,880 tokens, 6.2 full 131k requests) but leaves only
+  0.88 holds more KV (805,497 tokens, 6.2 full 131k requests) but leaves only
   about 11 GiB of host memory free, 1 GiB above the memory guard.
 - 16k prefill chunks (`MAX_BATCHED_TOKENS`) are the measured best.
 - MTP 2 costs about 4 % prefill and more than doubles decode (18 -> 40-43
-  tok/s). Its DFlash 2 draft does not run yet, and ReplaySSM is not supported
-  for this architecture.
+  tok/s). ReplaySSM is not supported for this architecture.
+- `qwen3.8-flash-next-dflash2` runs incoai/Qwen3.8-Flash-Next-DFlash2 instead
+  of MTP: 19 % faster for one request and 16 % with 8 at once at the default
+  4 draft tokens ([speculative decoding](performance.md#speculative-decoding)).
 - Keep `gdn_conv` enabled: with vLLM's own GDN causal conv this model fails at
   startup, so `STRIX_DISABLE=all` does not run.
 - int8 KV (`int8_per_token_head`) needs the strix-vllm fork's int8 QSA
-  layers: 612,463 tokens at `GPU_UTIL=0.85`, against 362,862 with bf16 KV.
+  layers: 607,697 tokens at `GPU_UTIL=0.85`, against 361,482 with bf16 KV.
   GSM8K 244 / 250 (bf16 KV 242, McNemar p = 0.625).
 
 `flint-fp8`, `flint-fp8-dflash2` and `lfm2.5-24b-a2b-fp8-dspark` need the

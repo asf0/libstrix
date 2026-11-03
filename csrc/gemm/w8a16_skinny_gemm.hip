@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// W8A16 skinny GEMM for decode (M <= 5): uint8b128 weights [N, K], per-channel
+// W8A16 skinny GEMM for decode (M <= 8): uint8b128 weights [N, K], per-channel
 // or per-group (g = 128) scales, bf16/fp16 activations.
 // Moved from the asf0/strix-vllm fork (csrc/rocm/skinny_gemms_int8.cu), itself derived
 // from vLLM's csrc/rocm/skinny_gemms.cu (Apache-2.0, vLLM contributors).
@@ -621,6 +621,8 @@ static torch::Tensor skinny_impl(const at::Tensor& in_a, const at::Tensor& in_b,
   // gfx115x walks K in LDS-sized chunks, so K * N is unbounded there.
   // Elsewhere the activation must fit LDS outright.
   const int max_lds_len = get_lds_size_int8() / 2;
+  TORCH_CHECK(N_in >= 1 && N_in <= 8, "w8a16_skinny_gemm takes 1-8 rows, got ",
+              N_in);
   TORCH_CHECK(on_gfx115x_int8() || K_in * N_in <= max_lds_len,
               "K*N exceeds LDS capacity on this GPU (deep-K requires gfx115x);"
               " K=",
@@ -688,8 +690,9 @@ static torch::Tensor skinny_impl(const at::Tensor& in_a, const at::Tensor& in_b,
         WVSPLIT_INT8G_GS(_YT, 2, __N)                                         \
       else                                                                    \
         WVSPLIT_INT8G_GS(_YT, 1, __N)                                         \
-    } else if (__N == 1 && _sYT >= 40) {                                      \
-      /* Many rows per CU: fewer k-steps to amortise. */                      \
+    } else if ((__N == 1 && _sYT >= 40) || __N == 6) {                        \
+      /* Many rows per CU: fewer k-steps to amortise. N = 6 at UNRL 4 */      \
+      /* spills 658 VGPRs (1.9 KB scratch/lane, 5x slower); UNRL 2 fits. */   \
       WVSPLIT_INT8G_GS(_YT, 2, __N)                                           \
     } else {                                                                  \
       WVSPLIT_INT8G_GS(_YT, 4, __N)                                           \
@@ -731,8 +734,18 @@ static torch::Tensor skinny_impl(const at::Tensor& in_a, const at::Tensor& in_b,
           case 4:
             WVSPLIT_INT8G_TILE(sYT, 4)
             break;
-          default:
+          case 5:
             WVSPLIT_INT8G_TILE(sYT, 5)
+            break;
+          // 6-8 rows: a verify step with 5-7 draft tokens (DFlash 2).
+          case 6:
+            WVSPLIT_INT8G_TILE(sYT, 6)
+            break;
+          case 7:
+            WVSPLIT_INT8G_TILE(sYT, 7)
+            break;
+          default:
+            WVSPLIT_INT8G_TILE(sYT, 8)
             break;
         }
       });

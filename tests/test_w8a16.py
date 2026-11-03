@@ -42,6 +42,35 @@ def test_w8_paths_match_reference(n, k, m, group_size):
     )
 
 
+# The skinny op at 6-8 rows (dense_w8 on a DFlash 2 verify step): the LDS
+# path (2560) and the chunked deep-K path (5120, 17408 at 6-8 rows), and the
+# N = 6 instantiation that runs at UNRL 2 to avoid a register spill.
+@pytest.mark.parametrize("n,k", [(13312, 2560), (16384, 5120), (5120, 17408)])
+@pytest.mark.parametrize("m", [6, 7, 8])
+@pytest.mark.parametrize("group_size", [0, 128])
+def test_w8_skinny_6_to_8_rows(n, k, m, group_size):
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w_u8 = torch.randint(0, 256, (n, k), device="cuda", dtype=torch.uint8)
+    g = k // group_size if group_size else 1
+    s = (torch.rand(n, g, device="cuda") * 0.01).to(torch.bfloat16)
+    if group_size == 0:
+        s = s.reshape(n)
+    out = torch.ops.strix.w8a16_skinny_gemm(w_u8, x, s, None, 40, group_size)
+    ref = reference(x, w_u8, s, group_size)
+    torch.testing.assert_close(
+        out.float() / ref.abs().amax(), ref / ref.abs().amax(), rtol=0, atol=3e-2
+    )
+
+
+def test_w8_skinny_rejects_more_than_8_rows():
+    x = torch.randn(9, 256, device="cuda", dtype=torch.bfloat16)
+    w_u8 = torch.randint(0, 256, (128, 256), device="cuda", dtype=torch.uint8)
+    s = torch.full((128,), 0.01, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="1-8 rows"):
+        torch.ops.strix.w8a16_skinny_gemm(w_u8, x, s, None, 40, 0)
+
+
 # W4A8 WMMA op on vLLM's skinny int4 layout (RDNAHybridW4A16: ExLlama-shuffled
 # int32 words viewed as int8 [N, K/2], rows padded on gfx1151), uint4b8 g128.
 @pytest.mark.parametrize("n,k", [(16384, 5120), (5120, 17408), (256, 1024)])

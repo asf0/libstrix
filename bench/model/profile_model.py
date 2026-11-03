@@ -62,6 +62,17 @@ def main() -> None:
         "short/long decode passes that each repeat the prefill",
     )
     p.add_argument("--mtp", type=int, default=0, help="MTP draft tokens, 0 = off")
+    p.add_argument(
+        "--speculative-config",
+        help="JSON speculative config (any method, e.g. a DFlash 2 draft); "
+        "overrides --mtp",
+    )
+    p.add_argument(
+        "--prompts-file",
+        help="JSON list of chat prompts: decode batches use them (chat template "
+        "applied, cycled to the batch size) instead of random tokens, so a "
+        "draft accepts what it would on real text; --decode-ctx is ignored",
+    )
     p.add_argument("--gap", type=float, default=4.0)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.75)
     p.add_argument("--enforce-eager", action="store_true")
@@ -137,7 +148,11 @@ def main() -> None:
         enforce_eager=args.enforce_eager,
         **({"engram_config": {"disk_offload": True}} if args.engram_disk_offload else {}),
         speculative_config=(
-            {"method": "mtp", "num_speculative_tokens": args.mtp} if args.mtp else None
+            json.loads(args.speculative_config)
+            if args.speculative_config
+            else {"method": "mtp", "num_speculative_tokens": args.mtp}
+            if args.mtp
+            else None
         ),
         profiler_config=(
             {
@@ -153,8 +168,34 @@ def main() -> None:
     )
     global VOCAB_HI
     VOCAB_HI = min(VOCAB_HI, len(llm.get_tokenizer()))
+    chat_prompts: list[TokensPrompt] = []
+    if args.prompts_file:
+        tok = llm.get_tokenizer()
+        for text in json.loads(Path(args.prompts_file).read_text()):
+            ids = tok.apply_chat_template(
+                [{"role": "user", "content": text}],
+                add_generation_prompt=True,
+                enable_thinking=False,
+                tokenize=True,
+            )
+            if not isinstance(ids, list):  # transformers 5: a BatchEncoding
+                ids = ids["input_ids"]
+            chat_prompts.append(TokensPrompt(prompt_token_ids=list(ids)))
+
+    def spec_counts() -> tuple[float, float]:
+        """(drafts, accepted tokens) so far, from the engine's metrics."""
+        drafts = accepted = 0.0
+        for m in llm.get_metrics():
+            if m.name == "vllm:spec_decode_num_drafts":
+                drafts += getattr(m, "value", 0.0)
+            elif m.name == "vllm:spec_decode_num_accepted_tokens":
+                accepted += getattr(m, "value", 0.0)
+        return drafts, accepted
     rng = random.Random(0)
     llm.generate(prompts(1, 512, rng), SamplingParams(max_tokens=8), use_tqdm=False)
+
+    def kind_of(label: str) -> str:
+        return next((k for k in ("prefill", "decode") if label.startswith(k)), "e2e")
 
     labels: list[str] = []
     if args.torch_profile:
@@ -165,12 +206,18 @@ def main() -> None:
     ) -> None:
         time.sleep(args.gap)
         sp = SamplingParams(max_tokens=max_tokens, temperature=0.0, ignore_eos=True)
+        d0, a0 = spec_counts()
         t0 = time.perf_counter()
         outs = llm.generate(batch, sp, use_tqdm=False)
         dt = time.perf_counter() - t0
         labels.append(label)
         print(f"PHASE {label}: {dt:.3f} s", flush=True)
-        kind = next((k for k in ("prefill", "decode") if label.startswith(k)), "e2e")
+        d1, a1 = spec_counts()
+        if d1 > d0:
+            accept = 1 + (a1 - a0) / (d1 - d0)
+            print(f"ACCEPT {label}: {accept:.2f} tokens/step", flush=True)
+            rec(kind_of(label), "accept_len", accept, label, depth, bs)
+        kind = kind_of(label)
         rec(kind, "phase_s", dt, label, depth, bs)
         # Decode step time of the request that started decoding last: its
         # steps all run after every prefill chunk of the batch (earlier ones
@@ -210,7 +257,11 @@ def main() -> None:
     ctxs = [int(x) for x in str(args.decode_ctx).split(",")]
     for bs in (int(x) for x in args.decode_batches.split(",")):
         for ctx in ctxs:
-            batch = prompts(bs, ctx, rng)
+            batch = (
+                [chat_prompts[i % len(chat_prompts)] for i in range(bs)]
+                if chat_prompts
+                else prompts(bs, ctx, rng)
+            )
             # Keep the historical label when there is one depth, so the
             # existing collectors and trace labels stay valid.
             tag = f"decode{bs}:c{ctx}" if len(ctxs) > 1 else f"decode{bs}"

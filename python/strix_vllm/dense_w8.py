@@ -6,7 +6,7 @@ Qwen3.8-Flash-Next (int4 experts, bf16 attention / GDN / shared-expert / HC
 projections) that is ~9 GB and 67 % of a decode step, at the DRAM ceiling.
 This keeps the bf16 weight for prefill (hipBLASLt) and adds a symmetric int8
 copy (scale per 128-element group, or per channel when K is not a multiple
-of 128) for batches of <= 5 rows, run on strix::w8a16_skinny_gemm: half the
+of 128) for batches of <= 8 rows, run on strix::w8a16_skinny_gemm: half the
 bytes per step for ~+50 % of the dense weight memory.
 
 Covers vLLM's UnquantizedLinearMethod layers and the ParallelLMHead (1.27 GB
@@ -35,7 +35,27 @@ import os
 import torch
 
 from strix_vllm import disabled, model_gate
-from strix_vllm.linear import MAX_SKINNY_BATCH_SIZE, _pack_w8_rows
+from strix_vllm.linear import _pack_w8_rows
+
+# Rows the int8 copies serve (strix::w8a16_skinny_gemm takes 1-8): decode and
+# MTP verify (up to 5) always; 6-8 (DFlash 2 verify with 5-7 draft tokens)
+# only on weights of at least _W8_LARGE_NUMEL elements. Past 5 rows vLLM's
+# bf16 GEMM switches kernels and wins on small weights (Qwen3.8-Flash-Next
+# shared expert 1280x2560 at 6 rows: 12.5 us bf16 against 16.3 us int8),
+# while the large ones keep 1.5-1.9x (LM head 248320x2560: 3.0 ms against
+# 5.5 ms; bench/kernels/dense_w8_rows.py). Larger batches read bf16.
+MAX_SKINNY_BATCH_SIZE = 8
+_W8_ALWAYS_ROWS = 5
+_W8_LARGE_NUMEL = 8 << 20
+# vLLM's int4 skinny kernel (STRIX_DENSE_W4) takes at most 5 rows.
+_W4_MAX_ROWS = 5
+
+
+def skinny_ok(rows: int, w_q: torch.Tensor) -> bool:
+    """Whether a matmul of `rows` rows should read the int8 copy `w_q`."""
+    return rows <= _W8_ALWAYS_ROWS or (
+        rows <= MAX_SKINNY_BATCH_SIZE and w_q.numel() >= _W8_LARGE_NUMEL
+    )
 
 _GROUP = 128
 _MAX_BYTES = float(os.environ.get("STRIX_DENSE_W8_MAX_GB", "12")) * 2**30
@@ -74,7 +94,7 @@ def _impl(
     cu_count: int,
     group: int,
 ) -> torch.Tensor:
-    if x_2d.size(0) <= MAX_SKINNY_BATCH_SIZE:
+    if skinny_ok(x_2d.size(0), w_q):
         return torch.ops.strix.w8a16_skinny_gemm(w_q, x_2d, w_s, bias, cu_count, group)
     from vllm.model_executor.layers.utils import rocm_unquantized_gemm_impl
 
@@ -102,7 +122,7 @@ def _impl4(
     bias: torch.Tensor | None,
     cu_count: int,
 ) -> torch.Tensor:
-    if x_2d.size(0) <= MAX_SKINNY_BATCH_SIZE:
+    if x_2d.size(0) <= _W4_MAX_ROWS:
         import vllm._custom_ops as ops
 
         return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, _GROUP, None, bias)

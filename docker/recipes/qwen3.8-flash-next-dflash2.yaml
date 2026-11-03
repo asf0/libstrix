@@ -1,0 +1,34 @@
+# Qwen3.8-Flash-Next AWQ W4A16 + DFlash 2 draft (incoai/Qwen3.8-Flash-Next-DFlash2,
+# mounted next to the target under /models). Same serving setup as
+# qwen3.8-flash-next.yaml (n-gram table streamed from disk, 16k chunks) with
+# DFlash 2 speculation in place of MTP. SPEC_TOKENS sets the draft tokens per
+# step: 4 is fastest, for one request and for several (at most 7).
+#
+#   docker compose -f qwen3.8-flash-next-dflash2.yaml up -d
+#
+# Overrides go in .env (see .env.example) or the shell.
+services:
+  qwen3.8-flash-next-dflash2:
+    extends:
+      file: common.yaml
+      service: strix
+    environment:
+      MTP: 0
+      HF_REPO: wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16
+    command:
+      - /models/Qwen3.8-Flash-Next-AWQ-W4A16
+      - '--speculative-config={"method": "dflash", "model": "/models/Qwen3.8-Flash-Next-DFlash2", "num_speculative_tokens": ${SPEC_TOKENS:-4}}'
+      - --mm-encoder-attn-backend=TRITON_ATTN
+      - '--engram-config={"disk_offload": true}'
+      - --kv-cache-dtype=int8_per_token_head
+      - --gpu-memory-utilization=${GPU_UTIL:-0.85}
+      - --max-model-len=${MAX_MODEL_LEN:-131072}
+      - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-16384}
+      - --max-num-seqs=${MAX_NUM_SEQS:-4}
+      - --no-enable-prefix-caching
+      # Tool calls and reasoning come back parsed, as chat clients expect.
+      - --enable-auto-tool-choice
+      - --tool-call-parser=qwen3_coder
+      - --reasoning-parser=qwen3
+      # Sampling defaults (Qwen3.8 model card, thinking mode); a request's own values win.
+      - '--override-generation-config={"temperature": 1.0, "top_p": 0.95, "top_k": 20}'

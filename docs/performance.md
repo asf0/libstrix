@@ -219,9 +219,9 @@ sequences on head 256 / GQA 8, stock Triton above that).
 | gemma-4-31B MXFP4 | int8 | 6 → **29** (5.19×) | 5 → **28** (5.46×) | 14 → **92** (6.43×) | 12 → **83** (6.81×) |
 | gemma-4-31B QAT W4A16 | int8 | 21 → **39** (1.84×) | 15 → **37** (2.38×) | 22 → **104** (4.72×) | 17 → **93** (5.45×) |
 
-On Qwen3.8-Flash-Next, `dense_w8` (int8 decode copies) applies only up to 5
-rows, and decode attention (QSA) and the GDN recurrence stay on vLLM's
-kernels without MTP. The batched gain is therefore small, unlike the
+On Qwen3.8-Flash-Next, `dense_w8` (int8 decode copies) applies only up to 8
+rows (5 on small weights), and decode attention (QSA) and the GDN recurrence
+stay on vLLM's kernels without MTP. The batched gain is therefore small, unlike the
 single-stream decode gain (1.5-1.7×).
 
 ### Serving
@@ -271,7 +271,7 @@ the draft model's own cache comes out of the same memory):
 | Qwen3.6-35B-A3B | 5,684,779 | 4,736,198 | 4,710,648 | 3,923,703 (7 tokens) | – |
 | Qwen3.8-27B | 2,022,253 | 1,864,797 | 1,870,062 | 1,769,472 (7 tokens) | – |
 | LFM2.5-24B-A2B | 7,423,011 | – | – | – | 4,853,614 (4 tokens) |
-| Muse-Glimmer-30B | 7,046,883 | – | – | 5,479,374 (15 tokens) | – |
+| Muse-Glimmer-30B | 7,046,883 | – | – | 5,380,274 (15 tokens) | – |
 | Flint | 2,981,019 | – | – | 2,678,872 (3 tokens) | – |
 
 - **Draft tokens:** 7 beats 3 on the Qwen models (35B 75.4 / 187.4, 27B 20.4
@@ -291,9 +291,25 @@ the draft model's own cache comes out of the same memory):
   30 % of the tokens needed), LFM2.5 + DSpark (9). Qwen3.8-Flash-Next is not
   covered: with a cache that small it runs one request at a time, so nothing
   is preempted.
-- **Qwen3.8-Flash-Next** cannot run its DFlash 2 draft yet: the draft reads
-  the mean of the four hyper-connection streams after layers 5/15/25/35/45,
-  which the Flash-Next model code in vLLM (and SGLang main) does not capture.
+- **Qwen3.8-Flash-Next AWQ** (needs the strix-vllm fork: it records the mean
+  of the four hyper-connection streams after layers 5/15/25/35/45 for the
+  draft) on the same 8 prompts with 256-token answers, int8 KV, output tok/s
+  at 1 request / 8 at once (tokens accepted per step) and the KV it leaves:
+
+  | configuration | tok/s | KV tokens |
+  | --- | ---: | ---: |
+  | none | 24.9-25.2 / 54.5-60.0 | 1,391,594 |
+  | MTP 2 | 41.1 / 70.6 (2.60) | 605,314 |
+  | DFlash 2, 4 tokens | **48.8 / 81.8** (3.64) | 627,020 |
+  | DFlash 2, 5 tokens | 48.8 / 79.4 (3.92) | 586,463 |
+  | DFlash 2, 6 tokens | 47.4 / 77.7 (4.12) | 527,484 |
+  | DFlash 2, 7 tokens | 45.1 / 78.4 (4.25) | 530,456 |
+
+  4 tokens is the recipe default. Each token checked reads up to 10 more of
+  the 512 experts, so longer drafts stop paying past 4-5 although they
+  accept more. MTP 2 and DFlash 7 diverge from the no-draft output at one
+  confident position (baseline margin 2.6, same prompt and token); MTP 2 on
+  the previous image (v0.32) does the same, so it is not the draft.
 
 ## Accuracy
 
