@@ -43,8 +43,8 @@ ENV ROCM_PATH=${SP}/_rocm_sdk_devel \
     VLLM_TARGET_DEVICE=rocm \
     PYTORCH_ROCM_ARCH=gfx1151
 
-# Everything that depends only on the pins below (docker/constraints.txt,
-# docker/patch_tensorizer.py), not on the fork or libstrix: built once and
+# Everything that depends only on the pins below (docker/constraints.txt), not
+# on the fork or libstrix: built once and
 # reused by .github/workflows/image.yml.
 FROM base AS toolchain
 RUN apt-get update && apt-get install -y --no-install-recommends git \
@@ -65,10 +65,6 @@ COPY docker/constraints.txt /tmp/constraints.txt
 # --ignore-requires-python: amd-quark's py3 wheel is capped below 3.14 but runs.
 RUN pip install --no-deps --ignore-requires-python -r /tmp/constraints.txt \
     && python -c "import torch; assert torch.version.hip, torch.__version__"
-# tensorizer 2.10.1 reads the class-body __annotations__, which Python 3.14
-# (PEP 649) no longer materializes; without this `import vllm` fails.
-COPY docker/patch_tensorizer.py /tmp/patch_tensorizer.py
-RUN python /tmp/patch_tensorizer.py
 
 FROM ${TOOLCHAIN} AS builder
 ARG STRIX_VLLM_REPO=https://github.com/asf0/strix-vllm.git
@@ -84,7 +80,7 @@ RUN --mount=type=bind,from=strix-vllm-local,target=/mnt/strix-vllm \
     && git -C /src/strix-vllm rev-parse HEAD > /src/strix-vllm.ref
 # The fork clone has no upstream release tags; stamp the release it is based on
 # plus the fork commit instead of setuptools-scm's 0.1.devN fallback.
-ARG VLLM_BASE_VERSION=0.32.1rc0
+ARG VLLM_BASE_VERSION=0.33.0
 RUN cd /src/strix-vllm \
     && VLLM_VERSION_OVERRIDE="$VLLM_BASE_VERSION+strix.g$(cut -c1-10 /src/strix-vllm.ref)" \
        MAX_JOBS=$MAX_JOBS pip install --no-build-isolation --no-deps .

@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: key
-        run: echo "tag=${{ hashFiles('docker/Dockerfile', 'docker/constraints.txt', 'docker/patch_tensorizer.py') }}" >> "$GITHUB_OUTPUT"
+        run: echo "tag=${{ hashFiles('docker/Dockerfile', 'docker/constraints.txt') }}" >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
