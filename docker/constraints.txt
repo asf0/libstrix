@@ -48,7 +48,6 @@ fastapi-cloud-cli==0.26.0
 fastar==0.12.0
 fastsafetensors==0.5.0
 filelock==4.2.7
-flydsl==0.4.1
 frozenlist==1.8.0
 fsspec==2026.7.0
 google-api-core==2.43.2
@@ -196,7 +195,6 @@ sympy==1.14.0
 tblib==3.2.2
 tensorizer==2.12.1
 tiktoken==0.14.0
-tilelang==0.1.15
 timm==1.0.30
 tokenizers==0.23.3
 tqdm==4.70.1
@@ -215,5 +213,4 @@ wheel==0.48.0
 xgrammar==0.2.8
 xxhash==4.0.2
 yarl==1.25.1
-z3-solver==4.15.4.0
 zstandard==0.25.0

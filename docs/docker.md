@@ -122,6 +122,22 @@ the 117 GiB cap.
 About 40 minutes, mostly vLLM's C++: `docker/build-and-push.sh`, or
 `docker build -f docker/Dockerfile .` from the repo root.
 
+**What the image leaves out.** Only the build stage has the full ROCm SDK. The
+runtime keeps `_rocm_sdk_core` and `_rocm_sdk_libraries` without the ROCm
+compiler (`hipcc`, clang, lld), headers, static libraries and MLIR, and the
+Python packages that compile kernels with `hipcc` at runtime: tilelang,
+flydsl and aiter. No recipe needs them.
+
+- DeepSeek V4 and GLM-5-Next use tilelang for their mHC layers on gfx1151;
+  without it vLLM runs its PyTorch version of those layers (not measured).
+- To serve them with tilelang, build an image that keeps the compiler and
+  installs tilelang: keep `_rocm_sdk_core/lib/llvm/bin`,
+  `_rocm_sdk_core/lib/llvm/include` and clang's `libclang_rt` builtins in the
+  `/stage` step of `docker/Dockerfile`, link `_rocm_sdk_core/amdgcn` to
+  `lib/llvm/amdgcn` (where clang looks for the device libraries), add the
+  unversioned `lib*.so` names `hipcc` links against, and `pip install
+  tilelang==0.1.15 z3-solver==4.15.4.0`.
+
 `STRIX_VLLM_LOCAL=/path/to/strix-vllm docker/build-and-push.sh` builds from a
 local fork checkout instead of GitHub: its committed HEAD goes in as the
 BuildKit named context `strix-vllm-local`, the image is tagged

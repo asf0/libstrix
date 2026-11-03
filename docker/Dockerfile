@@ -88,18 +88,29 @@ COPY . /src/libstrix
 RUN cd /src/libstrix && MAX_JOBS=$MAX_JOBS ./build.sh \
     && pip install --no-build-isolation --no-deps . \
     && (git -c safe.directory='*' -C /src/libstrix rev-parse HEAD || echo unknown) > /src/libstrix.ref
-# Unused at runtime: rpp (image processing; nothing links it) and the static
-# libraries. LLVM stays: hipcc-based JIT (tilelang, aiter) needs it.
+# The runtime needs only _rocm_sdk_core and _rocm_sdk_libraries: no recipe
+# loads a file from _rocm_sdk_devel, and nothing compiles with hipcc at
+# runtime (Triton has its own LLVM and builds its launcher with gcc; the image
+# leaves out tilelang, see docs/docker.md#building-the-image). Also unused at
+# runtime: static libraries, rpp (image processing; nothing links it), LLVM's
+# tools, headers and MLIR (comgr links only libLLVM and libclang-cpp; the clang
+# resource headers and device bitcode stay for hiprtc), hipify, rocgdb and its
+# per-Python bindings for versions other than 3.14.
 # The big, rarely-changing trees move to /stage so the runtime stage copies
 # each as its own layer: an update to vLLM or libstrix then re-downloads only
 # the last layer, and no layer approaches the registry's 10 GB limit.
-# The hard links rocm-sdk init creates become symlinks: COPY would store each
-# hard link as a full copy.
-COPY docker/dedup_rocm.py /tmp/dedup_rocm.py
-RUN rm -f "$ROCM_PATH"/lib/librpp.so* "$ROCM_PATH"/lib/*.a \
-    && mkdir -p /stage/rocm \
-    && mv "$SP"/_rocm_sdk_* /stage/rocm/ \
-    && python /tmp/dedup_rocm.py /stage/rocm \
+RUN mkdir -p /stage/rocm \
+    && mv "$SP"/_rocm_sdk_core "$SP"/_rocm_sdk_libraries /stage/rocm/ \
+    && rm -rf "$SP"/_rocm_sdk_devel \
+    && cd /stage/rocm \
+    && find . -name '*.a' -delete \
+    && rm -rf _rocm_sdk_libraries/lib/librpp.so* \
+        _rocm_sdk_core/lib/llvm/bin _rocm_sdk_core/lib/llvm/include \
+        _rocm_sdk_core/lib/llvm/lib/libMLIR* _rocm_sdk_core/lib/llvm/lib/libmlir_* \
+        _rocm_sdk_core/lib/llvm/lib/libclang.so* _rocm_sdk_core/lib/llvm/lib/libomptarget* \
+        _rocm_sdk_core/lib/llvm/lib/libLLVMOffload* \
+        _rocm_sdk_core/bin/hipify-clang _rocm_sdk_core/bin/rocgdb* _rocm_sdk_core/bin/rocgcore* \
+        _rocm_sdk_core/lib/python3.1[0-3] \
     && mv "$SP/torch" "$SP/triton" /stage/
 
 FROM base AS runtime
@@ -110,9 +121,13 @@ LABEL org.opencontainers.image.source=https://github.com/asf0/libstrix \
       org.opencontainers.image.created=${BUILD_DATE}
 RUN apt-get update && apt-get install -y --no-install-recommends tini \
     && rm -rf /var/lib/apt/lists/*
+# Without the devel tree the ROCm root is _rocm_sdk_core.
+ENV ROCM_PATH=${SP}/_rocm_sdk_core \
+    ROCM_HOME=${SP}/_rocm_sdk_core \
+    HIP_PATH=${SP}/_rocm_sdk_core \
+    LD_LIBRARY_PATH=${SP}/torch/lib:${SP}/_rocm_sdk_core/lib:${SP}/_rocm_sdk_libraries/lib
 # Layers from least to most often changed (see the /stage step above).
-# Every _rocm_sdk_* tree in one layer; their shared libraries are symlinks
-# (dedup_rocm.py), so each is stored once.
+# Both _rocm_sdk_* trees in one layer.
 COPY --from=builder /stage/rocm/ ${SP}/
 COPY --from=builder /stage/torch ${SP}/torch
 COPY --from=builder /stage/triton ${SP}/triton
