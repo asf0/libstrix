@@ -2,7 +2,7 @@
 """Speculative decoding: same greedy output, and what it buys.
 
 For the baseline (no speculation) and each candidate (MTP, DFlash 2, ...):
-output tok/s at one request and at --concurrency at once, mean tokens
+output tok/s at one request and at each --concurrency level at once, mean tokens
 accepted per step, and the KV cache the configuration leaves (a draft model
 takes some). Then the check that speculation does not change greedy output:
 the one-at-a-time outputs are compared token by token with the baseline's.
@@ -16,6 +16,10 @@ state corruption).
     python bench/container/spec_equiv.py \
         --baseline qwen3.6-35b-a3b-fp8.yaml:MTP=0 \
         qwen3.6-35b-a3b-fp8.yaml:MTP=2 qwen3.6-35b-a3b-fp8-dflash2.yaml
+
+`--concurrency 2,8` adds a 2-request pass: a verify step of 2 requests is
+2 x (K+1) rows, which can cross a kernel's row limit that neither 1 nor 8
+requests shows.
 """
 
 from __future__ import annotations
@@ -48,9 +52,9 @@ PROMPTS = [
 ]
 
 
-def run(target: str, max_tokens: int, concurrency: int) -> dict:
-    """Prompts one at a time (compared for equivalence, timed), then all at
-    once (timed); KV capacity from the startup log."""
+def run(target: str, max_tokens: int, levels: list[int]) -> dict:
+    """Prompts one at a time (compared for equivalence, timed), then each
+    level's requests all at once (timed); KV capacity from the startup log."""
     recipe, env = parse_target(target)
     with Server(recipe, env) as s:
         drafts0 = s.metric("vllm:spec_decode_num_drafts_total")
@@ -69,15 +73,17 @@ def run(target: str, max_tokens: int, concurrency: int) -> dict:
         def gen(p: str) -> int:
             return s.chat(p, max_tokens=max_tokens)["usage"]["completion_tokens"]
 
-        prompts = (PROMPTS * (concurrency // len(PROMPTS) + 1))[:concurrency]
-        t0 = time.time()
-        with ThreadPoolExecutor(concurrency) as ex:
-            toks = sum(ex.map(gen, prompts))
-        conc_tok_s = round(toks / (time.time() - t0), 1)
+        conc_tok_s = {}
+        for n in levels:
+            prompts = (PROMPTS * (n // len(PROMPTS) + 1))[:n]
+            t0 = time.time()
+            with ThreadPoolExecutor(n) as ex:
+                toks = sum(ex.map(gen, prompts))
+            conc_tok_s[f"tok_s_x{n}"] = round(toks / (time.time() - t0), 1)
         kv = s.startup_numbers()
     return {"target": target, "outs": outs,
             "tok_s": round(sum(len(t) for t, _ in outs) / secs, 1),
-            f"tok_s_x{concurrency}": conc_tok_s,
+            **conc_tok_s,
             "accept_len": round(1 + acc / drafts, 2) if drafts else None,
             "kv_tokens": kv["kv_tokens"], "kv_gib": kv["kv_gib"]}
 
@@ -87,18 +93,20 @@ def main() -> None:
     ap.add_argument("--baseline", required=True)
     ap.add_argument("candidates", nargs="+")
     ap.add_argument("--max-tokens", type=int, default=256)
-    ap.add_argument("--concurrency", type=int, default=8, help="requests in the all-at-once pass")
+    ap.add_argument("--concurrency", default="8",
+                    help="requests in the all-at-once pass; a comma list runs one pass per level")
     ap.add_argument("--max-margin", type=float, default=1.0,
                     help="largest baseline top-1/top-2 logprob gap a divergence may sit at")
     ap.add_argument("--out", help="write the full result as JSON")
     args = ap.parse_args()
 
-    base = run(args.baseline, args.max_tokens, args.concurrency)
-    keys = ("tok_s", f"tok_s_x{args.concurrency}", "kv_tokens", "kv_gib")
+    levels = [int(x) for x in args.concurrency.split(",")]
+    base = run(args.baseline, args.max_tokens, levels)
+    keys = ("tok_s", *(f"tok_s_x{n}" for n in levels), "kv_tokens", "kv_gib")
     print(json.dumps({"baseline": args.baseline, **{k: base[k] for k in keys}}), flush=True)
     results, ok = [], True
     for cand in args.candidates:
-        c = run(cand, args.max_tokens, args.concurrency)
+        c = run(cand, args.max_tokens, levels)
         rows = []
         for i, ((bt, bm), (ct, _)) in enumerate(zip(base["outs"], c["outs"])):
             d = first_divergence(bt, ct)

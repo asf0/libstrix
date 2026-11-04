@@ -14,6 +14,22 @@ Qwen3.8-Flash-Next only, so they turn on for that architecture
 `STRIX_DISABLE` still wins. `dense_w8` stops adding int8 copies at
 `STRIX_DENSE_W8_MAX_GB` (default 12).
 
+`STRIX_ENABLE=npu` (off by default) moves Qwen3.8-Flash-Next's prefill input
+projections to the XDNA2 NPU (`python/strix_vllm/qwen4_exp_npu.py`, the `npu/`
+shim over hipfire's G80 BF16 trunk transport). A single-request prefill step of
+N >= `STRIX_NPU_MIN_TOKENS` (4,096) tokens is split into two banks, the first
+~N/2 tokens and the rest, each with its own attention / GDN / QSA metadata
+(the model state's `prepare_attn` on sliced input batches; bank B sees bank A
+as context). Layers 0 and 1 (PLE, a convolution across tokens) run on all
+rows; from layer 2 on each layer runs bank A, then bank B, while the NPU
+computes the other bank's input projection (GDN `in_proj_qkvz` + `in_proj_ba`,
+QSA `qkv_proj`), so the GPU runs none from layer 3 on. A bank's rows past the
+largest NPU program size (`STRIX_NPU_SIZES`, up to 8,192) are projected on the
+GPU. The NPU part is W8A8 (int8 per output row and per token, grid15 scales,
+one BF16 rounding), bit-equal to an exact CPU model of that contract. The step
+runs eagerly (outside torch.compile); other steps keep the compiled path.
+Docker: [docker.md](docker.md#npu-prefill).
+
 | `STRIX_DISABLE` name | kernel | replaces | when |
 | --- | --- | --- | --- |
 | `rms_norm_gated` | `gdn_gated_rmsnorm_h128_bf16` | `RMSNormGated` (GDN output norm) | bf16, 128 channels |

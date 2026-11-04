@@ -73,6 +73,23 @@ def main() -> None:
         "applied, cycled to the batch size) instead of random tokens, so a "
         "draft accepts what it would on real text; --decode-ctx is ignored",
     )
+    p.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="sampling temperature; 0 (the default) is greedy, as every "
+        "measurement in docs/performance.md",
+    )
+    p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument("--top-k", type=int, default=0, help="0 = off")
+    p.add_argument(
+        "--prefill-same-prompt",
+        action="store_true",
+        help="the second prefill rep at a depth reuses the first's prompt: "
+        "prefix caching is off, so it recomputes everything, but its "
+        "Qwen3.8-Flash-Next n-gram rows are then in the page cache, so the "
+        "rep difference is the disk-read share of TTFT",
+    )
     p.add_argument("--gap", type=float, default=4.0)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.75)
     p.add_argument("--enforce-eager", action="store_true")
@@ -205,7 +222,13 @@ def main() -> None:
         label: str, batch: list[TokensPrompt], max_tokens: int, depth: int, bs: int = 1
     ) -> None:
         time.sleep(args.gap)
-        sp = SamplingParams(max_tokens=max_tokens, temperature=0.0, ignore_eos=True)
+        sp = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            ignore_eos=True,
+        )
         d0, a0 = spec_counts()
         t0 = time.perf_counter()
         outs = llm.generate(batch, sp, use_tqdm=False)
@@ -252,8 +275,10 @@ def main() -> None:
     for length in (int(x) for x in args.prefill.split(",") if x):
         # Two reps smooth the shallow depths; a 64k+ prefill is expensive
         # enough that one measured pass is the right trade.
+        first = prompts(1, length, rng)
         for rep in range(2 if length < 65536 else 1):
-            phase(f"prefill{length}#{rep}", prompts(1, length, rng), 1, length)
+            batch = first if rep == 0 or args.prefill_same_prompt else prompts(1, length, rng)
+            phase(f"prefill{length}#{rep}", batch, 1, length)
     ctxs = [int(x) for x in str(args.decode_ctx).split(",")]
     for bs in (int(x) for x in args.decode_batches.split(",")):
         for ctx in ctxs:

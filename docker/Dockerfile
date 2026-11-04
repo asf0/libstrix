@@ -20,6 +20,18 @@ ARG TOOLCHAIN=toolchain
 # Empty unless --build-context strix-vllm-local=... replaces it.
 FROM scratch AS strix-vllm-local
 
+# The XDNA2 NPU shim (npu/, STRIX_ENABLE=npu): a Rust cdylib over hipfire's
+# trunk transport and G80 program builder, built against hipfire at HIPFIRE_REF.
+# It links only libc and dlopens the HIP runtime torch already loaded.
+FROM rust:1.99-trixie AS npu
+ARG HIPFIRE_REPO=https://github.com/warpfront/hipfire.git
+ARG HIPFIRE_REF=6fded099bf9022ffd431abcfc7ac491e33711c8b
+RUN git clone --filter=blob:none "$HIPFIRE_REPO" /src/hipfire \
+    && git -C /src/hipfire checkout "$HIPFIRE_REF"
+COPY npu /src/libstrix/npu
+RUN cd /src/libstrix/npu && cargo build --release \
+    && install -D target/release/libstrix_npu.so /stage/libstrix_npu.so
+
 FROM ${UBUNTU} AS base
 ENV DEBIAN_FRONTEND=noninteractive \
     VIRTUAL_ENV=/opt/venv \
@@ -133,6 +145,7 @@ COPY --from=builder /stage/torch ${SP}/torch
 COPY --from=builder /stage/triton ${SP}/triton
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /src/strix-vllm.ref /src/libstrix.ref /opt/strix/
+COPY --from=npu /stage/libstrix_npu.so /opt/strix/lib/libstrix_npu.so
 COPY docker/entrypoint.sh /opt/strix/entrypoint.sh
 # Compile, Triton and HF caches go to one volume so restarts skip recompiling.
 ENV XDG_CACHE_HOME=/cache \

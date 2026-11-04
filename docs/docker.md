@@ -103,6 +103,33 @@ Sage-A1.5 needs them for tool calls: greedy, it reasons in circles past 4,096
 tokens without calling the tool; with its defaults it called it in 7 of 8
 tries, after 52-251 tokens.
 
+## NPU prefill
+
+Qwen3.8-Flash-Next only, off by default (`STRIX_ENABLE=npu`, see
+[kernels.md](kernels.md#turning-kernels-on-and-off)): the XDNA2 NPU computes
+the GDN and QSA input projections of single-request prefill steps of 4,096
+tokens or more while the GPU runs the rest of the layer: TTFT 7-8 % lower from
+16k to 100k (see below). Layer the
+override over the recipe and leave room for the NPU's pinned memory:
+
+```sh
+GPU_UTIL=0.82 docker compose -f qwen3.8-flash-next-dflash2.yaml \
+  -f npu/qwen3.8-flash-next-dflash2.yaml up -d
+```
+
+| needs | why |
+| --- | --- |
+| kernel 7.4+, `amdxdna` loaded (`/dev/accel/accel0`) | the override passes the device in |
+| `ulimits: memlock: -1` (in the override) | weight panels and arenas are pinned host memory |
+| `GPU_UTIL=0.82` | at 0.85 the memory guard stopped vLLM at the first long prompt (MemAvailable 9 GiB); at 0.82 the DFlash 2 recipe keeps 412,699 KV tokens with the NPU, 471,150 without |
+
+The log shows `libstrix: npu prefill on: 46 layers resident` after startup.
+Without a usable NPU (no device, no driver, the memlock limit, no
+`libstrix_npu.so`) it logs `libstrix: npu prefill off: <reason>` once and runs
+the GPU path, with the full KV cache (471,150 tokens at 0.82). A failed NPU
+chain during a step fails that request and turns the NPU off for later steps.
+Speed and accuracy: [performance.md](performance.md#npu-prefill).
+
 ## Memory guard
 
 GPU memory here is host RAM, so a run that asks for too much does not fail

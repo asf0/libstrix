@@ -783,6 +783,61 @@ Reading it:
 - **MTP 2** (the recipe default) decodes at 40-43 tok/s on real text (the vLLM
   docs as prompts); the random-token prompts here would accept fewer drafts.
 
+#### NPU prefill
+
+`STRIX_ENABLE=npu` (see [kernels.md](kernels.md#turning-kernels-on-and-off)),
+kernel 7.4.0-rc1, int8 KV, n-gram table from disk.
+
+Served (DFlash 2 recipe, a full image build, `GPU_UTIL=0.82` for both, TTFT
+of the second send of each prompt, n-gram rows cached; plugin 4 server runs,
+NPU 3, alternated):
+
+| prompt | plugin | NPU |
+| --- | ---: | ---: |
+| ~16k tokens (three prompts) | 7.65-7.79 s, mean 7.70 | 7.08-7.20 s, mean 7.14 (-7.3 %) |
+| ~30k tokens (two prompts) | 14.50-14.55 s, mean 14.53 | 13.45-13.47 s, mean 13.46 (-7.4 %) |
+| an image + ~8k tokens of text | 4.41-4.82 s, "Red." | 4.61-4.94 s, "The color of the square is red." |
+
+Other lengths, three server runs each (TTFT of the second send; prefill
+rate = prompt tokens / TTFT):
+
+| prompt | plugin | NPU |
+| --- | ---: | ---: |
+| 7,643 tokens | 4.16 / 4.16 / 4.15 s (1,839 tok/s) | 4.02 / 4.01 / 4.13 s (1,886 tok/s, -2.5 %) |
+| 57,053 tokens | 32.51 / 32.30 / 32.64 s (1,757 tok/s) | 30.02 / 30.00 / 30.06 s (1,900 tok/s, -7.6 %) |
+| 85,032 tokens | 49.75 / 49.57 / 49.86 s (1,710 tok/s) | 45.66 / 45.64 / 45.75 s (1,861 tok/s, -8.1 %) |
+| an image + ~30k tokens of text | 15.34 / 15.44 / 15.22 s | 14.29 / 14.31 / 14.34 s (-6.7 %), the same answer |
+| two ~16k prompts at once (time to both answers) | 28.57, 23.26, 23.25 s | 22.94, 22.82, 22.75 s, the same answers |
+
+Two requests in one step take the GPU path, so the concurrent case barely
+moves (the first plugin run was slower).
+
+Offline (host venv, 16,384-token chunks, `--gpu-memory-utilization 0.80`,
+prefill time of the second pass over the same prompt):
+
+| depth | plugin (three runs) | plugin, eager | NPU |
+| ---: | ---: | ---: | ---: |
+| 8,192 | 4.195 / 4.203 / 4.217 s | 4.157 s | 3.871 s (-7.6 %) |
+| 16,384 | 9.260 / 9.003 / 9.008 s | 8.942 s | 7.784 s (-14.2 %) |
+| 32,768 | 18.175 / 18.158 / 18.164 s | 18.057 s | 16.271 s (-10.3 %) |
+
+Reading it:
+
+- **Accuracy** (KLD at 16k against the plugin, 2,048 scored positions): NPU
+  0.0115 mean (p95 0.046), top-1 95.8 %, perplexity +0.47 %; the plugin
+  against itself 0.0090 (p95 0.036), 96.7 %, +0.23 %. The difference is the
+  W8A8 projections, about what the int8 KV cache costs.
+- **The NPU is slower per row but hidden.** A GDN projection of 8,192 rows
+  takes 44.2 ms on the NPU (15.6 TOPS) against 15.8 ms on the GPU; with two
+  banks it runs while the GPU does the other bank's layer.
+- **Memory.** The NPU pins ~3 GB (weight panels and two banks of arenas),
+  opened during vLLM's memory profile: 412,699 KV tokens at `GPU_UTIL=0.82`
+  against 471,150 without the NPU. At 0.85 the memory guard stopped vLLM
+  (host MemAvailable 9 GiB); 32k prefill chunks do not fit with the NPU
+  (1.33 GiB of KV cache left at 0.80).
+- **Which steps.** Steps below 4,096 tokens, batches of several requests and
+  graph capture keep the GPU path, so decode and short prompts do not change.
+
 ### LFM2.5-24B-A2B
 
 prefill tok/s

@@ -1,0 +1,22 @@
+[package]
+name = "strix-npu"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "C ABI over hipfire's XDNA2 G80 BF16 trunk transport, for libstrix's NPU prefill projections"
+publish = false
+
+[lib]
+name = "strix_npu"
+crate-type = ["cdylib"]
+
+# hipfire (Apache-2.0) supplies the NPU transport (railgun::npu::trunk) and the
+# G80 program builder / packers (peacemaker-npu). HIPFIRE points at its checkout;
+# the path below is this machine's default.
+[dependencies]
+railgun = { path = "../../hipfire/crates/railgun", features = ["npu"] }
+peacemaker-npu = { path = "../../hipfire/crates/peacemaker-npu" }
+
+[profile.release]
+opt-level = 3
+debug = false

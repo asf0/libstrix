@@ -1,0 +1,18 @@
+# NPU prefill for qwen3.8-flash-next (see docs/docker.md#npu-prefill): the XDNA2 NPU computes
+# the layers' input projections of long prefill steps while the GPU runs the
+# rest of each layer. Layer it over the recipe, with GPU_UTIL=0.82:
+#
+#   GPU_UTIL=0.82 docker compose -f qwen3.8-flash-next.yaml -f npu/qwen3.8-flash-next.yaml up -d
+#
+# Needs the amdxdna driver (/dev/accel/accel0) and kernel 7.4 or later.
+services:
+  qwen3.8-flash-next:
+    devices:
+      - /dev/accel/accel0:/dev/accel/accel0
+    # The NPU's weight panels and arenas (~3 GB) are pinned host memory.
+    ulimits:
+      memlock: -1
+    environment:
+      STRIX_ENABLE: npu
+      # Rows the NPU takes per step (see docs/kernels.md); empty keeps the defaults.
+      STRIX_NPU_SIZES: ${STRIX_NPU_SIZES:-}

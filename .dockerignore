@@ -7,3 +7,4 @@ docker/recipes/models/
 **/*.so
 NOTES.md
 docs/handoff.md
+npu/target/

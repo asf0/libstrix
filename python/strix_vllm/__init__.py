@@ -186,4 +186,8 @@ def register() -> None:
     attn.register()
     qwen4_exp.register()
     dense_w8.register()
+    # Opt-in (STRIX_ENABLE=npu): needs the XDNA2 NPU and libstrix_npu.so.
+    from strix_vllm import qwen4_exp_npu
+
+    qwen4_exp_npu.register()
     logger.info("libstrix: plugin registered")
