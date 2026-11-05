@@ -838,6 +838,69 @@ Reading it:
 - **Which steps.** Steps below 4,096 tokens, batches of several requests and
   graph capture keep the GPU path, so decode and short prompts do not change.
 
+Qwen3.8-27B bf16 (`STRIX_ENABLE=npu`, two K halves, 47 GDN layers; prefill of
+an 8,192-token prompt, second pass, three runs each, alternating):
+
+| configuration | prefill | tok/s |
+| --- | --- | ---: |
+| plugin, compiled | 11.29 / 10.88 / 11.35 s (mean 11.17) | 733 |
+| plugin, eager | 12.19 / 12.25 s | 670 |
+| NPU + GPU, eager loop | 11.44 s | 717 |
+| NPU + GPU, compiled loop | 10.20 / 10.35 / 10.50 s (mean 10.35, **-7.3 %**) | 792 |
+
+Depth (same method, one run each):
+
+| depth | plugin, compiled | NPU + GPU, compiled loop |
+| ---: | ---: | ---: |
+| 8,192 | 11.21 s | 10.46 s (-6.7 %) |
+| 16,384 | 23.60 s | 22.02 s (-6.7 %) |
+| 32,768 | 49.81 s | 49.07 s (-1.5 %) |
+
+Served (the [npu overlay](docker.md#npu-prefill) over the recipe,
+`GPU_UTIL=0.82` for both, MTP 2, alternated; request time of a fresh prompt,
+`max_tokens` 1 - the first request at a bank shape pays the dense regions'
+one-time compile, so the steady runs are the later ones at each length):
+
+| prompt | plugin | NPU |
+| --- | ---: | ---: |
+| ~8.2k tokens | 11.48 / 11.52 s | 10.68 s (**-7.3 %**) |
+| ~16.4k tokens | 23.76 / 23.80 s | 22.07 / 22.13 s (**-7.1 %**) |
+| ~24.6k tokens | 37.15 s | 34.33 s (**-7.6 %**) |
+
+Reading it:
+
+- **Accuracy.** KLD at 8k 0.0106 (p95 0.0147), top-1 97.3 %, perplexity
+  +0.74 % against the plugin; at 9,216, a split of 3,072 + 6,144 rows,
+  0.00268 (p95 0.0053), 98.5 %, -0.05 %. One activation scale over both
+  K halves instead of one per half is worse: KLD 0.0140, +2.14 %.
+- **The NPU is slower per row but hidden.** On a 4,096-row bank the two
+  chains take 51.7 ms (13.4 TOPS) against 15.5 ms for the GPU's own GEMM;
+  each chain runs while the GPU does the other bank's layer.
+- **The split follows the served chunks.** The engine chunks an 8.2k
+  prompt at 8,080 tokens and a 16.4k one at 16,160, sizes that do not
+  halve cleanly, so the step splits at the boundary that covers the most
+  NPU rows (`STRIX_NPU_SIZES`, default 2,048-8,192): 8,080 gives banks of
+  4,096 + 3,984 rows (89 % covered), 16,160 gives 8,192 + 7,968 (95 %). A
+  plain half-split won 2.2 % served (11.23 against 11.48 s at 8.2k).
+  16,384 tokens is the last depth a single step covers fully; at 32,768
+  the NPU takes each bank's first 8,192 rows and the rest runs on the
+  GPU, and the win shrinks to 1.5 %.
+- **Which steps.** Steps below 4,096 tokens, batches of several requests,
+  graph capture and non-first pipeline ranks keep the GPU path, so decode
+  and short prompts do not change. The loop's dense regions are
+  torch.compiled (`STRIX_NPU_COMPILE=0` keeps the whole loop eager - the
+  11.44 s row in the table).
+- **Memory.** The panels (~10.5 GiB) pin during vLLM's memory profile, so
+  they are counted before the KV cache is sized: 826,647 KV tokens at
+  `GPU_UTIL=0.82` against 1,121,559 without, host `MemAvailable` 18.4 GiB
+  with the NPU resident (the guard stops vLLM at 10 GiB). At 0.85 the
+  guard stopped the served engine at startup.
+- **Scope.** The panels are built for K = 5,120 bf16 projections;
+  quantized checkpoints and any other shape turn the path off (both
+  quantized ones were tried with dequantized panels and measured
+  break-even). The other bf16 recipes gain nothing: Qwen3.6-35B-A3B turns
+  off by shape, LFM2.5-24B-A2B and gemma-4-26B-A4B are not hooked.
+
 ### LFM2.5-24B-A2B
 
 prefill tok/s

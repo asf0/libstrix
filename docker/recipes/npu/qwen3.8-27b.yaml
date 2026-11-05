@@ -1,0 +1,24 @@
+# NPU prefill for qwen3.8-27b (see docs/docker.md#npu-prefill): the XDNA2 NPU
+# computes the GDN layers' input projections of long prefill steps while the GPU
+# runs the rest of each layer. Layer it over the recipe, with GPU_UTIL=0.82:
+# about 7 % faster served (8k-25k prompts) and 6.7-7.3 % offline at 8k-16k
+# prefill (docs/performance.md#npu-prefill), and at 0.85 the served engine
+# leaves the host under the memory guard's 10 GiB before the NPU panels even
+# pin (docs/docker.md#memory-guard).
+#
+#   GPU_UTIL=0.82 docker compose -f qwen3.8-27b.yaml -f npu/qwen3.8-27b.yaml up -d
+#
+# Needs the amdxdna driver (/dev/accel/accel0) and kernel 7.4 or later, and a
+# checkpoint whose GDN projections are bf16 (the bf16 base model; quantized
+# checkpoints turn the NPU off and run the GPU path).
+services:
+  qwen3.8-27b:
+    devices:
+      - /dev/accel/accel0:/dev/accel/accel0
+    # The NPU's weight panels and arenas are pinned host memory (~7 GB here:
+    # two K halves, two banks).
+    ulimits:
+      memlock: -1
+    environment:
+      STRIX_ENABLE: npu
+      STRIX_NPU_SIZES: ${STRIX_NPU_SIZES:-}

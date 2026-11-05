@@ -8,7 +8,8 @@ $IMAGE (default strix-vllm:test, see docker/build-test-image.sh); models come
 from $MODELS, compile caches from $CACHE (default docker/recipes/cache).
 
 A target is `recipe.yaml` optionally followed by env overrides:
-`qwen3.6-35b-a3b-fp8.yaml:MTP=0,MAX_MODEL_LEN=16384`.
+`qwen3.6-35b-a3b-fp8.yaml:MTP=0,MAX_MODEL_LEN=16384`; a `+` layers an
+overlay over its base: `qwen3.8-27b.yaml+npu/qwen3.8-27b.yaml`.
 """
 
 from __future__ import annotations
@@ -36,10 +37,12 @@ def parse_target(target: str) -> tuple[str, dict[str, str]]:
 
 
 def recipe_command(recipe: str) -> list[str]:
-    """The recipe's command list, as written (for flag checks)."""
+    """The recipe's command list, as written (for flag checks); a layered
+    target's command comes from its base recipe."""
     import yaml
 
-    svc = next(iter(yaml.safe_load(open(RECIPES / recipe))["services"].values()))
+    path = RECIPES / recipe.split("+")[0]
+    svc = next(iter(yaml.safe_load(open(path))["services"].values()))
     return [str(c) for c in svc.get("command", [])]
 
 
@@ -82,9 +85,11 @@ class Server:
         self.model = ""
 
     def _compose(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+        cmd = ["docker", "compose", "-p", PROJECT]
+        for part in self.recipe.split("+"):
+            cmd += ["-f", str(RECIPES / part)]
         return subprocess.run(
-            ["docker", "compose", "-p", PROJECT, "-f", str(RECIPES / self.recipe), *args],
-            env=self.env, capture_output=True, text=True, check=check,
+            [*cmd, *args], env=self.env, capture_output=True, text=True, check=check,
         )
 
     def __enter__(self) -> Server:

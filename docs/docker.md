@@ -105,25 +105,33 @@ tries, after 52-251 tokens.
 
 ## NPU prefill
 
-Qwen3.8-Flash-Next only, off by default (`STRIX_ENABLE=npu`, see
+Qwen3.8-Flash-Next and Qwen3.8-27B, off by default
+(`STRIX_ENABLE=npu`, see
 [kernels.md](kernels.md#turning-kernels-on-and-off)): the XDNA2 NPU computes
-the GDN and QSA input projections of single-request prefill steps of 4,096
+the input projections of single-request prefill steps of 4,096
 tokens or more while the GPU runs the rest of the layer: TTFT 7-8 % lower from
-16k to 100k (see below). Layer the
+16k to 100k on Flash-Next, prefill about 7 % faster on the 27B (served,
+8k-25k prompts; 6.7-7.3 % offline at 8k-16k; bf16 - the
+FP8 and INT8 checkpoints are not covered, see below).
+Layer the
 override over the recipe and leave room for the NPU's pinned memory:
 
 ```sh
 GPU_UTIL=0.82 docker compose -f qwen3.8-flash-next-dflash2.yaml \
   -f npu/qwen3.8-flash-next-dflash2.yaml up -d
+GPU_UTIL=0.82 docker compose -f qwen3.8-27b.yaml \
+  -f npu/qwen3.8-27b.yaml up -d
 ```
 
 | needs | why |
 | --- | --- |
 | kernel 7.4+, `amdxdna` loaded (`/dev/accel/accel0`) | the override passes the device in |
 | `ulimits: memlock: -1` (in the override) | weight panels and arenas are pinned host memory |
-| `GPU_UTIL=0.82` | at 0.85 the memory guard stopped vLLM at the first long prompt (MemAvailable 9 GiB); at 0.82 the DFlash 2 recipe keeps 412,699 KV tokens with the NPU, 471,150 without |
+| `GPU_UTIL=0.82` (Flash-Next) | at 0.85 the memory guard stopped vLLM at the first long prompt (MemAvailable 9 GiB); at 0.82 the DFlash 2 recipe keeps 412,699 KV tokens with the NPU, 471,150 without |
+| `GPU_UTIL=0.82` (the 27B) | at 0.85 the memory guard stopped vLLM at startup (MemAvailable 6 GiB); at 0.82 the NPU opens during the startup profile run and its panels pin ~10.5 GiB before the KV cache is sized: 826,647 KV tokens with the NPU resident (1,121,559 without), 6.31 requests at 131k |
 
-The log shows `libstrix: npu prefill on: 46 layers resident` after startup.
+The log shows `libstrix: npu prefill on: 46 layers resident` (Flash-Next) or
+`libstrix: npu prefill on (Qwen3.5): 47 GDN layers ...` (the 27B) after startup.
 Without a usable NPU (no device, no driver, the memlock limit, no
 `libstrix_npu.so`) it logs `libstrix: npu prefill off: <reason>` once and runs
 the GPU path, with the full KV cache (471,150 tokens at 0.82). A failed NPU

@@ -93,6 +93,11 @@ def main() -> None:
     p.add_argument("--gap", type=float, default=4.0)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.75)
     p.add_argument("--enforce-eager", action="store_true")
+    p.add_argument(
+        "--compilation-config",
+        help="JSON passed as vLLM's compilation_config, e.g. "
+        "'{\"cudagraph_mode\": \"NONE\"}' to isolate what the graphs buy",
+    )
     p.add_argument("--max-model-len", type=int, default=16384)
     p.add_argument("--max-num-batched-tokens", type=int, default=8192)
     p.add_argument(
@@ -163,6 +168,11 @@ def main() -> None:
         # Per-request token timestamps (RequestOutput.metrics) for DECODE lines.
         disable_log_stats=False,
         enforce_eager=args.enforce_eager,
+        **(
+            {"compilation_config": json.loads(args.compilation_config)}
+            if args.compilation_config
+            else {}
+        ),
         **({"engram_config": {"disk_offload": True}} if args.engram_disk_offload else {}),
         speculative_config=(
             json.loads(args.speculative_config)

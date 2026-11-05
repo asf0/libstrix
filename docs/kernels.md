@@ -30,6 +30,27 @@ one BF16 rounding), bit-equal to an exact CPU model of that contract. The step
 runs eagerly (outside torch.compile); other steps keep the compiled path.
 Docker: [docker.md](docker.md#npu-prefill).
 
+The same option also covers Qwen3.8-27B (`Qwen3_5Model`,
+`python/strix_vllm/qwen3_5_npu.py`): its projections are K = 5,120 wide against
+the NPU program's 2,560, so each runs as two chains over the K halves, from two
+runtimes, summed in bf16; only 47 of the 48 GDN layers' `in_proj_qkvz` +
+`in_proj_ba` go to the NPU (full-attention layers and layer 0 stay on the GPU).
+The bank loop's dense regions (each bank's input norm and post-mixer tail) are
+torch.compiled - the mixers and NPU calls stay eager - which is what makes it
+faster than the compiled base (-6.7 to -7.3 % offline at 8k-16k prefill,
+about -7 % served, see
+[performance.md](performance.md#npu-prefill)). The step splits into two banks
+at the boundary that covers the most NPU rows (`STRIX_NPU_SIZES`, default
+2,048 / 3,072 / 4,096 / 6,144 / 7,168 / 8,192): the served engine chunks
+prefill at sizes that do not halve cleanly, and a plain half-split leaves one
+bank over its largest program and the other too small to hide its chain.
+`STRIX_NPU_COMPILE=0` keeps the
+whole loop eager. Quantized checkpoints (FP8, INT8) are not covered: their
+projections are already cheap on the GPU, so the path turns itself off there
+(measured break-even when tried, see
+[performance.md](performance.md#npu-prefill)); a checkpoint with any other
+projection shape turns it off the same way.
+
 | `STRIX_DISABLE` name | kernel | replaces | when |
 | --- | --- | --- | --- |
 | `rms_norm_gated` | `gdn_gated_rmsnorm_h128_bf16` | `RMSNormGated` (GDN output norm) | bf16, 128 channels |
