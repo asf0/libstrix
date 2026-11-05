@@ -108,8 +108,8 @@ tries, after 52-251 tokens.
 Qwen3.8-Flash-Next and Qwen3.8-27B, off by default
 (`STRIX_ENABLE=npu`, see
 [kernels.md](kernels.md#turning-kernels-on-and-off)): the XDNA2 NPU computes
-the input projections of single-request prefill steps of 4,096
-tokens or more while the GPU runs the rest of the layer: TTFT 7-8 % lower from
+the input projections of prefill steps of 4,096 tokens or more — one request
+or several — while the GPU runs the rest of the layer: TTFT 7-8 % lower from
 16k to 100k on Flash-Next, prefill about 7 % faster on the 27B (served,
 8k-25k prompts; 6.7-7.3 % offline at 8k-16k; bf16 - the
 FP8 and INT8 checkpoints are not covered, see below).
@@ -119,19 +119,29 @@ override over the recipe and leave room for the NPU's pinned memory:
 ```sh
 GPU_UTIL=0.82 docker compose -f qwen3.8-flash-next-dflash2.yaml \
   -f npu/qwen3.8-flash-next-dflash2.yaml up -d
+GPU_UTIL=0.82 docker compose -f qwen3.8-flash-next.yaml \
+  -f npu/qwen3.8-flash-next.yaml up -d
 GPU_UTIL=0.82 docker compose -f qwen3.8-27b.yaml \
   -f npu/qwen3.8-27b.yaml up -d
 ```
 
 | needs | why |
 | --- | --- |
-| kernel 7.4+, `amdxdna` loaded (`/dev/accel/accel0`) | the override passes the device in |
+| kernel 7.4+, `amdxdna` loaded (`/dev/accel/accel0`), the IOMMU enabled with the GPU in a passthrough (identity) group | the override passes the device in; `amd_iommu=off`, the GPU-only recommendation, keeps the NPU off |
 | `ulimits: memlock: -1` (in the override) | weight panels and arenas are pinned host memory |
-| `GPU_UTIL=0.82` (Flash-Next) | at 0.85 the memory guard stopped vLLM at the first long prompt (MemAvailable 9 GiB); at 0.82 the DFlash 2 recipe keeps 412,699 KV tokens with the NPU, 471,150 without |
+| `GPU_UTIL=0.78-0.82` (Flash-Next DFlash 2) | at 0.85 the memory guard stopped vLLM at the first long prompt (MemAvailable 9 GiB); 0.78 keeps 4.59 GiB of KV (203,692 tokens) and served a full benchmark, 0.82 keeps 412,699 KV tokens with the NPU, 471,150 without |
+| `GPU_UTIL=0.80+` (Flash-Next with MTP) | the MTP drafter adds ~4 GiB: at 0.78 only 1.6 GiB of KV is left and the 131,072-token context no longer fits; 0.80 keeps 3.94 GiB |
 | `GPU_UTIL=0.82` (the 27B) | at 0.85 the memory guard stopped vLLM at startup (MemAvailable 6 GiB); at 0.82 the NPU opens during the startup profile run and its panels pin ~10.5 GiB before the KV cache is sized: 826,647 KV tokens with the NPU resident (1,121,559 without), 6.31 requests at 131k |
 
 The log shows `libstrix: npu prefill on: 46 layers resident` (Flash-Next) or
 `libstrix: npu prefill on (Qwen3.5): 47 GDN layers ...` (the 27B) after startup.
+Steps of several requests take the NPU path too (the banks are token ranges;
+a request straddling the boundary appears in both), and the QSA indexer's
+projection rides the panels unless `STRIX_NPU_INDEXER=0`. A full benchmark
+with the NPU on: 40 of 71 NPU steps were multi-request or ragged packs, with
+the GPU never waiting at a chain. `STRIX_NPU_STATS=<file>` logs per-chain
+relay stats and GPU windows for
+[bench/model/npu_stats.py](../bench/model/npu_stats.py).
 Without a usable NPU (no device, no driver, the memlock limit, no
 `libstrix_npu.so`) it logs `libstrix: npu prefill off: <reason>` once and runs
 the GPU path, with the full KV cache (471,150 tokens at 0.82). A failed NPU

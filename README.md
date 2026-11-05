@@ -1,7 +1,9 @@
 # libstrix
 
 HIP kernels tuned for **gfx1151** (Strix Halo, Radeon 8060S), plus a vLLM
-plugin that swaps them into stock vLLM. No vLLM source changes.
+plugin that swaps them into stock vLLM, and an option to run prefill input
+projections on the Strix Halo **XDNA2 NPU** while the GPU runs the rest of the
+layer. No vLLM source changes.
 
 Each kernel is compiled for one geometry, named in its entry point, and rejects
 any shape it was not built for. `strix.select(op, **geometry)` reports whether
@@ -46,14 +48,22 @@ The image cannot set these; they belong to the host kernel.
   but not to all of RAM: GPU memory is host memory the kernel cannot reclaim,
   so a cap near the total lets one run take the whole machine down. The
   recipes were tested with a 117 GiB cap (`amdgpu.gttsize` in MiB,
-  `ttm.pages_limit` in 4 KiB pages). `amd_iommu=off` is also recommended:
-  every number in this README was measured with it. On Ubuntu:
+  `ttm.pages_limit` in 4 KiB pages). `amd_iommu=off` is also recommended for
+  the GPU alone — every number in this README was measured with it — but it
+  keeps the NPU off: the XDNA2 prefill path needs the IOMMU enabled, the GPU
+  in a passthrough (identity) group, a kernel at 7.4 or newer, and the NPU's
+  memory pinnable (`ulimits: memlock: -1`, set by the `npu/` recipe
+  overrides). On Ubuntu, GPU-only:
 
   ```sh
   sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="/&amdgpu.gttsize=120000 ttm.pages_limit=30720000 amd_iommu=off /' /etc/default/grub
   sudo update-grub && sudo reboot
   cat /sys/class/drm/card*/device/mem_info_gtt_total   # ~117 GiB afterwards
   ```
+
+  With the NPU, drop `amd_iommu=off` and boot with the GPU's IOMMU group in
+  passthrough (e.g. `iommu.passthrough=1`); `/dev/accel/accel0` must exist
+  after the reboot (the `amdxdna` driver).
 
 - **BIOS.** Keep the dedicated VRAM (UMA frame buffer) small, e.g. 2 GB; the
   GPU uses the shared memory above, so a large carve-out only takes it away.
@@ -114,6 +124,11 @@ Against stock upstream vLLM on one gfx1151 APU, single stream, int8 KV
 - **Speculative decoding:** DFlash 2 decodes the FP8 27B at 29.6 tok/s (7.7
   without a draft, 16.4 with MTP 2) and the FP8 35B at 85.1 (45.7 / 63.5);
   LFM2.5's DSpark draft takes it from 51.7 to 66.7 tok/s.
+- **NPU prefill** (Flash-Next, `STRIX_ENABLE=npu`, kernel 7.4+): TTFT 7-8 %
+  lower from 16k to 100k tokens served and prefill 9-11 % faster at 8k-32k
+  offline, decode and short prompts unchanged, GSM8K unchanged; the NPU also
+  covers multi-request steps. See
+  [docs/docker.md](docs/docker.md#npu-prefill).
 
 ## Tests and benchmarks
 
