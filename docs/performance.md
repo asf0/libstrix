@@ -835,8 +835,28 @@ Reading it:
   against 471,150 without the NPU. At 0.85 the memory guard stopped vLLM
   (host MemAvailable 9 GiB); 32k prefill chunks do not fit with the NPU
   (1.33 GiB of KV cache left at 0.80).
-- **Which steps.** Steps below 4,096 tokens, batches of several requests and
-  graph capture keep the GPU path, so decode and short prompts do not change.
+- **Which steps.** Steps below 4,096 tokens, steps carrying draft rows and
+  graph capture keep the GPU path, so decode and short prompts do not change;
+  steps of several requests take the NPU path (the banks are token ranges, and
+  a request straddling the boundary appears in both).
+
+2026-11-04, same offline protocol (warm rep), with the `STRIX_NPU_STATS`
+instrumentation: the GPU never waits at a chain (0.01 ms mean at every depth;
+at 16k a chain is busy 44-60 ms inside an 80-89 ms window), so the pipeline is
+GPU-bound and capping the NPU rows at 7,168 *costs* 4.2 % at 16k. The QSA
+indexer's `index_qk_proj` now rides the QsaIn panels after `qkv_proj` (the
+last panel already ran; `STRIX_NPU_INDEXER=0` keeps it on the GPU): 16k
+7,902 -> 7,814 ms (-1.1 %), 8k 3,888 -> 3,832 (-1.4 %), and KLD against the
+GPU indexer at 16k is 0.0093 mean (the plugin-vs-itself floor), PPL +0.37 %.
+Against the GPU path the NPU step is -9.1 % / -10.8 % / -10.8 % at 8k/16k/32k.
+`STRIX_NPU_VIEWS=1` (opt-in) reads the GDN banks' projections straight from
+the NPU's C arena (the conv and gated-norm kernels take row pitches): another
+0.5-0.7 % of a 16k step. It stays opt-in because the path carries a
+run-to-run jitter - identical prefill steps land in a handful of discrete
+numeric states (teacher-forced logprobs differ by mean 0.01-0.15 between
+executions, reproducible per script layout) - that is the same size as the
+change, so the end-to-end numerics gate cannot resolve it; the kernels are
+bit-exact on strided inputs and the KLD sits at the null-pair floor.
 
 Qwen3.8-27B bf16 (`STRIX_ENABLE=npu`, two K halves, 47 GDN layers; prefill of
 an 8,192-token prompt, second pass, three runs each, alternating):

@@ -21,4 +21,6 @@ services:
       memlock: -1
     environment:
       STRIX_ENABLE: npu
-      STRIX_NPU_SIZES: ${STRIX_NPU_SIZES:-}
+      # Diagnostics: a JSONL path inside the container (per-chain relay stats
+      # and GPU windows, summarized by bench/model/npu_stats.py).
+      STRIX_NPU_STATS: ${STRIX_NPU_STATS:-}      STRIX_NPU_SIZES: ${STRIX_NPU_SIZES:-}

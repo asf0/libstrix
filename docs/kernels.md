@@ -16,18 +16,29 @@ Qwen3.8-Flash-Next only, so they turn on for that architecture
 
 `STRIX_ENABLE=npu` (off by default) moves Qwen3.8-Flash-Next's prefill input
 projections to the XDNA2 NPU (`python/strix_vllm/qwen4_exp_npu.py`, the `npu/`
-shim over hipfire's G80 BF16 trunk transport). A single-request prefill step of
-N >= `STRIX_NPU_MIN_TOKENS` (4,096) tokens is split into two banks, the first
-~N/2 tokens and the rest, each with its own attention / GDN / QSA metadata
-(the model state's `prepare_attn` on sliced input batches; bank B sees bank A
-as context). Layers 0 and 1 (PLE, a convolution across tokens) run on all
-rows; from layer 2 on each layer runs bank A, then bank B, while the NPU
-computes the other bank's input projection (GDN `in_proj_qkvz` + `in_proj_ba`,
-QSA `qkv_proj`), so the GPU runs none from layer 3 on. A bank's rows past the
-largest NPU program size (`STRIX_NPU_SIZES`, up to 8,192) are projected on the
-GPU. The NPU part is W8A8 (int8 per output row and per token, grid15 scales,
-one BF16 rounding), bit-equal to an exact CPU model of that contract. The step
-runs eagerly (outside torch.compile); other steps keep the compiled path.
+shim over hipfire's G80 BF16 trunk transport). A prefill step of N >=
+`STRIX_NPU_MIN_TOKENS` (4,096) tokens — one request or several — is split into
+two banks, the first ~N/2 tokens and the rest, each with its own attention /
+GDN / QSA metadata (the model state's `prepare_attn` on sliced input batches;
+the request slices come from the scheduler's own microbatch slicer, so a
+request straddling the boundary appears in both banks, its query truncated to
+the tokens each owns — bank B's suffix reads the GDN state bank A wrote — and
+whole requests inside a bank are independent; steps carrying draft rows or
+whose scheduled tokens do not line up with the token layout stay on the GPU).
+Layers 0 and 1 (PLE, a convolution across tokens) run on all rows; from layer 2
+on each layer runs bank A, then bank B, while the NPU computes the other bank's
+input projection (GDN `in_proj_qkvz` + `in_proj_ba`, QSA `qkv_proj` and, riding
+the same panels after it, the QSA indexer's `index_qk_proj` unless
+`STRIX_NPU_INDEXER=0`), so the GPU runs none from layer 3 on. A bank's rows
+past the largest NPU program size (`STRIX_NPU_SIZES`, up to 8,192) are
+projected on the GPU. The NPU part is W8A8 (int8 per output row and per token,
+grid15 scales, one BF16 rounding), bit-equal to an exact CPU model of that
+contract. The step runs eagerly (outside torch.compile); other steps keep the
+compiled path. `STRIX_NPU_STATS` (a JSONL path) records per-chain relay stats
+and the GPU window each chain had (summarized by `bench/model/npu_stats.py`).
+With `STRIX_NPU_VIEWS=1` the GDN banks read the arena in place instead of
+copying (the consumers take row pitches; opt-in - the win is 0.5-0.7% of a
+16k step, below the run-to-run jitter the path carries).
 Docker: [docker.md](docker.md#npu-prefill).
 
 The same option also covers Qwen3.8-27B (`Qwen3_5Model`,
