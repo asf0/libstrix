@@ -857,6 +857,8 @@ numeric states (teacher-forced logprobs differ by mean 0.01-0.15 between
 executions, reproducible per script layout) - that is the same size as the
 change, so the end-to-end numerics gate cannot resolve it; the kernels are
 bit-exact on strided inputs and the KLD sits at the null-pair floor.
+GSM8K paired for the indexer (n = 250, `STRIX_NPU_INDEXER=0` vs on, greedy,
+DFlash 2 recipe): 240 vs 242, 1 / 3 discordant, McNemar p = 0.63.
 
 Qwen3.8-27B bf16 (`STRIX_ENABLE=npu`, two K halves, 47 GDN layers; prefill of
 an 8,192-token prompt, second pass, three runs each, alternating):
