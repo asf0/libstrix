@@ -12,13 +12,20 @@ services:
       - "${PORT:-8000}:8000"
     volumes:
       - ${MODELS:-./models}:/models:ro
+      # Persistent compile cache on disk. For a RAM-backed cache instead
+      # (local testing without SSD writes), point CACHE at a tmpfs path:
+      #   CACHE=/dev/shm/strix-cache docker compose ... up -d
       - ${CACHE:-./cache}:/cache
     environment:
       MTP: ${MTP:-0}
       SERVED_MODEL_NAME: ${SERVED_MODEL_NAME:-}
       STRIX_DISABLE: ${STRIX_DISABLE:-}
       STRIX_ENABLE: ${STRIX_ENABLE:-}
-      EXTRA_ARGS: ${EXTRA_ARGS:-}
+      # Defaults add per-request data to responses so llama-swap's Activity
+      # view can show prefill/decode speeds (per-request metrics) and the
+      # Cached column (prompt tokens details). Override by setting EXTRA_ARGS
+      # in the environment.
+      EXTRA_ARGS: ${EXTRA_ARGS:---enable-per-request-metrics --enable-prompt-tokens-details}
       REPLAYSSM: ${REPLAYSSM:-0}
       # Gated repos (gemma-4) need it when a model is downloaded, not mounted.
       HF_TOKEN: ${HF_TOKEN:-}

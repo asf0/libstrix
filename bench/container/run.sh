@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs a command inside the image, with this checkout at /work (the working
-# directory), $MODELS at /models and $CACHE at /cache, so the offline bench
+# directory), $MODELS at /models and the compile cache at /cache, so the offline bench
 # scripts (bench/model/*.py) test the same build users get:
 #
 #   MODELS=/path/to/models bench/container/run.sh \
@@ -14,8 +14,16 @@
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 : "${MODELS:?set MODELS to the host directory holding the model folders}"
-cache=${CACHE:-$repo/docker/recipes/cache}
-mkdir -p "$cache"
+# CACHE_TMPFS=1 keeps the compile caches in RAM instead of on disk, so local
+# test runs do not write torch.compile/Triton artifacts to the SSD. Off by
+# default; CACHE_SIZE caps it (default 8g).
+if [ "${CACHE_TMPFS:-0}" = 1 ]; then
+  cache_mount=(--tmpfs "/cache:size=${CACHE_SIZE:-8g},mode=1777")
+else
+  cache=${CACHE:-$repo/docker/recipes/cache}
+  mkdir -p "$cache"
+  cache_mount=(-v "$cache":/cache)
+fi
 envs=()
 while IFS='=' read -r k _; do
   case $k in STRIX_WIKITEXT) ;; STRIX_*|VLLM_*|HF_TOKEN) envs+=(-e "$k") ;; esac
@@ -32,5 +40,5 @@ if [ "${STRIX_NPU:-0}" = 1 ]; then
 fi
 exec docker run --rm --device /dev/kfd --device /dev/dri "${npu[@]}" --ipc host \
   --security-opt seccomp=unconfined \
-  -v "$MODELS":/models:ro -v "$repo":/work -v "$cache":/cache -w /work \
+  -v "$MODELS":/models:ro -v "$repo":/work "${cache_mount[@]}" -w /work \
   "${envs[@]}" "${IMAGE:-strix-vllm:test}" "$@"

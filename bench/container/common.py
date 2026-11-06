@@ -5,7 +5,8 @@ The container tests (smoke, spec_equiv, kv_pressure, gsm8k) start a recipe
 with `docker compose` in their own compose project (`strixtest`), on their
 own port, so they never touch containers someone else started. The image is
 $IMAGE (default strix-vllm:test, see docker/build-test-image.sh); models come
-from $MODELS, compile caches from $CACHE (default docker/recipes/cache).
+from $MODELS, compile caches from $CACHE (default docker/recipes/cache);
+CACHE_TMPFS=1 keeps those caches in RAM instead (local testing).
 
 A target is `recipe.yaml` optionally followed by env overrides:
 `qwen3.6-35b-a3b-fp8.yaml:MTP=0,MAX_MODEL_LEN=16384`; a `+` layers an
@@ -19,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -44,6 +46,27 @@ def recipe_command(recipe: str) -> list[str]:
     path = RECIPES / recipe.split("+")[0]
     svc = next(iter(yaml.safe_load(open(path))["services"].values()))
     return [str(c) for c in svc.get("command", [])]
+
+
+def cache_tmpfs_override(recipe: str) -> Path:
+    """Compose override that makes /cache a sized tmpfs for this recipe.
+
+    Off by default (CACHE_TMPFS=1 turns it on). Generated because every recipe
+    names its service after itself, and a compose override must name it too.
+    """
+    import yaml
+
+    svc = next(iter(yaml.safe_load(open(RECIPES / recipe.split("+")[0]))["services"]))
+    path = Path(tempfile.gettempdir()) / f"strix-cache-tmpfs-{os.getpid()}.yaml"
+    path.write_text(
+        "services:\n"
+        f"  {svc}:\n"
+        "    volumes: !override\n"
+        "      - ${MODELS:-./models}:/models:ro\n"
+        "    tmpfs:\n"
+        "      - /cache:size=${CACHE_SIZE:-8g},mode=1777\n"
+    )
+    return path
 
 
 def gpu_busy() -> list[str]:
@@ -88,6 +111,8 @@ class Server:
         cmd = ["docker", "compose", "-p", PROJECT]
         for part in self.recipe.split("+"):
             cmd += ["-f", str(RECIPES / part)]
+        if self.env.get("CACHE_TMPFS", "") in ("1", "true", "yes"):
+            cmd += ["-f", str(cache_tmpfs_override(self.recipe))]
         return subprocess.run(
             [*cmd, *args], env=self.env, capture_output=True, text=True, check=check,
         )

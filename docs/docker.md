@@ -49,7 +49,12 @@ request when speculating; on in the Qwen recipes), `SERVED_MODEL_NAME`, `STRIX_D
 `STRIX_ENABLE` (see [kernels.md](kernels.md)), `HF_TOKEN`,
 `PORT`, and `EXTRA_ARGS` (appended to `vllm serve`). `CACHE` keeps the compile
 caches, so later starts skip recompiling; the container runs as root, so
-removing it needs `sudo`.
+removing it needs `sudo`. For local test runs that should not write compile
+artifacts to the SSD, point `CACHE` at a tmpfs directory such as
+`/dev/shm/strix-cache`; `bench/container/run.sh` and the Python harness also
+take `CACHE_TMPFS=1`, which mounts a sized tmpfs (`CACHE_SIZE`, default 8g)
+for the container only. Models must be present under `MODELS` with a tmpfs: a
+Hugging Face download will not fit.
 
 `qwen3.8-flash-next` needs the strix-vllm fork: its 102 GB n-gram (engram)
 table does not fit next to the weights, so the fork streams it from disk

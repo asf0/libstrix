@@ -21,10 +21,9 @@ services:
       - '--engram-config={"disk_offload": true}'
       - --kv-cache-dtype=int8_per_token_head
       - --gpu-memory-utilization=${GPU_UTIL:-0.85}
-      - --max-model-len=${MAX_MODEL_LEN:-131072}
+      - --max-model-len=${MAX_MODEL_LEN:-262144}
       - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-16384}
       - --max-num-seqs=${MAX_NUM_SEQS:-4}
-      - --no-enable-prefix-caching
       # Tool calls and reasoning come back parsed, as chat clients expect.
       - --enable-auto-tool-choice
       - --tool-call-parser=qwen3_coder

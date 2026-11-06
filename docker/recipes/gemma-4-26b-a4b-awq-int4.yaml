@@ -17,9 +17,9 @@ services:
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head
       - --gpu-memory-utilization=${GPU_UTIL:-0.85}
-      - --max-model-len=${MAX_MODEL_LEN:-131072}
+      - --max-model-len=${MAX_MODEL_LEN:-262144}
       - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-8192}
-      - --max-num-seqs=${MAX_NUM_SEQS:-16}
+      - --max-num-seqs=${MAX_NUM_SEQS:-8}
       # Tool calls and reasoning come back parsed, as chat clients expect.
       - --enable-auto-tool-choice
       - --tool-call-parser=gemma4

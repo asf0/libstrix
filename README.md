@@ -83,7 +83,10 @@ curl localhost:8000/v1/models
 
 Each recipe serves `/models/<folder>` and downloads the model's Hugging Face
 repo into `CACHE` when the folder is missing (gated repos such as gemma-4 need
-`HF_TOKEN` in `.env`). Run one model at a time; each takes most of the 128 GB.
+`HF_TOKEN` in `.env`). For local testing that should not write compile
+artifacts to the SSD, point `CACHE` at a tmpfs directory such as
+`/dev/shm/strix-cache`, or set `CACHE_TMPFS=1` for the bench scripts. Run one
+model at a time; each takes most of the 128 GB.
 
 See [docs/docker.md](docs/docker.md) for every recipe with its memory and KV
 capacity, the settings you can override (`GPU_UTIL`, `MAX_MODEL_LEN`, `MTP`,

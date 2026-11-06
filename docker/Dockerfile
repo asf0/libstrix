@@ -147,7 +147,8 @@ COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /src/strix-vllm.ref /src/libstrix.ref /opt/strix/
 COPY --from=npu /stage/libstrix_npu.so /opt/strix/lib/libstrix_npu.so
 COPY docker/entrypoint.sh /opt/strix/entrypoint.sh
-# Compile, Triton and HF caches go to one volume so restarts skip recompiling.
+# Compile, Triton and HF caches go to /cache; the recipes mount a persistent
+# host directory there by default, or a tmpfs for local test runs.
 ENV XDG_CACHE_HOME=/cache \
     VLLM_CACHE_ROOT=/cache/vllm \
     TRITON_CACHE_DIR=/cache/triton \
