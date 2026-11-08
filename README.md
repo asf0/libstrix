@@ -1,37 +1,51 @@
 # libstrix
 
-HIP kernels tuned for **gfx1151** (Strix Halo, Radeon 8060S), plus a vLLM
-plugin that swaps them into stock vLLM, and an option to run prefill input
-projections on the Strix Halo **XDNA2 NPU** while the GPU runs the rest of the
-layer. No vLLM source changes.
-
-Each kernel is compiled for one geometry, named in its entry point, and rejects
-any shape it was not built for. `strix.select(op, **geometry)` reports whether
-a kernel covers a shape; `None` means vLLM keeps its own path. The plugin is a
-no-op on every other GPU.
-
-## Requirements
-
-- A gfx1151 APU (Strix Halo / Radeon 8060S) and a ROCm install that ships
-  `hipcc`.
-- The ROCm build of PyTorch, CMake >= 3.26 and Ninja.
-- vLLM with `vllm.general_plugins` entry-point support.
-
-Build against the same torch and ROCm that the vLLM process loads — the
-extension links against that torch, and a mismatch fails at import.
-
-## Build and install
+**Fast vLLM on AMD Strix Halo** (Ryzen AI Max, Radeon 8060S, gfx1151).
+One `docker compose` command serves Qwen3.6, Qwen3.8, gemma-4, LFM2.5,
+MiniCPM-V, Muse-Glimmer and Flint behind an OpenAI-compatible API, with
+prefill 11-31x faster than stock vLLM at 64k context and decode up to 2.4x
+faster (more on gemma-4 and the FP8 27B).
 
 ```sh
-export ROCM_PATH=/opt/rocm          # your ROCm install
-source /path/to/venv/bin/activate   # the python that runs vLLM
-./build.sh                          # -> python/strix/_C.so
-pip install --no-deps --no-build-isolation -e .
+git clone https://github.com/asf0/libstrix && cd libstrix/docker/recipes
+cp .env.example .env              # set MODELS=/path/to/your/models
+docker compose -f qwen3.6-35b-a3b-fp8.yaml up -d
 ```
 
-`build.sh` compiles with `$ROCM_PATH/lib/llvm/bin/clang++`; `STRIX_GPU_ARCH`
-overrides the target architecture (default `gfx1151`) and `MAX_JOBS` the build
-parallelism (default 8).
+Host setup (GPU memory cap, BIOS) is a one-time step; see [Docker](#docker).
+
+Under the hood: HIP kernels tuned for gfx1151, a vLLM plugin that swaps them
+into stock vLLM with no vLLM source changes, and an option to run prefill input
+projections on the Strix Halo **XDNA2 NPU** while the GPU runs the rest of the
+layer. Each kernel is compiled for one geometry, named in its entry point, and
+rejects any shape it was not built for. `strix.select(op, **geometry)` reports
+whether a kernel covers a shape; `None` means vLLM keeps its own path. The
+plugin is a no-op on every other GPU.
+
+## Results
+
+Against stock upstream vLLM on one gfx1151 APU, single stream, int8 KV
+(full tables in [docs/performance.md](docs/performance.md)):
+
+- **Prefill** 1.7-4.4× faster at 2k and 11-31× at 64k (Flash-Next 2.4×,
+  against a different baseline; Flint FP8 8.8× at 2k); at 256k the 35B
+  prefills in 241 s against 7,568 s stock.
+- **Decode** 1.9-2.4× on the 35B, LFM2.5 and the INT8 27B, 3-7× on gemma-4 at
+  64k, 4.6× on Flint FP8, 13.5× on the FP8 27B, and at parity on the bf16 and
+  AWQ 27B and the 35B W8A8. No configuration, single stream or batched, is
+  slower than stock, apart from Qwen3.8-Flash-Next's short prompts on its
+  disk-backed n-gram table.
+- **Accuracy:** KLD against stock 0.001-0.006 on Qwen3.6 and Qwen3.8-27B (97-99 %
+  top-1), higher on Flash-Next and gemma-4-26B; GSM8K unchanged within noise on
+  every model checked.
+- **Speculative decoding:** DFlash 2 decodes the FP8 27B at 29.6 tok/s (7.7
+  without a draft, 16.4 with MTP 2) and the FP8 35B at 85.1 (45.7 / 63.5);
+  LFM2.5's DSpark draft takes it from 51.7 to 66.7 tok/s.
+- **NPU prefill** (Flash-Next, `STRIX_ENABLE=npu`, kernel 7.4+): TTFT 7-8 %
+  lower from 16k to 100k tokens served and prefill 9-11 % faster at 8k-32k
+  offline, decode and short prompts unchanged, GSM8K unchanged; the NPU also
+  covers multi-request steps. See
+  [docs/docker.md](docs/docker.md#npu-prefill).
 
 ## Docker
 
@@ -99,6 +113,31 @@ disk and gives its QSA layers an int8 KV cache, runs Flint on ROCm, supports
 states to their DFlash 2 and DSpark drafts, and gives draft models their own
 KV cache pool. The kernels themselves run on stock vLLM.
 
+## Building from source
+
+### Requirements
+
+- A gfx1151 APU (Strix Halo / Radeon 8060S) and a ROCm install that ships
+  `hipcc`.
+- The ROCm build of PyTorch, CMake >= 3.26 and Ninja.
+- vLLM with `vllm.general_plugins` entry-point support.
+
+Build against the same torch and ROCm that the vLLM process loads — the
+extension links against that torch, and a mismatch fails at import.
+
+### Build and install
+
+```sh
+export ROCM_PATH=/opt/rocm          # your ROCm install
+source /path/to/venv/bin/activate   # the python that runs vLLM
+./build.sh                          # -> python/strix/_C.so
+pip install --no-deps --no-build-isolation -e .
+```
+
+`build.sh` compiles with `$ROCM_PATH/lib/llvm/bin/clang++`; `STRIX_GPU_ARCH`
+overrides the target architecture (default `gfx1151`) and `MAX_JOBS` the build
+parallelism (default 8).
+
 ## Using it with vLLM
 
 Installing the package registers the `vllm.general_plugins` entry point
@@ -107,31 +146,6 @@ does. `STRIX_DISABLE=all`, or a comma-separated list of kernel names, keeps
 vLLM's own kernels for A/B runs; `STRIX_ENABLE` turns on the ones that are
 off by default. [docs/kernels.md](docs/kernels.md) lists every kernel, what
 it replaces and when it applies, plus how to add one.
-
-## Results
-
-Against stock upstream vLLM on one gfx1151 APU, single stream, int8 KV
-(full tables in [docs/performance.md](docs/performance.md)):
-
-- **Prefill** 1.7-4.4× faster at 2k and 11-31× at 64k (Flash-Next 2.4×,
-  against a different baseline; Flint FP8 8.8× at 2k); at 256k the 35B
-  prefills in 241 s against 7,568 s stock.
-- **Decode** 1.9-2.4× on the 35B, LFM2.5 and the INT8 27B, 3-7× on gemma-4 at
-  64k, 4.6× on Flint FP8, 13.5× on the FP8 27B, and at parity on the bf16 and
-  AWQ 27B and the 35B W8A8. No configuration, single stream or batched, is
-  slower than stock, apart from Qwen3.8-Flash-Next's short prompts on its
-  disk-backed n-gram table.
-- **Accuracy:** KLD against stock 0.001-0.006 on Qwen3.6 and Qwen3.8-27B (97-99 %
-  top-1), higher on Flash-Next and gemma-4-26B; GSM8K unchanged within noise on
-  every model checked.
-- **Speculative decoding:** DFlash 2 decodes the FP8 27B at 29.6 tok/s (7.7
-  without a draft, 16.4 with MTP 2) and the FP8 35B at 85.1 (45.7 / 63.5);
-  LFM2.5's DSpark draft takes it from 51.7 to 66.7 tok/s.
-- **NPU prefill** (Flash-Next, `STRIX_ENABLE=npu`, kernel 7.4+): TTFT 7-8 %
-  lower from 16k to 100k tokens served and prefill 9-11 % faster at 8k-32k
-  offline, decode and short prompts unchanged, GSM8K unchanged; the NPU also
-  covers multi-request steps. See
-  [docs/docker.md](docs/docker.md#npu-prefill).
 
 ## Tests and benchmarks
 
@@ -167,6 +181,12 @@ tests/          per-kernel correctness against torch references
 ```
 
 Conventions for docs, recipes and model names are in [AGENTS.md](AGENTS.md).
+
+## Support
+
+libstrix is built and tested on one machine in spare time. If it saves you
+time, [a Ko-fi tip](https://ko-fi.com/asfdev) helps keep the tests and
+development going.
 
 ## License
 
