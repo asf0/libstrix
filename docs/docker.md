@@ -44,6 +44,8 @@ request in this configuration.
 
 Overrides go in `.env` or the shell: `GPU_UTIL` (default 0.85), `MAX_MODEL_LEN`,
 `MAX_NUM_SEQS`, `MAX_BATCHED_TOKENS`, `MTP` (draft tokens, `0` = off),
+`MTP_VOCAB` (restrict the Flash-Next MTP draft's LM head to the leading
+vocabulary rows plus special tokens, `0` = full head; see below),
 `SPEC_TOKENS` (DFlash 2 and DSpark draft tokens), `REPLAYSSM` (`1` = one GDN state per
 request when speculating; on in the Qwen recipes), `SERVED_MODEL_NAME`, `STRIX_DISABLE`,
 `STRIX_ENABLE` (see [kernels.md](kernels.md)), `HF_TOKEN`,
@@ -67,6 +69,14 @@ Use the AWQ W4A16 checkpoint; bf16 does not fit.
 - 16k prefill chunks (`MAX_BATCHED_TOKENS`) are the measured best.
 - MTP 2 costs about 4 % prefill and more than doubles decode (18 -> 40-43
   tok/s). ReplaySSM is not supported for this architecture.
+- `MTP_VOCAB=<n>` gives the MTP draft a reduced LM head (the first `<n>`
+  vocabulary rows plus special tokens, cut from the target's head at load;
+  the target verifies over the full vocabulary). Measured as an opt-in
+  ([speculative decoding](performance.md#speculative-decoding)): about 5 %
+  faster at one request and 6-10 % with 8 at once over the full head, same
+  acceptance (2.60) and the same divergences from the no-draft output the
+  full head has. 65,536-131,072 land within a few percent of each other;
+  `MTP_VOCAB=0` (off) stays the recipe default.
 - `qwen3.8-flash-next-dflash2` runs incoai/Qwen3.8-Flash-Next-DFlash2 instead
   of MTP: 19 % faster for one request and 16 % with 8 at once at the default
   4 draft tokens ([speculative decoding](performance.md#speculative-decoding)).
@@ -135,11 +145,12 @@ GPU_UTIL=0.82 docker compose -f qwen3.8-27b.yaml \
 | kernel 7.4+, `amdxdna` loaded (`/dev/accel/accel0`), the IOMMU enabled with the GPU in a passthrough (identity) group | the override passes the device in; `amd_iommu=off`, the GPU-only recommendation, keeps the NPU off |
 | `ulimits: memlock: -1` (in the override) | weight panels and arenas are pinned host memory |
 | `GPU_UTIL=0.78-0.82` (Flash-Next DFlash 2) | at 0.85 the memory guard stopped vLLM at the first long prompt (MemAvailable 9 GiB); 0.78 keeps 4.59 GiB of KV (203,692 tokens) and served a full benchmark, 0.82 keeps 412,699 KV tokens with the NPU, 471,150 without |
-| `GPU_UTIL=0.80+` (Flash-Next with MTP) | the MTP drafter adds ~4 GiB: at 0.78 only 1.6 GiB of KV is left and the 131,072-token context no longer fits; 0.80 keeps 3.94 GiB |
+| `GPU_UTIL=0.80` (Flash-Next with MTP) | the MTP drafter adds ~4 GiB: at 0.78 only 1.6 GiB of KV is left and the 131,072-token context no longer fits. 0.82 boots shallow work fine but the memory guard stops vLLM during 32k+-prompt benches (connection resets, reproduced twice); a probe confirmed 0.80 serves 57k-token prompts |
 | `GPU_UTIL=0.82` (the 27B) | at 0.85 the memory guard stopped vLLM at startup (MemAvailable 6 GiB); at 0.82 the NPU opens during the startup profile run and its panels pin ~10.5 GiB before the KV cache is sized: 826,647 KV tokens with the NPU resident (1,121,559 without), 6.31 requests at 131k |
 
 The log shows `libstrix: npu prefill on: 46 layers resident` (Flash-Next) or
 `libstrix: npu prefill on (Qwen3.5): 47 GDN layers ...` (the 27B) after startup.
+
 Steps of several requests take the NPU path too (the banks are token ranges;
 a request straddling the boundary appears in both), and the QSA indexer's
 projection rides the panels unless `STRIX_NPU_INDEXER=0`. A full benchmark

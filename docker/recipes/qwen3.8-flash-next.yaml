@@ -14,6 +14,7 @@ services:
       service: strix
     environment:
       MTP: ${MTP:-2}
+      MTP_VOCAB: ${MTP_VOCAB:-0}
       HF_REPO: wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16
     command:
       - /models/Qwen3.8-Flash-Next-AWQ-W4A16

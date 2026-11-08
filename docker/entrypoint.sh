@@ -2,7 +2,8 @@
 # `vllm serve <model> <flags>` for the recipes in recipes/. A first argument
 # that is a command on PATH runs instead (`... bash`, `... python -c`).
 # The model folder falls back to $HF_REPO (downloaded into /cache/huggingface)
-# when it is not mounted under /models. MTP=<n> adds the MTP speculative config.
+# when it is not mounted under /models. MTP=<n> adds the MTP speculative config;
+# MTP_VOCAB=<n> restricts a Qwen4Exp MTP draft head to a vocabulary prefix.
 # REPLAYSSM=1 adds --use-replayssm whenever the run speculates (MTP, or a
 # --speculative-config in the recipe, e.g. DFlash 2),
 # EXTRA_ARGS (word-split) are appended last and win over the recipe's flags.
@@ -29,7 +30,11 @@ fi
 spec=()
 speculates=0
 if [ -n "${MTP:-}" ] && [ "$MTP" != 0 ]; then
-  spec=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP}")
+  draft_vocab=
+  if [ -n "${MTP_VOCAB:-}" ] && [ "$MTP_VOCAB" != 0 ]; then
+    draft_vocab=", \"mtp_draft_vocab_size\": $MTP_VOCAB"
+  fi
+  spec=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP$draft_vocab}")
   speculates=1
 fi
 for arg in "$@"; do

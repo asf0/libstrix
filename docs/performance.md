@@ -300,10 +300,20 @@ the draft model's own cache comes out of the same memory):
   | --- | ---: | ---: |
   | none | 24.9-25.2 / 54.5-60.0 | 1,391,594 |
   | MTP 2 | 41.1 / 70.6 (2.60) | 605,314 |
+  | MTP 2, draft vocab 131,072 | 41.1 / 70.7 (2.60) | 665,845 |
+  | MTP 2, draft vocab 94,208 | 41.2 / 68.0 (2.60) | 665,845 |
+  | MTP 2, draft vocab 65,536 | 41.1 / 70.8 (2.60) | 665,845 |
   | DFlash 2, 4 tokens | **48.8 / 81.8** (3.64) | 627,020 |
   | DFlash 2, 5 tokens | 48.8 / 79.4 (3.92) | 586,463 |
   | DFlash 2, 6 tokens | 47.4 / 77.7 (4.12) | 527,484 |
   | DFlash 2, 7 tokens | 45.1 / 78.4 (4.25) | 530,456 |
+
+  The draft-vocab rows are one spec_equiv sweep on the test image (the
+  protocol above; in that same sweep the full head measured 39.1 / 64.2 at
+  2.60): against the full head, the subsets are about 5 % faster at one
+  stream and 6-10 % with 8 at once, with the same acceptance, KV and
+  divergences — every candidate hits the same eight positions and margins
+  against the no-draft output, including the confident one below.
 
   4 tokens is the recipe default. Each token checked reads up to 10 more of
   the 512 experts, so longer drafts stop paying past 4-5 although they
