@@ -20,7 +20,7 @@ services:
       - '--speculative-config={"method": "dflash", "model": "/models/Qwen3.8-Flash-Next-DFlash2", "num_speculative_tokens": ${SPEC_TOKENS:-4}}'
       - --mm-encoder-attn-backend=TRITON_ATTN
       - '--engram-config={"disk_offload": true}'
-      - --kv-cache-dtype=int8_per_token_head
+      - --kv-cache-dtype=fp8
       - --gpu-memory-utilization=${GPU_UTIL:-0.85}
       - --max-model-len=${MAX_MODEL_LEN:-262144}
       - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-16384}

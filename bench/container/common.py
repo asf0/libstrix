@@ -168,7 +168,11 @@ class Server:
         """The kernel choices the startup log reports (plugin and vLLM)."""
         seen = []
         for line in self.logs().splitlines():
-            m = re.search(r"(Selected \S+ for \S+|libstrix: .*)", line)
+            m = re.search(
+                r"(Selected \S+ for \S+|Using \S+ for (?:mixed-precision linear|MX\w+ GEMM)"
+                r"|libstrix: .*)",
+                line,
+            )
             if m and m.group(1) not in seen:
                 seen.append(m.group(1))
         return seen

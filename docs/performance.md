@@ -55,11 +55,11 @@ What differs per checkpoint, for every table below:
   Docker image, 16k prefill chunks, the n-gram table read from disk (prefill
   is the fastest run per depth: a request whose rows are not cached is
   slower), and a baseline that keeps the libstrix GDN conv. See
-  [its per-model table](#qwen38-flash-next-awq). Its int8 KV (the strix-vllm
-  fork's int8 QSA layers, the served setting) scores KLD 0.0207 against bf16
-  KV at 2k and 0.0083 at 32k. At 2k any numeric change costs about that much
-  (K alone 0.0204, V alone 0.0197, V on an 11-bit grid 0.0215; two bf16 runs
-  are bit-identical); at 32k two bf16 runs already differ by 0.0075.
+  [its per-model table](#qwen38-flash-next-awq). Its rows in the int8-KV
+  tables use fp8 KV, the served setting, which scores KLD 0.0225 against bf16
+  KV at 2k, top-1 96.96 %. At 2k any
+  numeric change costs about that much (int8 K alone 0.0204, V alone 0.0197,
+  V on an 11-bit grid 0.0215; two bf16 runs are bit-identical).
 - **Flint FP8** (block FP8 experts, bf16 elsewhere) needs the strix-vllm
   fork, which runs it on ROCm. It is measured on the Docker image at
   `--gpu-memory-utilization 0.85` at every depth, 256k included; stock to 64k.
@@ -87,7 +87,7 @@ strix over stock; the last two columns are strix's own throughput.
 | Qwen3.8-27B INT8 | 2.56× | 14.6× | 2.38× | 2.33× | 430 / 5.7 |
 | Qwen3.8-27B AWQ INT4 | 2.05× | 14.2× | 1.01× | 1.22× | 428 / 8.1 |
 | Qwen3.8-27B FP8 | - | - | 13.5× | - | 434 / 6.4 |
-| Qwen3.8-Flash-Next AWQ | 1.93× | 2.37× | 1.52× | 1.72× | 1,518 / 24.2 |
+| Qwen3.8-Flash-Next AWQ | 1.82× | 1.65× | 1.51× | 1.58× | 1,547 / 25.5 |
 | LFM2.5-24B-A2B | 2.02× | 11.4× | 2.15× | 2.18× | 2,405 / 27.1 |
 | LFM2.5-24B-A2B FP8 | - | - | - | - | 2,244 / 33.6 |
 | Muse-Glimmer-30B FP8 | - | - | - | - | 76 / 6.5 |
@@ -141,7 +141,7 @@ int8 KV (`int8_per_token_head`, the serving dtype):
 | Qwen3.8-27B INT8 | 692 / 603 / 430 / 312 | 7.8 / 7.2 / 5.7 / 5.5 |
 | Qwen3.8-27B AWQ INT4 | 688 / 598 / 428 / 312 | 13.0 / 11.4 / 8.1 / 5.8 |
 | Qwen3.8-27B FP8 | 658 / 610 / 434 / 318 | 7.7 / 7.4 / 6.4 / 5.5 |
-| Qwen3.8-Flash-Next AWQ ¹ | 1,387 / 1,708 / 1,518 / 1,423 | 24.4 / 24.4 / 24.2 / 26.9 |
+| Qwen3.8-Flash-Next AWQ ¹ | 1,604 / 1,707 / 1,547 / 1,448 | 26.0 / 26.0 / 25.5 / 25.6 |
 | LFM2.5-24B-A2B | 5,124 / 4,613 / 2,405 / - | 38.3 / 34.7 / 27.1 / - |
 | LFM2.5-24B-A2B FP8 | 4,948 / 4,052 / 2,244 / - | 52.5 / 46.3 / 33.6 / - |
 | Muse-Glimmer-30B FP8 | 499 / 220 / 76 / - | 7.4 / 6.9 / 6.5 / - |
@@ -152,11 +152,11 @@ int8 KV (`int8_per_token_head`, the serving dtype):
 | gemma-4-31B MXFP4 | 542 / 462 / 296 / 200 | 9.7 / 8.9 / 7.3 / 5.9 |
 | gemma-4-31B QAT W4A16 | 535 / 452 / 292 / 198 | 10.8 / 10.0 / 8.1 / 6.4 |
 
-¹ The Docker image. Prefill is the fastest run at each depth: its n-gram table
+¹ The Docker image, fp8 KV. Prefill is the fastest run at each depth: its n-gram table
 is read from disk, and a request that waits on it prefills more slowly, down
 to about 540 tok/s at 2k (see [its per-model table](#qwen38-flash-next-awq)).
-Decode is the median of every run. bf16 KV on the same image: 1,515 / 1,695 /
-1,555 at 2k / 32k / 128k.
+Decode is the median of every run. bf16 KV on the same image: 1,593 / 1,717 /
+1,558 at 2k / 32k / 128k.
 
 bf16 KV (256k does not fit with bf16 KV):
 
@@ -171,7 +171,7 @@ bf16 KV (256k does not fit with bf16 KV):
 | Qwen3.8-27B INT8 | 694 / 608 / 413 | 7.7 / 6.9 / 5.0 |
 | Qwen3.8-27B AWQ INT4 | 690 / 604 / 408 | 12.9 / 10.6 / 6.6 |
 | Qwen3.8-27B FP8 | 664 / 638 / 421 | 7.7 / 7.1 / 5.8 |
-| Qwen3.8-Flash-Next AWQ | 1,515 / 1,695 / 1,555 | 25.4 / 25.3 / 25.3 |
+| Qwen3.8-Flash-Next AWQ | 1,593 / 1,717 / 1,558 | 23.6 / 26.6 / 26.4 |
 | LFM2.5-24B-A2B | 5,007 / 4,593 / 2,404 | 38.3 / 34.7 / 26.8 |
 | LFM2.5-24B-A2B FP8 | 4,972 / 4,149 / 2,261 | 52.7 / 46.0 / 33.0 |
 | Muse-Glimmer-30B FP8 | 580 / 328 / 136 | 7.5 / 7.1 / 6.7 |
@@ -730,9 +730,8 @@ decode tok/s
 Measured on the [strix-vllm](https://github.com/asf0/strix-vllm) fork's
 Docker image rather than unpatched upstream: only the fork streams the 102 GB
 n-gram table from disk (`engram_config={"disk_offload": true}`; it does not fit
-in 128 GB alongside the model) and gives the QSA layers an int8 KV cache. The
-served settings: int8 KV, 16,384-token prefill chunks,
-`--gpu-memory-utilization 0.85`; no MTP in these runs.
+in 128 GB alongside the model). The served settings: fp8 KV, 16,384-token
+prefill chunks, `--gpu-memory-utilization 0.85`; no MTP in these runs.
 
 "stock" is every libstrix kernel off except `gdn_conv`. With stock vLLM's GDN
 causal conv the engine fails at startup: the next n-gram lookup reads
@@ -744,27 +743,27 @@ bf16 stock was not run on the image.
 
 prefill tok/s
 
-| depth | bf16 stock | bf16 strix | x | int8 stock | int8 strix | x |
+| depth | bf16 stock | bf16 strix | x | fp8 stock | fp8 strix | x |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2,048 | - | 1,515 | - | 717 | 1,387 | 1.93x |
-| 8,192 | - | 1,521 | - | 725 | 1,746 | 2.41x |
-| 16,384 | - | 1,717 | - | 615 | 1,676 | 2.73x |
-| 32,768 | - | 1,695 | - | 677 | 1,708 | 2.52x |
-| 65,536 | - | 1,655 | - | 698 | 1,652 | 2.37x |
-| 131,072 | - | 1,555 | - | 710 | 1,518 | 2.14x |
-| 261,120 | - | 1,538 | - | 702 | 1,423 | 2.03x |
+| 2,048 | - | 1,593 | - | 881 | 1,604 | 1.82x |
+| 8,192 | - | 1,755 | - | 978 | 1,759 | 1.80x |
+| 16,384 | - | 1,750 | - | 996 | 1,742 | 1.75x |
+| 32,768 | - | 1,717 | - | 1,000 | 1,707 | 1.71x |
+| 65,536 | - | 1,652 | - | 996 | 1,646 | 1.65x |
+| 131,072 | - | 1,558 | - | 978 | 1,547 | 1.58x |
+| 261,120 | - | 1,526 | - | 947 | 1,448 | 1.53x |
 
 decode tok/s
 
-| depth | bf16 stock | bf16 strix | x | int8 stock | int8 strix | x |
+| depth | bf16 stock | bf16 strix | x | fp8 stock | fp8 strix | x |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2,048 | - | 25.40 | - | 16.09 | 24.42 | 1.52x |
-| 8,192 | - | 24.93 | - | 16.77 | 24.52 | 1.46x |
-| 16,384 | - | 25.70 | - | 14.95 | 25.96 | 1.74x |
-| 32,768 | - | 25.31 | - | 14.84 | 24.41 | 1.64x |
-| 65,536 | - | 28.47 | - | 16.02 | 27.53 | 1.72x |
-| 131,072 | - | 25.26 | - | 17.22 | 24.16 | 1.40x |
-| 261,120 | - | 27.64 | - | 16.97 | 26.90 | 1.59x |
+| 2,048 | - | 23.64 | - | 17.25 | 26.02 | 1.51x |
+| 8,192 | - | 26.82 | - | 16.89 | 25.92 | 1.53x |
+| 16,384 | - | 26.50 | - | 15.26 | 26.77 | 1.75x |
+| 32,768 | - | 26.61 | - | 16.85 | 26.03 | 1.54x |
+| 65,536 | - | 28.21 | - | 17.44 | 27.59 | 1.58x |
+| 131,072 | - | 26.43 | - | 16.74 | 25.53 | 1.53x |
+| 261,120 | - | 26.01 | - | 16.65 | 25.62 | 1.54x |
 
 Reading it:
 
@@ -785,11 +784,12 @@ Reading it:
   removes the rest.
 - **Decode gather.** A decode step reads 16 rows, often uncached; tasks of 4
   rows fault them in parallel, which makes a decode step 5.5 % faster at 2k.
-- **bf16 against int8 KV**: the same prefill. Interleaved in one session
-  (`--max-model-len 133120`), TTFT at 32k was 20.0 and 22.8 s with int8
-  against 20.1 and 23.1 s with bf16, at 128k 83.5 and 86.5 s against 85.3 and
-  84.4 s. Decode is about 3 % faster with bf16 (35.1 against 36.3 ms per step
-  at 128k).
+- **bf16 against fp8 KV**: the same prefill to 128k, where the union kernel
+  reads a bf16 copy of the request's fp8 pages (cast once per layer). Past its
+  128k bitmap the copy goes to vLLM's Triton kernel: 1,448 tok/s at 261k
+  against 1,526 with bf16. fp8 holds about twice the tokens (2,088,315 against
+  1,110,621 at 0.85 without MTP) and decodes 3 % slower at 128k (25.5 against
+  26.4 tok/s).
 - **MTP 2** (the recipe default) decodes at 40-43 tok/s on real text (the vLLM
   docs as prompts); the random-token prompts here would accept fewer drafts.
 

@@ -27,7 +27,7 @@ plugin is a no-op on every other GPU.
 Against stock upstream vLLM on one gfx1151 APU, single stream, int8 KV
 (full tables in [docs/performance.md](docs/performance.md)):
 
-- **Prefill** 1.7-4.4× faster at 2k and 11-31× at 64k (Flash-Next 2.4×,
+- **Prefill** 1.7-4.4× faster at 2k and 11-31× at 64k (Flash-Next 1.7×,
   against a different baseline; Flint FP8 8.8× at 2k); at 256k the 35B
   prefills in 241 s against 7,568 s stock.
 - **Decode** 1.9-2.4× on the 35B, LFM2.5 and the INT8 27B, 3-7× on gemma-4 at
@@ -108,7 +108,7 @@ capacity, the settings you can override (`GPU_UTIL`, `MAX_MODEL_LEN`, `MTP`,
 
 The image ships the [strix-vllm](https://github.com/asf0/strix-vllm) fork
 rather than stock vLLM: it streams Qwen3.8-Flash-Next's n-gram table from
-disk and gives its QSA layers an int8 KV cache, runs Flint on ROCm, supports
+disk, runs Flint on ROCm, supports
 `--use-replayssm` on the Qwen GDN models, hands Flint's and LFM2.5's hidden
 states to their DFlash 2 and DSpark drafts, and gives draft models their own
 KV cache pool. The kernels themselves run on stock vLLM.
