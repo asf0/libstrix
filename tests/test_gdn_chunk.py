@@ -71,3 +71,36 @@ def test_strided_qkv_views():
     ref_o, ref_final = strix.gdn_chunk_fwd(q, k, v, g, beta, state, cu)
     torch.testing.assert_close(o, ref_o, rtol=0, atol=0)
     torch.testing.assert_close(final, ref_final, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "backend,forward",
+    [("triton", "forward_native"), ("hip", "forward_hip"), ("aiter_flydsl", None)],
+)
+def test_layer_takes_over(monkeypatch, backend, forward):
+    """The strix chunk replaces vLLM's Triton/FLA and gfx1151 HIP prefill
+    kernels (HIP is vLLM's default on gfx1151) and keeps the chosen one as
+    the fallback; other backends stay as vLLM chose."""
+    layer = pytest.importorskip("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn")
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.custom_op import op_registry_oot
+
+    if forward is not None and not hasattr(layer.ChunkGatedDeltaRule, forward):
+        pytest.skip(f"this vLLM has no {forward}")
+    if "ChunkGatedDeltaRule" not in op_registry_oot:
+        from strix_vllm import gdn
+
+        gdn.register()
+    monkeypatch.setattr(
+        layer, "_resolve_gdn_prefill_backend", lambda config: ("auto", backend)
+    )
+    monkeypatch.setattr(layer, "_log_gdn_backend_decision", lambda *args: None)
+    with set_current_vllm_config(VllmConfig()):
+        op = layer.ChunkGatedDeltaRule()
+    assert type(op).__name__ == "StrixChunkGatedDeltaRule"
+    if forward is None:
+        assert op._forward_method == op._fallback
+        assert op._forward_method != op.forward_strix
+    else:
+        assert op._forward_method == op.forward_strix
+        assert op._fallback == getattr(op, forward)

@@ -116,15 +116,18 @@ def fp16_activations_ok(op: str) -> bool:
     return ok
 
 
-def _cache_factor() -> str:
-    """STRIX_DISABLE, STRIX_ENABLE and a digest of the plugin's Python source.
+def _cache_factor(active: bool) -> str:
+    """Whether the plugin is active, STRIX_DISABLE, STRIX_ENABLE and a digest
+    of the plugin's Python source.
 
     Some swaps (OOT norm, W8A16 apply, GEMM wrapper) live in code that
     torch.compile traces, and vLLM keys its compile caches on its own env vars
     and config only, so without this a graph traced with the plugin off (or an
-    older plugin) is replayed with it on.
+    older plugin) is replayed with it on. Activity counts on its own: a host
+    whose first GPU is not the gfx1151 traces with the plugin inactive.
     """
-    h = hashlib.sha256(os.environ.get("STRIX_DISABLE", "").encode())
+    h = hashlib.sha256(b"active" if active else b"inactive")
+    h.update(os.environ.get("STRIX_DISABLE", "").encode())
     h.update(os.environ.get("STRIX_ENABLE", "").encode())
     for f in sorted(Path(__file__).parent.glob("*.py")):
         h.update(f.read_bytes())
@@ -138,19 +141,21 @@ def register() -> None:
     _registered = True
 
     from vllm import envs
-
-    key = _cache_factor()
-    envs.environment_variables.setdefault(CACHE_FACTOR, lambda: key)
-
     from vllm.logger import init_logger
     from vllm.platforms import current_platform
+
+    gfx1151 = False
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx1151
+
+        gfx1151 = on_gfx1151()
+    key = _cache_factor(gfx1151)
+    envs.environment_variables.setdefault(CACHE_FACTOR, lambda: key)
 
     logger = init_logger(f"vllm.{__name__}")
     if not current_platform.is_rocm():
         return
-    from vllm.platforms.rocm import on_gfx1151
-
-    if not on_gfx1151():
+    if not gfx1151:
         logger.info("libstrix: not gfx1151, plugin inactive")
         return
     if disabled("all"):

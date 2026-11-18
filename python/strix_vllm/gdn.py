@@ -208,10 +208,18 @@ def register() -> None:
     @ChunkGatedDeltaRule.register_oot
     class StrixChunkGatedDeltaRule(ChunkGatedDeltaRule):
         # ChunkGatedDeltaRule picks its forward in __init__ rather than through
-        # CustomOp dispatch; take over only where it chose Triton/FLA.
+        # CustomOp dispatch; take over where it chose Triton/FLA or vLLM's
+        # gfx1151 HIP kernel (its default there), which is slower: prefill
+        # 1,744 vs 1,580 tok/s at 16k on Qwen3.8-Flash-Next (1,553 vs 1,419
+        # at 128k), 3,574 vs 3,363 at 2k on Qwen3.6-35B-A3B FP8.
+        # Shapes the strix kernel does not take go to the chosen kernel.
         def __init__(self) -> None:
             super().__init__()
-            if self._forward_method == self.forward_native:
+            self._fallback = self._forward_method
+            if self._forward_method in (
+                self.forward_native,
+                getattr(self, "forward_hip", None),
+            ):
                 self._forward_method = self.forward_strix
 
         def forward_strix(
@@ -242,7 +250,7 @@ def register() -> None:
                 and all(t.stride(-1) == 1 for t in (q, k, v))
             )
             if not supported:
-                return self.forward_native(
+                return self._fallback(
                     q,
                     k,
                     v,

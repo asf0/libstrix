@@ -80,6 +80,37 @@ def num_splits(max_seq_len: int) -> int:
     return max(1, min(32, (max_seq_len + 1023) // 1024))
 
 
+def _extensible_kv_cache_off() -> None:
+    """Default vLLM's extensible KV cache off (an explicit setting stands).
+
+    The gfx1151 Triton kernel splits a KV view past 2 GiB into up to four
+    pieces for 32-bit addressing and passes each piece's base pointer. The
+    extensible cache maps its pages only after warmup, so during warmup a
+    piece's base is unmapped and Triton's launcher refuses it ("Pointer
+    argument ... cannot be accessed from Triton"). Sizing the cache the
+    classic way plans as much KV here (Qwen3.8-Flash-Next, 0.85: 1,110,621
+    tokens against 1,057,882).
+    """
+    from vllm.config import VllmConfig
+
+    orig = getattr(VllmConfig, "_resolve_extensible_kv_cache", None)
+    if orig is None:
+        return
+    orig = getattr(orig, "strix_orig", orig)  # wrap once
+
+    def _resolve_extensible_kv_cache(self) -> None:
+        cache = self.cache_config
+        if (
+            not cache._extensible_kv_cache_resolved
+            and cache.enable_extensible_kv_cache is None
+        ):
+            cache.enable_extensible_kv_cache = False
+        orig(self)
+
+    _resolve_extensible_kv_cache.strix_orig = orig
+    VllmConfig._resolve_extensible_kv_cache = _resolve_extensible_kv_cache
+
+
 def register() -> None:
     from vllm.v1.attention.backends.registry import (
         AttentionBackendEnum,
@@ -95,6 +126,7 @@ def register() -> None:
         from strix_vllm import triton_unified_attention
 
         triton_attn.unified_attention = triton_unified_attention.unified_attention
+        _extensible_kv_cache_off()
 
     if disabled("attn_prefill"):
         return
@@ -149,6 +181,26 @@ def _classes():
                 and not self.logits_soft_cap
                 and self.chunk_lookback == -1
             )
+
+        def _int8_kv_views(self, kv_cache):
+            """Byte and fp32 scale views of the packed int8 cache.
+
+            The parent carves the scale views once, on the first call. An
+            extensible KV cache backs only part of the cache during warmup
+            and rebuilds its views at the final size afterwards. The parent's
+            kernel reads only pointers and strides, but ours checks the
+            shape, so the views are carved again when the block count or the
+            storage changes.
+            """
+            ks = self._k_scale_cache
+            if ks is not None and (
+                ks.shape[0] != kv_cache.shape[0]
+                or ks.untyped_storage().data_ptr()
+                != kv_cache.untyped_storage().data_ptr()
+            ):
+                self._k_scale_cache = self._v_scale_cache = None
+            key_cache, value_cache = self._pth_key_value_caches(kv_cache)
+            return key_cache, value_cache, self._k_scale_cache, self._v_scale_cache
 
         def forward(
             self,
@@ -209,8 +261,9 @@ def _classes():
                     )
                     k_scale = v_scale = None
                 else:
-                    key_cache, value_cache = self._pth_key_value_caches(kv_cache)
-                    k_scale, v_scale = self._k_scale_cache, self._v_scale_cache
+                    key_cache, value_cache, k_scale, v_scale = self._int8_kv_views(
+                        kv_cache
+                    )
                 seen = attn_metadata.max_seq_len
                 if window_left >= 0:
                     seen = min(seen, window_left + 1)
@@ -262,8 +315,7 @@ def _classes():
                 # Packed int8 cache: [K | K_scale | V | V_scale] per slot, and
                 # the parent already carves the byte and fp32 scale views for
                 # its own kernel (it also writes them on cache update).
-                key_cache, value_cache = self._pth_key_value_caches(kv_cache)
-                k_scale, v_scale = self._k_scale_cache, self._v_scale_cache
+                key_cache, value_cache, k_scale, v_scale = self._int8_kv_views(kv_cache)
             strix.attn_prefill(
                 output[:n].view(n, self.num_heads, self.head_size),
                 query[:n],

@@ -92,7 +92,7 @@ RUN --mount=type=bind,from=strix-vllm-local,target=/mnt/strix-vllm \
     && git -C /src/strix-vllm rev-parse HEAD > /src/strix-vllm.ref
 # The fork clone has no upstream release tags; stamp the release it is based on
 # plus the fork commit instead of setuptools-scm's 0.1.devN fallback.
-ARG VLLM_BASE_VERSION=0.33.0
+ARG VLLM_BASE_VERSION=0.34.0
 RUN cd /src/strix-vllm \
     && VLLM_VERSION_OVERRIDE="$VLLM_BASE_VERSION+strix.g$(cut -c1-10 /src/strix-vllm.ref)" \
        MAX_JOBS=$MAX_JOBS pip install --no-build-isolation --no-deps .

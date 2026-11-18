@@ -7,8 +7,10 @@ strix::qsa_union_attn_bf16.
 Groups of 16 consecutive query rows attend over the union of their selected
 tokens (csrc/attn/qsa_union_bf16.hip): 1.51x the RDNA-tuned Triton per-row
 kernel on a 26k-token prompt's real selections, more as the context grows.
-Everything else (decode, several requests, other shapes, positions past the
-128k union bitmap) keeps vLLM's Triton kernel.
+An fp8 cache (--kv-cache-dtype=fp8) is cast to bf16 per request first:
+vLLM's kernel on fp8 K/V is 4-7.6x slower. Everything else (decode, several
+requests, other shapes, positions past the 128k union bitmap) keeps vLLM's
+Triton kernel.
 
 vLLM's AMD QSA module imports `qsa_sparse_paged_attention` from
 `vllm.models.qwen4_exp.amd.ops.qsa` at call time, so swapping the module
@@ -35,6 +37,8 @@ from strix_vllm import disabled
 # STRIX_QSA_UNION_MIN_ROWS lowers the floor for accuracy runs on short prompts.
 _MIN_ROWS = int(os.environ.get("STRIX_QSA_UNION_MIN_ROWS", "1024"))
 _MAX_POSITIONS = 131072
+# vLLM's fp8 QSA cache (--kv-cache-dtype=fp8), viewed in the platform's flavor.
+_FP8 = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
 
 def _union_shape_ok(q, k_cache, v_cache, logical_indices, block_table) -> bool:
@@ -45,7 +49,7 @@ def _union_shape_ok(q, k_cache, v_cache, logical_indices, block_table) -> bool:
         and block_table.shape[0] == 1
         and q.dtype == torch.bfloat16
         and k_cache.dtype == v_cache.dtype
-        and k_cache.dtype in (torch.bfloat16, torch.int8)
+        and k_cache.dtype in (torch.bfloat16, torch.int8, *_FP8)
         and q.dim() == 3
         and q.shape[2] == 256
         and q.stride(2) == 1
@@ -63,6 +67,14 @@ def _dequant_pages(cache, scale, block_table, tokens):
     as a contiguous bf16 cache [pages, block, Hkv, 256], scaled in fp32."""
     pages = block_table[0, : -(-tokens // cache.shape[1])].long()
     return (cache[pages].float() * scale[pages][..., None]).to(torch.bfloat16)
+
+
+def _fp8_pages(cache, block_table, tokens):
+    """The request's first `tokens` positions of an fp8 cache as a contiguous
+    bf16 cache [pages, block, Hkv, 256]. vLLM's fp8 QSA cache has unit scales
+    (its layer refuses others), so e4m3 -> bf16 is an exact cast."""
+    pages = block_table[0, : -(-tokens // cache.shape[1])].long()
+    return cache[pages].to(torch.bfloat16)
 
 
 _HC_MIN_ROWS = 512
@@ -222,14 +234,35 @@ def _register_qsa_union() -> None:
         # An int8 cache and STRIX_QSA_UNION_F16 need that length anyway: the
         # kernel gathers from a compact fp16 copy of the visible K/V.
         capacity = block_table.shape[1] * k_cache.shape[1]
+        fp8 = k_cache.dtype in _FP8
         tokens = 0
-        if int8 or _F16 or capacity > _MAX_POSITIONS:
+        if int8 or fp8 or _F16 or capacity > _MAX_POSITIONS:
             tokens = int(logical_indices.max()) + 1
             if tokens <= 0:  # nothing selected: the Triton kernel writes zeros
                 return orig(
                     q, k_cache, v_cache, logical_indices, block_table, token_to_req,
                     out, **scales,
                 )
+        if fp8:
+            # vLLM's Triton kernel on fp8 K/V is 4-7.6x slower than the union
+            # kernel on bf16 (16k rows: 1891 vs 250 ms per layer at 16k context,
+            # 2068 vs 524 ms at 128k), so cast the request's pages to bf16
+            # once per layer and take the bf16 union path. Past the bitmap the
+            # bf16 copy goes to vLLM's kernel, which reads bf16 faster than fp8
+            # (261k-token prefill 1,267 vs 1,221 tok/s with the fp8 cache
+            # passed straight through).
+            k16 = _fp8_pages(k_cache, block_table, tokens)
+            v16 = _fp8_pages(v_cache, block_table, tokens)
+            pages = torch.arange(k16.shape[0], device=q.device, dtype=torch.int32)
+            if tokens > _MAX_POSITIONS:
+                return orig(q, k16, v16, logical_indices, pages[None], token_to_req, out)
+            if out is None:
+                out = torch.empty_like(q)
+            torch.ops.strix.qsa_union_attn_bf16(
+                out, q, k16, v16, logical_indices, pages, tokens if _F16 else 0,
+                None, None,
+            )
+            return out
         if tokens > _MAX_POSITIONS or (int8 and _UNION_ROWS != 16):
             if not int8:
                 return orig(
