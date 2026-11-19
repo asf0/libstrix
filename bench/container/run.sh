@@ -38,7 +38,11 @@ npu=()
 if [ "${STRIX_NPU:-0}" = 1 ]; then
   npu=(--device /dev/accel/accel0 --ulimit memlock=-1)
 fi
-exec docker run --rm --device /dev/kfd --device /dev/dri "${npu[@]}" --ipc host \
+# STRIX_DRI as in docker/recipes/.env (default /dev/dri): the gfx1151 only.
+if [ -z "${STRIX_DRI:-}" ] && [ -f "$repo/docker/recipes/.env" ]; then
+  STRIX_DRI=$(sed -n 's/^STRIX_DRI=//p' "$repo/docker/recipes/.env" | tail -1)
+fi
+exec docker run --rm --device /dev/kfd --device "${STRIX_DRI:-/dev/dri}" "${npu[@]}" --ipc host \
   --security-opt seccomp=unconfined \
   -v "$MODELS":/models:ro -v "$repo":/work "${cache_mount[@]}" -w /work \
   "${envs[@]}" "${IMAGE:-strix-vllm:test}" "$@"

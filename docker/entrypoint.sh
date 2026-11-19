@@ -65,8 +65,25 @@ trap 'stop TERM' TERM INT
 
 min_kb=$(( ${STRIX_MIN_AVAIL_GB:-9} * 1024 * 1024 ))
 gpu_min=$(( ${STRIX_MIN_GPU_FREE_GB:-14} * 1024 * 1024 * 1024 ))
-gtt=$(ls -d /sys/class/drm/card*/device 2>/dev/null | while read -r d; do
-  [ -r "$d/mem_info_gtt_used" ] && echo "$d" && break; done)
+# Watch the gfx1151's GTT: /sys/class/drm lists every GPU in the machine, also
+# ones the container cannot open (KFD refuses to describe those).
+strix_render=
+for node in /sys/class/kfd/kfd/topology/nodes/*; do
+  gfx=0 minor=
+  while read -r key val; do
+    case $key in gfx_target_version) gfx=$val ;; drm_render_minor) minor=$val ;; esac
+  done < "$node/properties" 2>/dev/null
+  if [ "$gfx" = 110501 ] && [ -e "/dev/dri/renderD$minor" ]; then
+    strix_render=$minor
+    break
+  fi
+done
+if [ -n "$strix_render" ] && [ -r "/sys/class/drm/renderD$strix_render/device/mem_info_gtt_used" ]; then
+  gtt=/sys/class/drm/renderD$strix_render/device
+else
+  gtt=$(ls -d /sys/class/drm/card*/device 2>/dev/null | while read -r d; do
+    [ -r "$d/mem_info_gtt_used" ] && echo "$d" && break; done)
+fi
 gtt_total=0
 [ -n "$gtt" ] && read -r gtt_total < "$gtt/mem_info_gtt_total"
 overcommit() { # $1 = reason

@@ -4,7 +4,7 @@ services:
     image: ${IMAGE:-ghcr.io/asf0/strix-vllm:latest}
     devices:
       - /dev/kfd:/dev/kfd
-      - /dev/dri:/dev/dri
+      - ${STRIX_DRI:-/dev/dri}:${STRIX_DRI:-/dev/dri}
     ipc: host
     security_opt:
       - seccomp=unconfined
