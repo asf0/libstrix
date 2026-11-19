@@ -17,7 +17,10 @@ services:
       HF_REPO: wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16
     command:
       - /models/Qwen3.8-Flash-Next-AWQ-W4A16
-      - '--speculative-config={"method": "dflash", "model": "/models/Qwen3.8-Flash-Next-DFlash2", "num_speculative_tokens": ${SPEC_TOKENS:-4}}'
+      # The draft on TRITON_ATTN: ROCM_ATTN takes only layer-major KV layouts, the
+      # target's QSA indexer only block-major ones, and startup fails with "No KV
+      # cache layout satisfies every supported set".
+      - '--speculative-config={"method": "dflash", "model": "/models/Qwen3.8-Flash-Next-DFlash2", "num_speculative_tokens": ${SPEC_TOKENS:-4}, "attention_backend": "TRITON_ATTN"}'
       - --mm-encoder-attn-backend=TRITON_ATTN
       - '--engram-config={"disk_offload": true}'
       - --kv-cache-dtype=fp8
