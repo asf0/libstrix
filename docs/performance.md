@@ -842,8 +842,8 @@ Reading it:
   banks it runs while the GPU does the other bank's layer.
 - **Memory.** The NPU pins ~3 GB (weight panels and two banks of arenas),
   opened during vLLM's memory profile: 412,699 KV tokens at `GPU_UTIL=0.82`
-  against 471,150 without the NPU. At 0.85 the memory guard stopped vLLM
-  (host MemAvailable 9 GiB); 32k prefill chunks do not fit with the NPU
+  against 471,150 without the NPU. At 0.85 host MemAvailable falls to
+  9 GiB, the memory guard's limit; 32k prefill chunks do not fit with the NPU
   (1.33 GiB of KV cache left at 0.80).
 - **Which steps.** Steps below 4,096 tokens, steps carrying draft rows and
   graph capture keep the GPU path, so decode and short prompts do not change;

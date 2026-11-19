@@ -146,9 +146,9 @@ GPU_UTIL=0.82 docker compose -f qwen3.8-27b.yaml \
 | --- | --- |
 | kernel 7.4+, `amdxdna` loaded (`/dev/accel/accel0`), the IOMMU enabled with the GPU in a passthrough (identity) group | the override passes the device in; `amd_iommu=off`, the GPU-only recommendation, keeps the NPU off |
 | `ulimits: memlock: -1` (in the override) | weight panels and arenas are pinned host memory |
-| `GPU_UTIL=0.78-0.82` (Flash-Next DFlash 2) | at 0.85 the memory guard stopped vLLM at the first long prompt (MemAvailable 9 GiB); 0.78 keeps 4.59 GiB of KV (203,692 tokens) and served a full benchmark, 0.82 keeps 412,699 KV tokens with the NPU, 471,150 without |
+| `GPU_UTIL=0.78-0.82` (Flash-Next DFlash 2) | at 0.85 host MemAvailable falls to 9 GiB at the first long prompt, the memory guard's limit; 0.78 keeps 4.59 GiB of KV (203,692 tokens) and served a full benchmark, 0.82 keeps 412,699 KV tokens with the NPU, 471,150 without |
 | `GPU_UTIL=0.80` (Flash-Next with MTP) | the MTP drafter adds ~4 GiB: at 0.78 only 1.6 GiB of KV is left and the 131,072-token context no longer fits. 0.82 boots shallow work fine but the memory guard stops vLLM during 32k+-prompt benches (connection resets, reproduced twice); a probe confirmed 0.80 serves 57k-token prompts |
-| `GPU_UTIL=0.82` (the 27B) | at 0.85 the memory guard stopped vLLM at startup (MemAvailable 6 GiB); at 0.82 the NPU opens during the startup profile run and its panels pin ~10.5 GiB before the KV cache is sized: 826,647 KV tokens with the NPU resident (1,121,559 without), 6.31 requests at 131k |
+| `GPU_UTIL=0.82` (the 27B) | at 0.85 host MemAvailable falls to 6 GiB at startup, below the memory guard; at 0.82 the NPU opens during the startup profile run and its panels pin ~10.5 GiB before the KV cache is sized: 826,647 KV tokens with the NPU resident (1,121,559 without), 6.31 requests at 131k |
 
 The log shows `libstrix: npu prefill on: 46 layers resident` (Flash-Next) or
 `libstrix: npu prefill on (Qwen3.5): 47 GDN layers ...` (the 27B) after startup.
