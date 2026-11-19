@@ -31,7 +31,7 @@ services:
       HF_TOKEN: ${HF_TOKEN:-}
       # The entrypoint stops vLLM below this much free host RAM, or this much
       # free GPU memory cap (0 = off); see entrypoint.sh.
-      STRIX_MIN_AVAIL_GB: ${STRIX_MIN_AVAIL_GB:-10}
+      STRIX_MIN_AVAIL_GB: ${STRIX_MIN_AVAIL_GB:-9}
       STRIX_MIN_GPU_FREE_GB: ${STRIX_MIN_GPU_FREE_GB:-14}
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]

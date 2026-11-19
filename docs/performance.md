@@ -925,7 +925,7 @@ Reading it:
 - **Memory.** The panels (~10.5 GiB) pin during vLLM's memory profile, so
   they are counted before the KV cache is sized: 826,647 KV tokens at
   `GPU_UTIL=0.82` against 1,121,559 without, host `MemAvailable` 18.4 GiB
-  with the NPU resident (the guard stops vLLM at 10 GiB). At 0.85 the
+  with the NPU resident (the guard stops vLLM at 9 GiB). At 0.85 the
   guard stopped the served engine at startup.
 - **Scope.** The panels are built for K = 5,120 bf16 projections;
   quantized checkpoints and any other shape turn the path off (both

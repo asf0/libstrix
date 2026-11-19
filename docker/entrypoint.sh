@@ -11,7 +11,7 @@
 # gfx1151 GPU memory is host RAM, and the kernel cannot reclaim it: a run that
 # overcommits takes the whole machine down rather than this container. vLLM
 # therefore runs in its own process group, and the group is killed when host
-# MemAvailable drops below STRIX_MIN_AVAIL_GB (default 10), or when less than
+# MemAvailable drops below STRIX_MIN_AVAIL_GB (default 9), or when less than
 # STRIX_MIN_GPU_FREE_GB (default 14) of the GPU's memory cap is left: the
 # driver runs out a few GB before mem_info_gtt_used reaches the cap, and then
 # the kernel OOM-kills the host while MemAvailable still looks healthy.
@@ -63,7 +63,7 @@ done
 stop() { kill "-$1" -- "-$pid" 2>/dev/null || kill "-$1" "$pid" 2>/dev/null || true; }
 trap 'stop TERM' TERM INT
 
-min_kb=$(( ${STRIX_MIN_AVAIL_GB:-10} * 1024 * 1024 ))
+min_kb=$(( ${STRIX_MIN_AVAIL_GB:-9} * 1024 * 1024 ))
 gpu_min=$(( ${STRIX_MIN_GPU_FREE_GB:-14} * 1024 * 1024 * 1024 ))
 gtt=$(ls -d /sys/class/drm/card*/device 2>/dev/null | while read -r d; do
   [ -r "$d/mem_info_gtt_used" ] && echo "$d" && break; done)
@@ -88,7 +88,7 @@ while kill -0 "$pid" 2>/dev/null; do
       [ "$key" = MemAvailable: ] && break
     done < /proc/meminfo
     if (( kb < min_kb )); then
-      overcommit "host MemAvailable $(( kb >> 20 )) GiB < STRIX_MIN_AVAIL_GB=${STRIX_MIN_AVAIL_GB:-10}"
+      overcommit "host MemAvailable $(( kb >> 20 )) GiB < STRIX_MIN_AVAIL_GB=${STRIX_MIN_AVAIL_GB:-9}"
     fi
   fi
   sleep 0.2

@@ -64,7 +64,7 @@ table does not fit next to the weights, so the fork streams it from disk
 Use the AWQ W4A16 checkpoint; bf16 does not fit.
 
 - `GPU_UTIL=0.85` leaves page cache for the table rows; lower prefills slower.
-  0.88 holds more KV but leaves only about 11 GiB of host memory free, 1 GiB
+  0.88 holds more KV but leaves only about 11 GiB of host memory free, 2 GiB
   above the memory guard.
 - 16k prefill chunks (`MAX_BATCHED_TOKENS`) are the measured best.
 - MTP 2 costs about 4 % prefill and more than doubles decode (18 -> 40-43
@@ -174,7 +174,7 @@ entrypoint watches two numbers and stops vLLM (exit 137) before that happens:
 
 | variable | default | stops vLLM when |
 | --- | ---: | --- |
-| `STRIX_MIN_AVAIL_GB` | 10 | host `MemAvailable` drops below this many GB |
+| `STRIX_MIN_AVAIL_GB` | 9 | host `MemAvailable` drops below this many GB |
 | `STRIX_MIN_GPU_FREE_GB` | 14 | less than this many GB are left under the GPU memory cap (the driver fails a few GB before the cap, while `MemAvailable` still looks fine) |
 
 `0` turns a check off. Every recipe stays within both at `GPU_UTIL=0.85` and
