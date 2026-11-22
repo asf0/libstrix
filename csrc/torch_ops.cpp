@@ -21,7 +21,12 @@ void nvfp4_moe_wmma(torch::Tensor& out, const torch::Tensor& act,
                     const torch::Tensor& amax, const torch::Tensor& denominator,
                     const torch::Tensor& tiles, int64_t max_ctas, int64_t tile_rows,
                     const std::optional<torch::Tensor>& gammas, double gate_cap,
-                    double up_cap);
+                    double up_cap, const std::optional<torch::Tensor>& row_token);
+void mxfp8_moe_wmma(torch::Tensor& out, const torch::Tensor& act,
+                    const torch::Tensor& weight, const torch::Tensor& scales,
+                    const torch::Tensor& tiles, int64_t max_ctas, int64_t tile_rows,
+                    const std::optional<torch::Tensor>& gammas, double gate_cap,
+                    double up_cap, const std::optional<torch::Tensor>& row_token);
 void moe_gemm_w4a16(torch::Tensor& c, const torch::Tensor& a,
                     const torch::Tensor& b, const torch::Tensor& scales,
                     const torch::Tensor& sorted_ids,
@@ -203,7 +208,11 @@ TORCH_LIBRARY(strix, m) {
       "nvfp4_moe_wmma(Tensor(a!) out, Tensor act, Tensor packed, Tensor scales, "
       "Tensor amax, Tensor denominator, Tensor tiles, int max_ctas, "
       "int tile_rows, Tensor? gammas=None, float gate_cap=0.0, "
-      "float up_cap=0.0) -> ()");
+      "float up_cap=0.0, Tensor? row_token=None) -> ()");
+  m.def(
+      "mxfp8_moe_wmma(Tensor(a!) out, Tensor act, Tensor weight, Tensor scales, "
+      "Tensor tiles, int max_ctas, int tile_rows, Tensor? gammas=None, "
+      "float gate_cap=0.0, float up_cap=0.0, Tensor? row_token=None) -> ()");
   // Qwen3.8-Flash-Next hyper-connection up GEMM fused with the gated mix.
   m.def("hc_up_gate_mix_bf16(Tensor(a!) y, Tensor x, Tensor a, Tensor w) -> ()");
   // Qwen3.8-Flash-Next QSA indexer scores (single request).
@@ -321,6 +330,7 @@ TORCH_LIBRARY_IMPL(strix, CUDA, m) {
   m.impl("moe_gemm_bf16", &strix::moe_gemm_bf16);
   m.impl("moe_gemm_w4a16", &strix::moe_gemm_w4a16);
   m.impl("nvfp4_moe_wmma", &strix::nvfp4_moe_wmma);
+  m.impl("mxfp8_moe_wmma", &strix::mxfp8_moe_wmma);
   m.impl("moe_act_quant_i8", &strix::moe_act_quant_i8);
   m.impl("qsa_union_attn_bf16", &strix::qsa_union_attn_bf16);
   m.impl("qsa_kv_to_f16", &strix::qsa_kv_to_f16);

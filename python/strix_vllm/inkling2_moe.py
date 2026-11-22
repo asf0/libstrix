@@ -305,26 +305,32 @@ def _scatter_bf16_kernel(
     Gammas,
     Rows,
     Values,
+    RowToken,
     H: tl.constexpr,
     TOPK: tl.constexpr,
     LOCAL_POW2: tl.constexpr,
     HEAD: tl.constexpr,
     TAIL: tl.constexpr,
+    COPY: tl.constexpr,
 ):
-    """`_scatter_kernel` that copies the bf16 row instead of quantizing it."""
+    """`_scatter_kernel` that copies the bf16 row instead of quantizing it
+    (COPY), or records each layout row's token for kernels that gather."""
     token = tl.program_id(0).to(tl.int64)
-    head = tl.load(X + token * H + tl.arange(0, HEAD))
-    if TAIL > 0:
-        tail = tl.load(X + token * H + HEAD + tl.arange(0, TAIL))
     dst = _place_rows(
         Starts, Ids, Ranks, Weights, Src2Dst, Gammas, Rows, token, TOPK, LOCAL_POW2
     )
-    for slot in range(dst.shape[0]):
-        row = _pick(dst, slot).to(tl.int64)
-        if row >= 0:
-            tl.store(Values + row * H + tl.arange(0, HEAD), head)
-            if TAIL > 0:
-                tl.store(Values + row * H + HEAD + tl.arange(0, TAIL), tail)
+    if COPY:
+        head = tl.load(X + token * H + tl.arange(0, HEAD))
+        if TAIL > 0:
+            tail = tl.load(X + token * H + HEAD + tl.arange(0, TAIL))
+        for slot in range(dst.shape[0]):
+            row = _pick(dst, slot).to(tl.int64)
+            if row >= 0:
+                tl.store(Values + row * H + tl.arange(0, HEAD), head)
+                if TAIL > 0:
+                    tl.store(Values + row * H + HEAD + tl.arange(0, TAIL), tail)
+    else:
+        tl.store(RowToken + dst, token.to(tl.int32), dst >= 0)
 
 
 @triton.jit
@@ -369,8 +375,11 @@ def route_bf16(
     expert_bounds,
     plan,
     is_padding=None,
+    gather=False,
 ):
-    """The port's unfused `route`, scattering bf16 rows instead of MXFP8."""
+    """The port's unfused `route`, scattering bf16 rows instead of MXFP8.
+    With `gather`, returns each layout row's token (int32 `[rows]`) in place
+    of the scattered rows, for kernels that read `x` directly."""
     tokens, hidden = x.shape
     experts = gate_weight.shape[0]
     num_local = counts.numel()
@@ -384,7 +393,10 @@ def route_bf16(
     ids = torch.empty(n, dtype=torch.int32, device=device)
     ranks = torch.empty(n, dtype=torch.int32, device=device)
     weights = torch.empty(n, dtype=torch.float32, device=device)
-    values = torch.empty((rows, hidden), dtype=torch.bfloat16, device=device)
+    if gather:
+        values = torch.empty(rows, dtype=torch.int32, device=device)
+    else:
+        values = torch.empty((rows, hidden), dtype=torch.bfloat16, device=device)
     head = 1 << (hidden.bit_length() - 1)
     tail = hidden - head
     partials = k_group_partials(x, gate_weight)
@@ -425,11 +437,13 @@ def route_bf16(
         gammas,
         routed,
         values,
+        values,
         H=hidden,
         TOPK=topk,
         LOCAL_POW2=local_pow2,
         HEAD=head,
         TAIL=tail,
+        COPY=not gather,
         num_warps=2,
     )
     return (src2dst, gammas, routed, tiles), values
@@ -563,10 +577,27 @@ def gemm_nvfp4(act, weight, weight_scale, weight_amax, weight_denominator, tiles
     return out
 
 
+def _mxfp8_scales_ok(weight_scale) -> bool:
+    """Whether every e8m0 scale is in [105, 134], where `mxfp8_moe_wmma`
+    applies it to fp16 weights exactly (checked once, kept on the tensor)."""
+    ok = getattr(weight_scale, "_strix_wmma_scales_ok", None)
+    if ok is None:
+        s = weight_scale.view(torch.uint8)
+        ok = bool((s.min() >= 105).item() and (s.max() <= 134).item())
+        weight_scale._strix_wmma_scales_ok = ok
+    return ok
+
+
 def gemm_mxfp8(act, weight, weight_scale, tiles, plan):
     _, n, k = weight.shape
     out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
     tile = plan.tile
+    if tile >= 64 and n % 128 == 0 and k % 64 == 0 and _mxfp8_scales_ok(weight_scale):
+        # fp16 WMMA, the NVFP4 kernel's MXFP8 variant.
+        torch.ops.strix.mxfp8_moe_wmma(
+            out, act, weight, weight_scale, tiles, plan.max_ctas, tile
+        )
+        return out
     if _gemv_launch(plan, k):
         bn = 32 if n % 32 == 0 else 16
         _mxfp8_gemv_kernel[(n // bn, plan.rows)](
@@ -611,13 +642,44 @@ def _wmma_ok(weight, plan) -> bool:
     return plan.tile >= 64 and weight.shape[1] % 128 == 0 and weight.shape[2] % 32 == 0
 
 
-def gemm_nvfp4_swiglu(act, experts, tiles, plan, gammas):
+def _swiglu_wmma_ok(experts, plan) -> bool:
+    """Whether the w13 GEMM of this batch runs on a WMMA kernel."""
+    weight = experts.w13_weight
+    if experts.nvfp4:
+        return _wmma_ok(weight, plan)
+    n, k = weight.shape[1], weight.shape[2]
+    return (
+        plan.tile >= 64
+        and n % 128 == 0
+        and k % 64 == 0
+        and _mxfp8_scales_ok(experts.w13_weight_scale)
+    )
+
+
+def gemm_nvfp4_swiglu(act, experts, tiles, plan, gammas, row_token=None):
     """w13 GEMM with the softcapped SwiGLU in its epilogue (`[rows, N / 2]`
-    bf16, as `swiglu_bf16` of `gemm_nvfp4`), for batches on the WMMA kernel."""
+    bf16, as `swiglu_bf16` of the GEMM), for batches on a WMMA kernel. With
+    `row_token`, `act` is the token rows and layout row r reads
+    `act[row_token[r]]`."""
     weight = experts.w13_weight
     out = torch.empty(
         (plan.rows, weight.shape[1] // 2), dtype=torch.bfloat16, device=act.device
     )
+    caps = (float(experts.gate_cap or 0.0), float(experts.up_cap or 0.0))
+    if not experts.nvfp4:
+        torch.ops.strix.mxfp8_moe_wmma(
+            out,
+            act,
+            weight,
+            experts.w13_weight_scale,
+            tiles,
+            plan.max_ctas,
+            plan.tile,
+            gammas,
+            *caps,
+            row_token,
+        )
+        return out
     torch.ops.strix.nvfp4_moe_wmma(
         out,
         act,
@@ -629,8 +691,8 @@ def gemm_nvfp4_swiglu(act, experts, tiles, plan, gammas):
         plan.max_ctas,
         plan.tile,
         gammas,
-        float(experts.gate_cap or 0.0),
-        float(experts.up_cap or 0.0),
+        *caps,
+        row_token,
     )
     return out
 
@@ -664,6 +726,7 @@ def moe_forward(self, x: torch.Tensor, pass_idx: int = 0) -> torch.Tensor:
     is_padding = None
     if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
         is_padding = get_forward_context().is_padding
+    fused = FUSED_SWIGLU and _swiglu_wmma_ok(experts, plan)
     routing, act = route_bf16(
         x,
         gate.weight,
@@ -675,11 +738,14 @@ def moe_forward(self, x: torch.Tensor, pass_idx: int = 0) -> torch.Tensor:
         experts.expert_bounds,
         plan,
         is_padding,
+        gather=fused,
     )
     src2dst, gammas, rows, tiles = routing
-    if FUSED_SWIGLU and experts.nvfp4 and _wmma_ok(experts.w13_weight, plan):
-        _pretile_experts(experts)
-        activated = gemm_nvfp4_swiglu(act, experts, tiles, plan, gammas)
+    if fused:
+        if experts.nvfp4:
+            _pretile_experts(experts)
+        # `act` holds each layout row's token: w13 reads the rows of x.
+        activated = gemm_nvfp4_swiglu(x, experts, tiles, plan, gammas, act)
     else:
         gate_up = _expert_gemm(experts, act, "w13", tiles, plan)
         activated = swiglu_bf16(

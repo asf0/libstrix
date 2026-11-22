@@ -15,10 +15,20 @@
 // fp16 with a shift (halved, offsetting the 2x), and one v_pk_mul_f16 scales a
 // pair. The global scale amax[e] / denominator is applied to the fp32 sums.
 //
+// FMT_MXFP8 runs the same kernel on MXFP8 experts (Inkling 2 Mini layers
+// 20-23) in their native layout: e4m3 [E, N, K], e8m0 scales [E, N, K/32].
+// fp16 bits (b & 0x7F) << 7 | (b & 0x80) << 8 are exactly 2^-8 times the e4m3
+// value (subnormals included), and one v_pk_mul_f16 by 2^(s - 119) restores
+// the scaled weight exactly while the scale byte s is in [105, 134] (the
+// caller checks).
+//
 // SWIGLU fuses the port's softcapped SwiGLU into the w13 epilogue: the w13
 // rows are interleaved (gate, up) pairs, so a pair sits in neighbouring lanes;
 // out is [rows, N / 2] of bf16(((softcap(g) * sigmoid(g)) * softcap(u)) * gamma)
 // with g, u the bf16-rounded GEMM outputs, as `_situ_bf16_kernel` computes.
+//
+// With `row_token`, A row r is act[row_token[r]] (act = the token rows, no
+// routed copy); otherwise act[r].
 //
 // Rows come from libstrix's routing layout: expert tile t owns rows
 // [t * TILE, row_end[t]) of `act` / `out` (tiles = [expert..., row_end...,
@@ -89,6 +99,30 @@ __device__ __forceinline__ void unpack_nvfp4_16(uint32_t p0, uint32_t p1,
 
 // cap * tanh(x / cap) with the port's division (`_div_rn`: the product with
 // the rounded reciprocal and one FMA correction, exact for its caps 4, 25).
+// 16 e4m3 bytes and their e8m0 scale byte -> 16 fp16.
+__device__ __forceinline__ void unpack_mxfp8_16(uint4 w, uint32_t scale_byte, uint4& o0,
+                                                uint4& o1) {
+  const uint32_t mult = (scale_byte - 104u) << 10;  // fp16 2^(s - 127 + 8)
+  const uint32_t mult_pk = mult | (mult << 16);
+  const uint32_t words[4] = {w.x, w.y, w.z, w.w};
+  uint32_t dst[8];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t lo = (words[i] & 0xFFu) | ((words[i] & 0xFF00u) << 8);
+    const uint32_t hi = ((words[i] >> 16) & 0xFFu) | ((words[i] >> 8) & 0xFF0000u);
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const uint32_t x = h ? hi : lo;
+      const uint32_t bits = ((x & 0x007F007Fu) << 7) | ((x & 0x00800080u) << 8);
+      uint32_t scaled;
+      asm("v_pk_mul_f16 %0, %1, %2" : "=v"(scaled) : "v"(bits), "v"(mult_pk));
+      dst[i * 2 + h] = scaled;
+    }
+  }
+  o0 = make_uint4(dst[0], dst[1], dst[2], dst[3]);
+  o1 = make_uint4(dst[4], dst[5], dst[6], dst[7]);
+}
+
 __device__ __forceinline__ float softcap(float x, float cap, float inv_cap) {
   float q = x * inv_cap;
   q = fmaf(-fmaxf(fmaf(q, cap, -x), -3.4028234663852886e38f), inv_cap, q);
@@ -96,15 +130,17 @@ __device__ __forceinline__ float softcap(float x, float cap, float inv_cap) {
 }
 
 // One program: M_TILE rows of one expert tile x 128 output columns.
-template <int M_TILE, int W_M, int W_N, bool SWIGLU>
+template <int M_TILE, int W_M, int W_N, bool SWIGLU, bool FMT_MXFP8>
 __global__ __launch_bounds__(32 * W_M * W_N, 2) void nvfp4_moe_wmma_kernel(
-    const uint16_t* __restrict__ act,      // bf16 [rows, K]
-    const uint32_t* __restrict__ packed,   // [E, N/128, K/64, 128, 8] u32
-    const uint32_t* __restrict__ scales,   // [E, N/128, K/64, 128] u32
+    const uint16_t* __restrict__ act,  // bf16 [rows, K]
+    // NVFP4: [E, N/128, K/64, 128, 8] u32 / MXFP8: e4m3 [E, N, K]
+    const void* __restrict__ weight_ptr,
+    // NVFP4: [E, N/128, K/64, 128] u32 / MXFP8: e8m0 [E, N, K/32]
+    const void* __restrict__ scale_ptr,
     const float* __restrict__ amax, const float* __restrict__ denominator,
     const int32_t* __restrict__ tiles, uint16_t* __restrict__ out,  // bf16
     const float* __restrict__ gammas, float gate_cap, float up_cap,
-    int max_ctas, int tile_rows, int n, int k) {
+    const int32_t* __restrict__ row_token, int max_ctas, int tile_rows, int n, int k) {
   constexpr int kThreads = 32 * W_M * W_N;
   constexpr int kWmRows = M_TILE / W_M;
   constexpr int kWnCols = kNTile / W_N;
@@ -156,15 +192,22 @@ __global__ __launch_bounds__(32 * W_M * W_N, 2) void nvfp4_moe_wmma_kernel(
     const int r = idx / 8;
     const int c = (idx % 8) * 8;
     a_valid[it] = r < valid;
-    a_ptr[it] = act + (int64_t)(row0 + (a_valid[it] ? r : 0)) * k + c;
+    const int row = row0 + (a_valid[it] ? r : 0);
+    a_ptr[it] = act + (int64_t)(row_token ? row_token[row] : row) * k + c;
     a_smem[it] = r * kKStride + c;
   }
-  // B: 4 x 16-column scale groups per weight row per K tile.
+  // B: 4 x 16-column groups per weight row per K tile.
   constexpr int kBIters = (kNTile * 4) / kThreads;
   const int k_tiles = k / kKTile;
   const int64_t tile0 = ((int64_t)expert * n_tiles + n_blk) * k_tiles;
+  const uint32_t* packed = static_cast<const uint32_t*>(weight_ptr);
+  const uint32_t* scales = static_cast<const uint32_t*>(scale_ptr);
+  const uint8_t* w8 = static_cast<const uint8_t*>(weight_ptr);
+  const uint8_t* s8 = static_cast<const uint8_t*>(scale_ptr);
   const uint32_t* b_pack[kBIters];
   const uint32_t* b_scale[kBIters];
+  const uint8_t* b_w8[kBIters];
+  const uint8_t* b_s8[kBIters];
   int b_kk[kBIters];
   int b_smem[kBIters];
 #pragma unroll
@@ -172,8 +215,14 @@ __global__ __launch_bounds__(32 * W_M * W_N, 2) void nvfp4_moe_wmma_kernel(
     const int idx = it * kThreads + tid;
     const int r = idx / 4;
     const int kk = idx % 4;
-    b_scale[it] = scales + tile0 * kNTile + r;
-    b_pack[it] = packed + (tile0 * kNTile + r) * 8 + kk * 2;
+    if constexpr (FMT_MXFP8) {
+      const int64_t wrow = (int64_t)expert * n + n_blk * kNTile + r;
+      b_w8[it] = w8 + wrow * k + kk * 16;
+      b_s8[it] = s8 + wrow * (k / 32) + kk / 2;
+    } else {
+      b_scale[it] = scales + tile0 * kNTile + r;
+      b_pack[it] = packed + (tile0 * kNTile + r) * 8 + kk * 2;
+    }
     b_kk[it] = kk;
     b_smem[it] = r * kKStride + kk * 16;
   }
@@ -186,6 +235,7 @@ __global__ __launch_bounds__(32 * W_M * W_N, 2) void nvfp4_moe_wmma_kernel(
 
   uint4 reg_a[kAIters];
   uint2 reg_p[kBIters];
+  uint4 reg_w[kBIters];
   uint32_t reg_s[kBIters];
   auto prefetch = [&](int kt) {
 #pragma unroll
@@ -195,8 +245,13 @@ __global__ __launch_bounds__(32 * W_M * W_N, 2) void nvfp4_moe_wmma_kernel(
                       : make_uint4(0, 0, 0, 0);
 #pragma unroll
     for (int it = 0; it < kBIters; ++it) {
-      reg_s[it] = b_scale[it][(int64_t)kt * kNTile];
-      reg_p[it] = *reinterpret_cast<const uint2*>(b_pack[it] + (int64_t)kt * (kNTile * 8));
+      if constexpr (FMT_MXFP8) {
+        reg_w[it] = *reinterpret_cast<const uint4*>(b_w8[it] + kt * kKTile);
+        reg_s[it] = b_s8[it][kt * 2];
+      } else {
+        reg_s[it] = b_scale[it][(int64_t)kt * kNTile];
+        reg_p[it] = *reinterpret_cast<const uint2*>(b_pack[it] + (int64_t)kt * (kNTile * 8));
+      }
     }
   };
 
@@ -208,8 +263,12 @@ __global__ __launch_bounds__(32 * W_M * W_N, 2) void nvfp4_moe_wmma_kernel(
 #pragma unroll
     for (int it = 0; it < kBIters; ++it) {
       uint4 o0, o1;
-      unpack_nvfp4_16(reg_p[it].x, reg_p[it].y, (reg_s[it] >> (b_kk[it] * 8)) & 0xFFu,
-                      o0, o1);
+      if constexpr (FMT_MXFP8) {
+        unpack_mxfp8_16(reg_w[it], reg_s[it], o0, o1);
+      } else {
+        unpack_nvfp4_16(reg_p[it].x, reg_p[it].y, (reg_s[it] >> (b_kk[it] * 8)) & 0xFFu,
+                        o0, o1);
+      }
       uint4* sp = reinterpret_cast<uint4*>(smem_b + b_smem[it]);
       sp[0] = o0;
       sp[1] = o1;
@@ -243,7 +302,7 @@ __global__ __launch_bounds__(32 * W_M * W_N, 2) void nvfp4_moe_wmma_kernel(
   }
 
   // WMMA C layout: element i of a lane is row half_lane + 2 i, column lane16.
-  const float outer = amax[expert] / denominator[0];
+  const float outer = FMT_MXFP8 ? 1.f : amax[expert] / denominator[0];
   const bool gate_lane = (lane16 & 1) == 0;
   const float my_cap = gate_lane ? gate_cap : up_cap;
   const float my_inv_cap = my_cap > 0.f ? 1.f / my_cap : 0.f;
@@ -291,58 +350,57 @@ __global__ __launch_bounds__(32 * W_M * W_N, 2) void nvfp4_moe_wmma_kernel(
 
 }  // namespace
 
-void nvfp4_moe_wmma(torch::Tensor& out, const torch::Tensor& act,
-                    const torch::Tensor& packed, const torch::Tensor& scales,
-                    const torch::Tensor& amax, const torch::Tensor& denominator,
-                    const torch::Tensor& tiles, int64_t max_ctas, int64_t tile_rows,
-                    const std::optional<torch::Tensor>& gammas, double gate_cap,
-                    double up_cap) {
+namespace {
+
+template <bool FMT_MXFP8>
+void launch_moe_wmma(torch::Tensor& out, const torch::Tensor& act, const void* weight,
+                     const void* scales, const float* amax, const float* denominator,
+                     const torch::Tensor& tiles, int64_t max_ctas, int64_t tile_rows,
+                     int64_t n, int64_t k, const std::optional<torch::Tensor>& gammas,
+                     double gate_cap, double up_cap,
+                     const std::optional<torch::Tensor>& row_token) {
   TORCH_CHECK(act.scalar_type() == at::kBFloat16 && act.is_contiguous(), "act: contiguous bf16");
   TORCH_CHECK(out.scalar_type() == at::kBFloat16 && out.is_contiguous(), "out: contiguous bf16");
-  TORCH_CHECK(packed.scalar_type() == at::kByte && packed.dim() == 3 && packed.is_contiguous(),
-              "packed: contiguous uint8 [E, N, K/2] (pre-tiled)");
-  TORCH_CHECK(scales.element_size() == 1 && scales.is_contiguous(), "scales: e4m3 [E, N, K/16]");
   TORCH_CHECK(tiles.scalar_type() == at::kInt, "tiles: int32");
-  TORCH_CHECK(amax.scalar_type() == at::kFloat && denominator.scalar_type() == at::kFloat,
-              "amax / denominator: fp32");
-  const int64_t n = packed.size(1);
-  const int64_t k = packed.size(2) * 2;
   TORCH_CHECK(n % kNTile == 0 && k % kKTile == 0, "N % 128 and K % 64 must be 0");
   const bool swiglu = gammas.has_value();
   TORCH_CHECK(act.size(1) == k && out.size(1) == (swiglu ? n / 2 : n), "shape mismatch");
+  TORCH_CHECK(tile_rows == 64 || (tile_rows >= 128 && tile_rows % 128 == 0),
+              "tile_rows: 64 or a multiple of 128");
+  TORCH_CHECK(out.size(0) >= max_ctas * tile_rows, "out rows < max_ctas * tile_rows");
+  if (row_token) {
+    TORCH_CHECK(row_token->scalar_type() == at::kInt && row_token->is_contiguous() &&
+                    row_token->numel() >= max_ctas * tile_rows,
+                "row_token: contiguous int32 [rows]");
+  } else {
+    TORCH_CHECK(act.size(0) >= max_ctas * tile_rows, "act rows < max_ctas * tile_rows");
+  }
+  const int32_t* row_token_ptr = row_token ? row_token->data_ptr<int32_t>() : nullptr;
   if (swiglu) {
     TORCH_CHECK(gammas->scalar_type() == at::kFloat && gammas->is_contiguous() &&
                     gammas->numel() >= max_ctas * tile_rows,
                 "gammas: contiguous fp32 [rows]");
   }
   const float* gamma_ptr = swiglu ? gammas->data_ptr<float>() : nullptr;
-  TORCH_CHECK(tile_rows == 64 || (tile_rows >= 128 && tile_rows % 128 == 0),
-              "tile_rows: 64 or a multiple of 128");
-  TORCH_CHECK(act.size(0) >= max_ctas * tile_rows && out.size(0) >= max_ctas * tile_rows,
-              "act / out rows < max_ctas * tile_rows");
-
   auto stream = at::hip::getCurrentHIPStream();
   const int n_tiles = int(n / kNTile);
   auto args = [&](auto kernel, int blocks, int threads) {
     const int grid = ((blocks + 3) / 4) * 4 * n_tiles;
     hipLaunchKernelGGL(kernel, dim3(grid), dim3(threads), 0, stream,
-                       reinterpret_cast<const uint16_t*>(act.data_ptr()),
-                       reinterpret_cast<const uint32_t*>(packed.data_ptr()),
-                       reinterpret_cast<const uint32_t*>(scales.data_ptr()),
-                       amax.data_ptr<float>(), denominator.data_ptr<float>(),
-                       tiles.data_ptr<int32_t>(),
+                       reinterpret_cast<const uint16_t*>(act.data_ptr()), weight, scales,
+                       amax, denominator, tiles.data_ptr<int32_t>(),
                        reinterpret_cast<uint16_t*>(out.data_ptr()), gamma_ptr,
-                       float(gate_cap), float(up_cap), int(max_ctas), int(tile_rows),
-                       int(n), int(k));
+                       float(gate_cap), float(up_cap), row_token_ptr, int(max_ctas),
+                       int(tile_rows), int(n), int(k));
   };
   auto launch = [&](auto swiglu_tag) {
     constexpr bool kSwiglu = decltype(swiglu_tag)::value;
     if (tile_rows >= 128) {
       const int blocks = int(max_ctas * (tile_rows / 128));
-      args(nvfp4_moe_wmma_kernel<128, 2, 4, kSwiglu>, blocks, 256);
-      args(nvfp4_moe_wmma_kernel<64, 1, 4, kSwiglu>, blocks, 128);
+      args(nvfp4_moe_wmma_kernel<128, 2, 4, kSwiglu, FMT_MXFP8>, blocks, 256);
+      args(nvfp4_moe_wmma_kernel<64, 1, 4, kSwiglu, FMT_MXFP8>, blocks, 128);
     } else {
-      args(nvfp4_moe_wmma_kernel<64, 1, 4, kSwiglu>, int(max_ctas), 128);
+      args(nvfp4_moe_wmma_kernel<64, 1, 4, kSwiglu, FMT_MXFP8>, int(max_ctas), 128);
     }
   };
   if (swiglu) {
@@ -350,6 +408,40 @@ void nvfp4_moe_wmma(torch::Tensor& out, const torch::Tensor& act,
   } else {
     launch(std::false_type{});
   }
+}
+
+}  // namespace
+
+void nvfp4_moe_wmma(torch::Tensor& out, const torch::Tensor& act,
+                    const torch::Tensor& packed, const torch::Tensor& scales,
+                    const torch::Tensor& amax, const torch::Tensor& denominator,
+                    const torch::Tensor& tiles, int64_t max_ctas, int64_t tile_rows,
+                    const std::optional<torch::Tensor>& gammas, double gate_cap,
+                    double up_cap, const std::optional<torch::Tensor>& row_token) {
+  TORCH_CHECK(packed.scalar_type() == at::kByte && packed.dim() == 3 && packed.is_contiguous(),
+              "packed: contiguous uint8 [E, N, K/2] (pre-tiled)");
+  TORCH_CHECK(scales.element_size() == 1 && scales.is_contiguous(), "scales: e4m3 [E, N, K/16]");
+  TORCH_CHECK(amax.scalar_type() == at::kFloat && denominator.scalar_type() == at::kFloat,
+              "amax / denominator: fp32");
+  launch_moe_wmma<false>(out, act, packed.data_ptr(), scales.data_ptr(),
+                         amax.data_ptr<float>(), denominator.data_ptr<float>(), tiles,
+                         max_ctas, tile_rows, packed.size(1), packed.size(2) * 2, gammas,
+                         gate_cap, up_cap, row_token);
+}
+
+void mxfp8_moe_wmma(torch::Tensor& out, const torch::Tensor& act,
+                    const torch::Tensor& weight, const torch::Tensor& scales,
+                    const torch::Tensor& tiles, int64_t max_ctas, int64_t tile_rows,
+                    const std::optional<torch::Tensor>& gammas, double gate_cap,
+                    double up_cap, const std::optional<torch::Tensor>& row_token) {
+  TORCH_CHECK(weight.element_size() == 1 && weight.dim() == 3 && weight.is_contiguous(),
+              "weight: contiguous e4m3 [E, N, K]");
+  TORCH_CHECK(scales.element_size() == 1 && scales.is_contiguous() &&
+                  scales.size(-1) * 32 == weight.size(2),
+              "scales: e8m0 [E, N, K/32]");
+  launch_moe_wmma<true>(out, act, weight.data_ptr(), scales.data_ptr(), nullptr, nullptr,
+                        tiles, max_ctas, tile_rows, weight.size(1), weight.size(2), gammas,
+                        gate_cap, up_cap, row_token);
 }
 
 }  // namespace strix

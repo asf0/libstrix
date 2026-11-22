@@ -55,6 +55,24 @@ def _(
     gammas=None,
     gate_cap=0.0,
     up_cap=0.0,
+    row_token=None,
+):
+    return None
+
+
+@torch.library.register_fake("strix::mxfp8_moe_wmma")
+def _(
+    out,
+    act,
+    weight,
+    scales,
+    tiles,
+    max_ctas,
+    tile_rows,
+    gammas=None,
+    gate_cap=0.0,
+    up_cap=0.0,
+    row_token=None,
 ):
     return None
 

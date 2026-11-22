@@ -69,13 +69,16 @@ def test_bmm_nvfp4_matches_reference(tile, rows, bf16_act):
         torch.testing.assert_close(out[sl], ref, rtol=2e-2, atol=2e-2 * ref.abs().max())
 
 
+@pytest.mark.parametrize("scale_lo", [120, 100])  # 100: outside mxfp8_moe_wmma's range
 @pytest.mark.parametrize("bf16_act", [False, True])
-@pytest.mark.parametrize("tile,rows", [(16, 1), (16, 7), (64, 40)])
-def test_bmm_mxfp8_decode_matches_reference(tile, rows, bf16_act):
+@pytest.mark.parametrize(
+    "tile,rows", [(16, 1), (16, 7), (64, 40), (128, 50), (128, 100), (256, 150)]
+)
+def test_bmm_mxfp8_decode_matches_reference(tile, rows, bf16_act, scale_lo):
     torch.manual_seed(0)
     num_experts, n, k = 3, 256, 384
     weight = (torch.randn(num_experts, n, k) * 0.5).to(torch.float8_e4m3fn)
-    scale = torch.randint(120, 130, (num_experts, n, k // 32), dtype=torch.uint8)
+    scale = torch.randint(scale_lo, 130, (num_experts, n, k // 32), dtype=torch.uint8)
     experts = [2, 0]
     max_ctas = len(experts)
     plan = ExpertPlan(tile=tile, max_ctas=max_ctas)
@@ -169,8 +172,9 @@ def test_nvfp4_tile_gemv_matches_reference(rows):
         torch.testing.assert_close(out[sl], ref, rtol=2e-2, atol=2e-2 * ref.abs().max())
 
 
+@pytest.mark.parametrize("gather", [False, True])
 @pytest.mark.parametrize("tile,rows", [(64, 40), (128, 100), (256, 150)])
-def test_wmma_swiglu_matches_gemm_then_swiglu(tile, rows):
+def test_wmma_swiglu_matches_gemm_then_swiglu(tile, rows, gather):
     from types import SimpleNamespace
 
     from strix_vllm.inkling2_moe import gemm_nvfp4_swiglu, swiglu_bf16
@@ -182,6 +186,7 @@ def test_wmma_swiglu_matches_gemm_then_swiglu(tile, rows):
     scale = (torch.rand(num_experts, n, k // 16) * 2 + 0.1).to(torch.float8_e4m3fn)
     weight, scale = pretile_nvfp4(weight.to(dev), scale.to(dev))
     experts = SimpleNamespace(
+        nvfp4=True,
         w13_weight=weight,
         w13_weight_scale=scale,
         w13_weight_amax=(torch.rand(num_experts) * 4 + 1).to(dev),
@@ -215,7 +220,23 @@ def test_wmma_swiglu_matches_gemm_then_swiglu(tile, rows):
         plan,
     )
     ref = swiglu_bf16(gate_up, gammas, 4.0, 25.0, (routed, num_routed), tile)
-    got = gemm_nvfp4_swiglu(act, experts, tiles, plan, gammas)
+    if gather:  # layout rows read token rows of a smaller x
+        tokens = torch.randn(37, k, device=dev).to(torch.bfloat16)
+        row_token = torch.randint(0, 37, (plan.rows,), dtype=torch.int32, device=dev)
+        act.copy_(tokens[row_token.long()])
+        gate_up = gemm_nvfp4(
+            act,
+            experts.w13_weight,
+            experts.w13_weight_scale,
+            experts.w13_weight_amax,
+            experts.w13_weight_outer_scale_denominator,
+            tiles,
+            plan,
+        )
+        ref = swiglu_bf16(gate_up, gammas, 4.0, 25.0, (routed, num_routed), tile)
+        got = gemm_nvfp4_swiglu(tokens, experts, tiles, plan, gammas, row_token)
+    else:
+        got = gemm_nvfp4_swiglu(act, experts, tiles, plan, gammas)
     ref, got = ref[routed.long()].float(), got[routed.long()].float()
     # Same bf16 GEMM outputs in; the activation may differ by a bf16 ulp.
     torch.testing.assert_close(got, ref, rtol=1.6e-2, atol=1e-3 * ref.abs().max())
