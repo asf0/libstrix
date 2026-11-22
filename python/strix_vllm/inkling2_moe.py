@@ -102,28 +102,32 @@ def _nvfp4_gemv_kernel(
     outer = tl.load(WAmax + expert) / tl.load(WDenominator)
     cols = tl.program_id(0) * BN + tl.arange(0, BN)
     half = tl.arange(0, BK // 2)
+    # Split layout (`split_nvfp4`): byte h of a K step holds column lo[h] in
+    # its low nibble and lo[h] + 16 in its high one.
+    lo = 32 * (half // 16) + half % 16
+    group = 2 * (half // 16)
     weight_rows = (expert * N + cols[:, None]).to(tl.int64)
     a_row = A + row.to(tl.int64) * K
     acc = tl.zeros((BN,), tl.float32)
     for k in range(0, K, BK):
         if A_BF16:
-            a_even = tl.load(a_row + k + 2 * half).to(tl.float32)
-            a_odd = tl.load(a_row + k + 2 * half + 1).to(tl.float32)
+            a_lo = tl.load(a_row + k + lo).to(tl.float32)
+            a_hi = tl.load(a_row + k + lo + 16).to(tl.float32)
         else:
             a_scale = tl.load(
-                AScale + _scale_offsets(row, (k + 2 * half) // 32, K // 32, TILE)
+                AScale + _scale_offsets(row, (k + lo) // 32, K // 32, TILE)
             )
             a_mult = tl.exp2(a_scale.to(tl.float32) - 127.0)
-            a_even = tl.load(a_row + k + 2 * half).to(tl.float32) * a_mult
-            a_odd = tl.load(a_row + k + 2 * half + 1).to(tl.float32) * a_mult
+            a_lo = tl.load(a_row + k + lo).to(tl.float32) * a_mult
+            a_hi = tl.load(a_row + k + lo + 16).to(tl.float32) * a_mult
         packed = tl.load(W + weight_rows * (K // 2) + k // 2 + half[None, :])
         packed = packed.to(tl.int32)
-        block_scale = tl.load(
-            WScale + weight_rows * (K // 16) + k // 16 + half[None, :] // 8
-        ).to(tl.float32)
-        partial = _e2m1_f32_bits(packed & 15) * a_even[None, :]
-        partial += _e2m1_f32_bits(packed >> 4) * a_odd[None, :]
-        acc += tl.sum(partial * block_scale, axis=1)
+        scales = WScale + weight_rows * (K // 16) + k // 16 + group[None, :]
+        s_lo = _e4m3_f32(tl.load(scales).to(tl.int32))
+        s_hi = _e4m3_f32(tl.load(scales + 1).to(tl.int32))
+        partial = _e2m1_f32_bits(packed & 15) * a_lo[None, :] * s_lo
+        partial += _e2m1_f32_bits(packed >> 4) * a_hi[None, :] * s_hi
+        acc += tl.sum(partial, axis=1)
     tl.store(Out + row.to(tl.int64) * N + cols, (acc * outer).to(tl.bfloat16))
 
 
@@ -144,8 +148,9 @@ def _nvfp4_bmm_bf16_kernel(
     BN: tl.constexpr,
 ):
     # bf16 activation rows against NVFP4 weights decoded from their bits, K
-    # in steps of 32: even / odd activation columns meet the low / high
-    # nibbles in two K=16 dots (no register interleave of the decoded values).
+    # in steps of 32. Split layout (`split_nvfp4`): the low / high nibbles are
+    # the step's first / second 16 columns, so each meets a contiguous
+    # activation slice and one block scale per weight row in a K=16 dot.
     SUB: tl.constexpr = TILE // BM if TILE >= BM else 1
     pid_m = tl.program_id(1)
     tile = pid_m // SUB
@@ -161,18 +166,21 @@ def _nvfp4_bmm_bf16_kernel(
     row_mask = (rows < row_end)[:, None]
     cols = tl.program_id(0) * BN + tl.arange(0, BN)
     j = tl.arange(0, 16)
-    weight_rows = (expert * N + cols[:, None]).to(tl.int64)
-    a_ptrs = A + rows[:, None].to(tl.int64) * K + 2 * j[None, :]
-    w_ptrs = W + weight_rows * (K // 2) + j[None, :]
-    ws_ptrs = WScale + weight_rows * (K // 16) + (j[None, :] // 8)
+    weight_rows = (expert * N + cols).to(tl.int64)
+    a_ptrs = A + rows[:, None].to(tl.int64) * K + j[None, :]
+    w_ptrs = W + weight_rows[:, None] * (K // 2) + j[None, :]
+    ws_ptrs = WScale + weight_rows * (K // 16)
     acc = tl.zeros((BM, BN), tl.float32)
     for k in range(0, K, 32):
-        a_even = tl.load(a_ptrs + k, row_mask, other=0.0)
-        a_odd = tl.load(a_ptrs + k + 1, row_mask, other=0.0)
+        a_lo = tl.load(a_ptrs + k, row_mask, other=0.0)
+        a_hi = tl.load(a_ptrs + k + 16, row_mask, other=0.0)
         packed = tl.load(w_ptrs + k // 2).to(tl.int32)
-        scale = (tl.load(ws_ptrs + k // 16).to(tl.float32) * outer).to(tl.bfloat16)
-        acc = tl.dot(a_even, tl.trans(_e2m1_bf16(packed & 15) * scale), acc)
-        acc = tl.dot(a_odd, tl.trans(_e2m1_bf16(packed >> 4) * scale), acc)
+        s_lo = _e4m3_f32(tl.load(ws_ptrs + k // 16).to(tl.int32)) * outer
+        s_hi = _e4m3_f32(tl.load(ws_ptrs + k // 16 + 1).to(tl.int32)) * outer
+        w_lo = _e2m1_bf16(packed & 15) * s_lo.to(tl.bfloat16)[:, None]
+        w_hi = _e2m1_bf16(packed >> 4) * s_hi.to(tl.bfloat16)[:, None]
+        acc = tl.dot(a_lo, tl.trans(w_lo), acc)
+        acc = tl.dot(a_hi, tl.trans(w_hi), acc)
     out_ptrs = Out + rows[:, None].to(tl.int64) * N + cols[None, :]
     tl.store(out_ptrs, acc.to(tl.bfloat16), row_mask)
 
@@ -444,7 +452,29 @@ def _gemv_launch(plan, k):
     return plan.tile == 16 and plan.max_ctas <= GEMV_MAX_CTAS and k % 128 == 0
 
 
+def split_nvfp4(weight: torch.Tensor) -> torch.Tensor:
+    """NVFP4 bytes `[..., K / 2]` (byte j: column 2j low, 2j + 1 high) in the
+    split layout the kernels read: in each 32-column block, byte j holds
+    column j low and j + 16 high."""
+    codes = torch.stack((weight & 15, weight >> 4), -1).view(*weight.shape[:-1], -1, 32)
+    return (codes[..., :16] | (codes[..., 16:] << 4)).reshape(weight.shape)
+
+
+def _split_experts(experts) -> None:
+    """Rewrite the experts' NVFP4 weights in the split layout, in place, one
+    expert at a time (first forward: the profile run)."""
+    if getattr(experts, "_strix_split_nvfp4", False):
+        return
+    for name in ("w13_weight", "w2_weight"):
+        weight = getattr(experts, name)
+        assert weight.shape[-1] % 16 == 0
+        for e in range(weight.shape[0]):
+            weight[e].copy_(split_nvfp4(weight[e]))
+    experts._strix_split_nvfp4 = True
+
+
 def gemm_nvfp4(act, weight, weight_scale, weight_amax, weight_denominator, tiles, plan):
+    """Grouped NVFP4 GEMM; `weight` in the split layout (`split_nvfp4`)."""
     _, n, k_half = weight.shape
     k = 2 * k_half
     out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
@@ -455,7 +485,7 @@ def gemm_nvfp4(act, weight, weight_scale, weight_amax, weight_denominator, tiles
             act,
             act,
             weight,
-            weight_scale,
+            weight_scale.view(torch.uint8),
             weight_amax,
             weight_denominator,
             out,
@@ -470,14 +500,14 @@ def gemm_nvfp4(act, weight, weight_scale, weight_amax, weight_denominator, tiles
             num_warps=warps,
         )
         return out
-    # 64x128 tiles, 2 stages: 19-21 TFLOPS at a 5k-token prefill.
-    bm = min(max(tile, 16), 64)
-    bn = 128 if n % 128 == 0 else 64
+    # 128x64 tiles, 1 stage: 24 TFLOPS at a 5k-token prefill.
+    bm = min(max(tile, 16), 128)
+    bn = 64
     sub = tile // bm if tile >= bm else 1
     _nvfp4_bmm_bf16_kernel[(n // bn, plan.max_ctas * sub)](
         act,
         weight,
-        weight_scale,
+        weight_scale.view(torch.uint8),
         weight_amax,
         weight_denominator,
         out,
@@ -489,7 +519,7 @@ def gemm_nvfp4(act, weight, weight_scale, weight_amax, weight_denominator, tiles
         BM=bm,
         BN=bn,
         num_warps=4,
-        num_stages=2,
+        num_stages=1,
     )
     return out
 
@@ -539,6 +569,7 @@ def gemm_mxfp8(act, weight, weight_scale, tiles, plan):
 
 def _expert_gemm(experts, act, name, tiles, plan):
     if experts.nvfp4:
+        _split_experts(experts)
         return gemm_nvfp4(
             act,
             getattr(experts, f"{name}_weight"),
