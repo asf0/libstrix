@@ -7,13 +7,17 @@ rank-64 controllers: `hidden = pair @ down.T` (bf16) and
 hipBLAS batched GEMMs of a few rows (about 17 us each, 96 per Inkling 2 Mini
 token). Here: a split-K kernel for `down` and one for `up` that sums the
 split partials, rounds `hidden` to bf16 as the GEMM does, and multiplies.
+
+Prefill batches keep `down` on hipBLAS, but `gain_forget` (fp32, 2D wide: 95 MB
+per stream at 5k tokens) is never stored: `_blend_up_kernel` computes it a
+token block at a time from rank-64 `hidden` inside the blend and RMSNorm.
 """
 
 from __future__ import annotations
 
 import torch
 from vllm.models.inkling2.amd.ops.loop import blend_rms_norm, pair_rms_norm
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, tldevice, triton
 
 # Batches up to this many tokens take the kernels (one 16-row dot tile).
 MAX_TOKENS = 16
@@ -80,6 +84,123 @@ def _up_kernel(
     tl.store(Out + (s * T + rows[:, None]) * N + cols[None, :], out, rows[:, None] < T)
 
 
+@triton.jit
+def _blend_x(
+    Dest,
+    Message,
+    Up,
+    h,
+    s,
+    t0,
+    c,
+    stride_dest_s,
+    T,
+    D: tl.constexpr,
+    R: tl.constexpr,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+):
+    """fp32 `(1 - tanh(forget)) * dest + tanh(gain) * message` for tokens
+    `t0 + [0, BT)` and columns `c + [0, BC)`, gain / forget from bf16 `h`."""
+    ts = t0 + tl.arange(0, BT)
+    cols = c + tl.arange(0, BC)
+    rs = tl.arange(0, R)
+    tmask = (ts < T)[:, None]
+    up = Up + (s * 2 * D + cols[:, None]) * R + rs[None, :]
+    gain = tldevice.tanh(tl.dot(h, tl.trans(tl.load(up))))
+    forget = tldevice.tanh(tl.dot(h, tl.trans(tl.load(up + D * R))))
+    dest = tl.load(
+        Dest + s * stride_dest_s + ts[:, None] * D + cols[None, :], tmask, other=0
+    )
+    message = tl.load(
+        Message + (s * T + ts[:, None]) * D + cols[None, :], tmask, other=0
+    )
+    return (1.0 - forget) * dest + gain * message
+
+
+@triton.jit
+def _blend_up_kernel(
+    Hidden,
+    Up,
+    Dest,
+    Message,
+    NormW,
+    Out,
+    stride_dest_s,
+    stride_w_s,
+    T,
+    norm_eps,
+    D: tl.constexpr,
+    R: tl.constexpr,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+):
+    """`blend_rms_norm` with `gain_forget = hidden @ up.T` made in place:
+    two passes over the row (sum of squares, then normalize and store)."""
+    s = tl.program_id(0).to(tl.int64)
+    t0 = tl.program_id(1) * BT
+    ts = t0 + tl.arange(0, BT)
+    tmask = (ts < T)[:, None]
+    rs = tl.arange(0, R)
+    h = tl.load(Hidden + (s * T + ts[:, None]) * R + rs[None, :], tmask, other=0)
+    sumsq = tl.zeros((BT,), tl.float32)
+    for c in range(0, D, BC):
+        x = _blend_x(Dest, Message, Up, h, s, t0, c, stride_dest_s, T, D, R, BT, BC)
+        sumsq += tl.sum(x * x, axis=1)
+    rstd = tl.rsqrt(tl.div_rn(sumsq, D) + norm_eps)
+    for c in range(0, D, BC):
+        x = _blend_x(Dest, Message, Up, h, s, t0, c, stride_dest_s, T, D, R, BT, BC)
+        cols = c + tl.arange(0, BC)
+        w = tl.load(NormW + s * stride_w_s + cols).to(tl.float32)
+        y = x * rstd[:, None] * w[None, :]
+        tl.store(
+            Out + (s * T + ts[:, None]) * D + cols[None, :],
+            y.to(Out.dtype.element_ty),
+            tmask,
+        )
+
+
+def blend_up(dest, message, hidden, up, norm_weight, norm_eps, bt=32, bc=128):
+    """bf16 `(S, T, D)` blend and RMSNorm (as `blend_rms_norm`) of bf16
+    `hidden` `(S, T, R)` through `up` `(S, 2D, R)`."""
+    num_streams, num_tokens, d = message.shape
+    rank = hidden.shape[2]
+    out = message.new_empty((num_streams, num_tokens, d), dtype=torch.bfloat16)
+    _blend_up_kernel[(num_streams, triton.cdiv(num_tokens, bt))](
+        hidden,
+        up,
+        dest,
+        message,
+        norm_weight,
+        out,
+        dest.stride(0),
+        norm_weight.stride(0),
+        num_tokens,
+        norm_eps,
+        D=d,
+        R=rank,
+        BT=bt,
+        BC=bc,
+        num_warps=8,
+        enable_fp_fusion=False,
+    )
+    return out
+
+
+def blend_up_usable(dest, message, hidden, up, norm_weight) -> bool:
+    d = message.shape[2]
+    return (
+        d % 128 == 0
+        and hidden.shape[2] in (16, 32, 64, 128)
+        and message.is_contiguous()
+        and hidden.is_contiguous()
+        and up.is_contiguous()
+        and dest.stride(1) == d
+        and dest.stride(2) == 1
+        and norm_weight.stride(1) == 1
+    )
+
+
 def controllers(pair: torch.Tensor, down: torch.Tensor, up: torch.Tensor):
     """fp32 `(S, T, 2D)` `[gain, forget]` of bf16 `(S, T, 2D)` `pair` through
     `down` `(S, R, 2D)` and `up` `(S, 2D, R)`."""
@@ -135,7 +256,9 @@ def blend(self, streams, dest, message, norm_weight, norm_eps):
     up = self.controller_gain_forget[streams]
     if usable(pair, down, up):
         gain_forget = controllers(pair, down, up)
-    else:
-        hidden = torch.bmm(pair, down.transpose(1, 2))
-        gain_forget = torch.bmm(hidden, up.transpose(1, 2), out_dtype=torch.float32)
+        return blend_rms_norm(dest, message, gain_forget, norm_weight, norm_eps)
+    hidden = torch.bmm(pair, down.transpose(1, 2))
+    if blend_up_usable(dest, message, hidden, up, norm_weight):
+        return blend_up(dest, message, hidden, up, norm_weight, norm_eps)
+    gain_forget = torch.bmm(hidden, up.transpose(1, 2), out_dtype=torch.float32)
     return blend_rms_norm(dest, message, gain_forget, norm_weight, norm_eps)

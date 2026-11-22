@@ -7,7 +7,7 @@ reference that decodes the same NVFP4 bytes. Run inside the image:
 import pytest
 import torch
 
-from strix_vllm.inkling2_moe import gemm_mxfp8, gemm_nvfp4
+from strix_vllm.inkling2_moe import gemm_mxfp8, gemm_nvfp4, split_nvfp4
 from vllm.models.inkling2.amd.ops.triton_bmm import ExpertPlan, bmm, bmm_nvfp4
 
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
@@ -22,7 +22,7 @@ def decode(weight, scale, amax, denominator):
 
 
 @pytest.mark.parametrize("bf16_act", [False, True])
-@pytest.mark.parametrize("tile,rows", [(16, 5), (16, 16), (32, 23), (128, 100)])
+@pytest.mark.parametrize("tile,rows", [(16, 5), (16, 16), (32, 23), (128, 100), (256, 200)])
 def test_bmm_nvfp4_matches_reference(tile, rows, bf16_act):
     torch.manual_seed(0)
     num_experts, n, k = 3, 256, 384
@@ -45,6 +45,7 @@ def test_bmm_nvfp4_matches_reference(tile, rows, bf16_act):
     dev = torch.device("cuda")
     gpu = [t.to(dev) for t in (weight, scale, amax, denominator, tiles)]
     if bf16_act:  # libstrix's gfx1151 kernels
+        gpu[0] = split_nvfp4(gpu[0])
         out = gemm_nvfp4(act.to(torch.bfloat16).to(dev), *gpu, plan)
     else:  # the port's portable path
         out = bmm_nvfp4(act.to(dev), act_scale.to(dev), *gpu, plan)
@@ -103,3 +104,27 @@ def test_loop_controllers_match_bmm(tokens, streams):
     ref = torch.bmm(hidden, up.transpose(1, 2), out_dtype=torch.float32)
     got = controllers(pair, down, up)
     torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2 * ref.abs().max())
+
+
+@pytest.mark.parametrize("tokens", [17, 300])
+@pytest.mark.parametrize("streams,broadcast", [(1, False), (3, True), (3, False)])
+def test_blend_up_matches_blend_rms_norm(tokens, streams, broadcast):
+    from strix_vllm.inkling2_loop import blend_up
+    from vllm.models.inkling2.amd.ops.loop import blend_rms_norm
+
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    d, rank = 2304, 64
+    if broadcast:  # local layers: one dest and norm weight for all streams
+        dest = torch.randn(1, tokens, d, device=dev).expand(streams, -1, -1)
+        norm_weight = (torch.rand(1, d, device=dev) + 0.5).expand(streams, -1)
+    else:
+        dest = torch.randn(streams, tokens, d, device=dev)
+        norm_weight = torch.rand(streams, d, device=dev) + 0.5
+    message = torch.randn(streams, tokens, d, device=dev)
+    hidden = torch.randn(streams, tokens, rank, device=dev).to(torch.bfloat16)
+    up = (torch.randn(streams, 2 * d, rank, device=dev) * 0.1).to(torch.bfloat16)
+    gain_forget = torch.bmm(hidden, up.transpose(1, 2), out_dtype=torch.float32)
+    ref = blend_rms_norm(dest, message, gain_forget, norm_weight, 1e-6)
+    got = blend_up(dest, message, hidden, up, norm_weight, 1e-6)
+    torch.testing.assert_close(got.float(), ref.float(), rtol=1.6e-2, atol=1e-2)
