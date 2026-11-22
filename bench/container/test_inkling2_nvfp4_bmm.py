@@ -86,3 +86,20 @@ def test_bmm_mxfp8_decode_matches_reference(tile, rows, bf16_act):
         sl = slice(t * tile, t * tile + rows)
         ref = act[sl].float() @ w[e].T
         torch.testing.assert_close(out[sl], ref, rtol=2e-2, atol=2e-2 * ref.abs().max())
+
+
+@pytest.mark.parametrize("tokens", [1, 4, 8])
+@pytest.mark.parametrize("streams", [1, 3])
+def test_loop_controllers_match_bmm(tokens, streams):
+    from strix_vllm.inkling2_loop import controllers
+
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    k, rank = 4608, 64
+    pair = torch.randn(streams, tokens, k, device=dev).to(torch.bfloat16)
+    down = (torch.randn(streams, rank, k, device=dev) * 0.02).to(torch.bfloat16)
+    up = (torch.randn(streams, k, rank, device=dev) * 0.05).to(torch.bfloat16)
+    hidden = torch.bmm(pair, down.transpose(1, 2))
+    ref = torch.bmm(hidden, up.transpose(1, 2), out_dtype=torch.float32)
+    got = controllers(pair, down, up)
+    torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2 * ref.abs().max())
