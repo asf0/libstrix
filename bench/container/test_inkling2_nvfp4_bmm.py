@@ -7,7 +7,8 @@ reference that decodes the same NVFP4 bytes. Run inside the image:
 import pytest
 import torch
 
-from vllm.models.inkling2.amd.ops.triton_bmm import ExpertPlan, bmm_nvfp4
+from strix_vllm.inkling2_moe import gemm_mxfp8, gemm_nvfp4
+from vllm.models.inkling2.amd.ops.triton_bmm import ExpertPlan, bmm, bmm_nvfp4
 
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 
@@ -42,16 +43,12 @@ def test_bmm_nvfp4_matches_reference(tile, rows, bf16_act):
     act_scale = torch.full((plan.rows * k // 32,), 127, dtype=torch.uint8)
 
     dev = torch.device("cuda")
-    out = bmm_nvfp4(
-        act.to(torch.bfloat16).to(dev) if bf16_act else act.to(dev),
-        None if bf16_act else act_scale.to(dev),
-        weight.to(dev),
-        scale.to(dev),
-        amax.to(dev),
-        denominator.to(dev),
-        tiles.to(dev),
-        plan,
-    ).float().cpu()
+    gpu = [t.to(dev) for t in (weight, scale, amax, denominator, tiles)]
+    if bf16_act:  # libstrix's gfx1151 kernels
+        out = gemm_nvfp4(act.to(torch.bfloat16).to(dev), *gpu, plan)
+    else:  # the port's portable path
+        out = bmm_nvfp4(act.to(dev), act_scale.to(dev), *gpu, plan)
+    out = out.float().cpu()
 
     w = decode(weight, scale, amax, denominator)
     for t, e in enumerate(experts):
@@ -63,8 +60,6 @@ def test_bmm_nvfp4_matches_reference(tile, rows, bf16_act):
 @pytest.mark.parametrize("bf16_act", [False, True])
 @pytest.mark.parametrize("tile,rows", [(16, 1), (16, 7), (64, 40)])
 def test_bmm_mxfp8_decode_matches_reference(tile, rows, bf16_act):
-    from vllm.models.inkling2.amd.ops.triton_bmm import bmm
-
     torch.manual_seed(0)
     num_experts, n, k = 3, 256, 384
     weight = (torch.randn(num_experts, n, k) * 0.5).to(torch.float8_e4m3fn)
@@ -80,11 +75,12 @@ def test_bmm_mxfp8_decode_matches_reference(tile, rows, bf16_act):
     act = (torch.randn(plan.rows, k) * 2).to(torch.float8_e4m3fn)
     act_scale = torch.full((plan.rows * k // 32,), 127, dtype=torch.uint8)
     dev = torch.device("cuda")
-    out = bmm(
-        act.to(torch.bfloat16).to(dev) if bf16_act else act.to(dev),
-        None if bf16_act else act_scale.to(dev),
-        weight.to(dev), scale.to(dev), tiles.to(dev), plan,
-    ).float().cpu()
+    gpu = [t.to(dev) for t in (weight, scale, tiles)]
+    if bf16_act:
+        out = gemm_mxfp8(act.to(torch.bfloat16).to(dev), *gpu, plan)
+    else:
+        out = bmm(act.to(dev), act_scale.to(dev), *gpu, plan)
+    out = out.float().cpu()
     w = weight.float() * torch.exp2(scale.float() - 127).repeat_interleave(32, -1)
     for t, e in enumerate(experts):
         sl = slice(t * tile, t * tile + rows)

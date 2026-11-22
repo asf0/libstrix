@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""Inkling2 (ROCm port) attention projections on dense_w8's int8 copies.
+"""Inkling2 (ROCm port) on gfx1151: the MoE on bf16 rows (`inkling2_moe`) and
+the attention projections on dense_w8's int8 copies.
 
 The ROCm Inkling2 attention multiplies by its `qkvr` weight, by row slices of
 it (the query side, k and v of full layers and of loop passes after the
@@ -16,6 +17,23 @@ from strix_vllm import dense_w8, disabled
 
 
 def register() -> None:
+    _register_moe()
+    _register_linear()
+
+
+def _register_moe() -> None:
+    if disabled("inkling2_moe"):
+        return
+    try:
+        from vllm.models.inkling2.amd import moe
+
+        from strix_vllm import inkling2_moe
+    except ImportError:
+        return
+    moe.Inkling2MoE.forward = inkling2_moe.moe_forward
+
+
+def _register_linear() -> None:
     if disabled("dense_w8") or disabled("inkling2_linear"):
         return
     try:
