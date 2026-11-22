@@ -35,6 +35,11 @@ ARCH_GATED = {
         "Qwen4ExpForConditionalGeneration",
         "Qwen4ExpForCausalLM",
         "FlintForCausalLM",
+        # Inkling 2 Mini (ROCm Inkling2 port, NVFP4/MXFP8 experts): decode
+        # 25.3 -> 30.0 tok/s (+1.1 GiB); GSM8K 87 / 88 of 100 off / on,
+        # McNemar p = 1.0.
+        "Inkling2LoopForConditionalGeneration",
+        "Inkling2ForConditionalGeneration",
     ),
     # int8 activations in the int4 MoE GEMM.
     "moe_w4a8": ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM"),
@@ -172,6 +177,7 @@ def register() -> None:
         fp8,
         gdn,
         gemm,
+        inkling2,
         int8,
         linear,
         moe,
@@ -191,6 +197,7 @@ def register() -> None:
     attn.register()
     qwen4_exp.register()
     dense_w8.register()
+    inkling2.register()
     # Opt-in (STRIX_ENABLE=npu): needs the XDNA2 NPU and libstrix_npu.so.
     from strix_vllm import qwen3_5_npu, qwen4_exp_npu
 

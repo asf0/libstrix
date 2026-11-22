@@ -1,0 +1,89 @@
+"""bmm_nvfp4 (vllm/models/inkling2/amd/ops/triton_bmm.py) against a torch
+reference that decodes the same NVFP4 bytes. Run inside the image:
+
+    python -m pytest -q bench/container/test_inkling2_nvfp4_bmm.py
+"""
+
+import pytest
+import torch
+
+from vllm.models.inkling2.amd.ops.triton_bmm import ExpertPlan, bmm_nvfp4
+
+E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+
+
+def decode(weight, scale, amax, denominator):
+    """[E, N, K // 2] uint8, [E, N, K // 16] e4m3 -> fp32 [E, N, K]."""
+    codes = torch.stack((weight & 15, weight >> 4), dim=-1).flatten(-2).long()
+    values = E2M1[codes & 7] * torch.where(codes >= 8, -1.0, 1.0)
+    blocks = scale.float().repeat_interleave(16, dim=-1)
+    return values * blocks * (amax / denominator)[:, None, None]
+
+
+@pytest.mark.parametrize("tile,rows", [(16, 5), (16, 16), (32, 23)])
+def test_bmm_nvfp4_matches_reference(tile, rows):
+    torch.manual_seed(0)
+    num_experts, n, k = 3, 256, 384
+    weight = torch.randint(0, 256, (num_experts, n, k // 2), dtype=torch.uint8)
+    scale = (torch.rand(num_experts, n, k // 16) * 2 + 0.1).to(torch.float8_e4m3fn)
+    amax = torch.rand(num_experts) + 0.5
+    denominator = torch.tensor([6.0 * 448.0])
+    # Two tiles: expert 2 then expert 0, each with `rows` routed rows.
+    experts = [2, 0]
+    max_ctas = len(experts)
+    plan = ExpertPlan(tile=tile, max_ctas=max_ctas)
+    tiles = torch.zeros(2 * max_ctas + 1, dtype=torch.int32)
+    for t, e in enumerate(experts):
+        tiles[t] = e
+        tiles[max_ctas + t] = t * tile + rows
+    tiles[2 * max_ctas] = max_ctas
+    act = (torch.randn(plan.rows, k) * 2).to(torch.float8_e4m3fn)
+    act_scale = torch.full((plan.rows * k // 32,), 127, dtype=torch.uint8)
+
+    dev = torch.device("cuda")
+    out = bmm_nvfp4(
+        act.to(dev),
+        act_scale.to(dev),
+        weight.to(dev),
+        scale.to(dev),
+        amax.to(dev),
+        denominator.to(dev),
+        tiles.to(dev),
+        plan,
+    ).float().cpu()
+
+    w = decode(weight, scale, amax, denominator)
+    for t, e in enumerate(experts):
+        sl = slice(t * tile, t * tile + rows)
+        ref = act[sl].float() @ w[e].T
+        torch.testing.assert_close(out[sl], ref, rtol=2e-2, atol=2e-2 * ref.abs().max())
+
+
+@pytest.mark.parametrize("tile,rows", [(16, 1), (16, 7)])
+def test_bmm_mxfp8_decode_matches_reference(tile, rows):
+    from vllm.models.inkling2.amd.ops.triton_bmm import bmm
+
+    torch.manual_seed(0)
+    num_experts, n, k = 3, 256, 384
+    weight = (torch.randn(num_experts, n, k) * 0.5).to(torch.float8_e4m3fn)
+    scale = torch.randint(120, 130, (num_experts, n, k // 32), dtype=torch.uint8)
+    experts = [2, 0]
+    max_ctas = len(experts)
+    plan = ExpertPlan(tile=tile, max_ctas=max_ctas)
+    tiles = torch.zeros(2 * max_ctas + 1, dtype=torch.int32)
+    for t, e in enumerate(experts):
+        tiles[t] = e
+        tiles[max_ctas + t] = t * tile + rows
+    tiles[2 * max_ctas] = max_ctas
+    act = (torch.randn(plan.rows, k) * 2).to(torch.float8_e4m3fn)
+    act_scale = torch.full((plan.rows * k // 32,), 127, dtype=torch.uint8)
+    dev = torch.device("cuda")
+    out = bmm(
+        act.to(dev), act_scale.to(dev), weight.to(dev), scale.to(dev),
+        tiles.to(dev), plan,
+    ).float().cpu()
+    w = weight.float() * torch.exp2(scale.float() - 127).repeat_interleave(32, -1)
+    for t, e in enumerate(experts):
+        sl = slice(t * tile, t * tile + rows)
+        ref = act[sl].float() @ w[e].T
+        torch.testing.assert_close(out[sl], ref, rtol=2e-2, atol=2e-2 * ref.abs().max())

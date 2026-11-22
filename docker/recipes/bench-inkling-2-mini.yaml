@@ -1,0 +1,22 @@
+# Inkling 2 Mini (looped, NVFP4 + MXFP8 experts) on the ROCm Inkling2 port.
+# 32k context; eager mode via EXTRA_ARGS=--enforce-eager.
+#
+#   docker compose -f bench-inkling-2-mini.yaml up -d
+services:
+  bench-inkling-2-mini:
+    extends:
+      file: common.yaml
+      service: strix
+    environment:
+      MTP: 0
+      HF_REPO: thinkingmachines/Inkling-2-Mini
+    command:
+      - /models/Inkling-2-Mini
+      - --gpu-memory-utilization=${GPU_UTIL:-0.80}
+      - --max-model-len=${MAX_MODEL_LEN:-32768}
+      - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-8192}
+      - --max-num-seqs=${MAX_NUM_SEQS:-4}
+      # Tool calls and reasoning come back parsed, as chat clients expect.
+      - --enable-auto-tool-choice
+      - --tool-call-parser=inkling
+      - --reasoning-parser=inkling
