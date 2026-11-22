@@ -167,3 +167,55 @@ def test_nvfp4_tile_gemv_matches_reference(rows):
         sl = slice(t * tile, t * tile + max(rows - t, 1))
         ref = act[sl].float() @ w[e].T
         torch.testing.assert_close(out[sl], ref, rtol=2e-2, atol=2e-2 * ref.abs().max())
+
+
+@pytest.mark.parametrize("tile,rows", [(64, 40), (128, 100), (256, 150)])
+def test_wmma_swiglu_matches_gemm_then_swiglu(tile, rows):
+    from types import SimpleNamespace
+
+    from strix_vllm.inkling2_moe import gemm_nvfp4_swiglu, swiglu_bf16
+
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    num_experts, n, k = 3, 512, 384
+    weight = torch.randint(0, 256, (num_experts, n, k // 2), dtype=torch.uint8)
+    scale = (torch.rand(num_experts, n, k // 16) * 2 + 0.1).to(torch.float8_e4m3fn)
+    weight, scale = pretile_nvfp4(weight.to(dev), scale.to(dev))
+    experts = SimpleNamespace(
+        w13_weight=weight,
+        w13_weight_scale=scale,
+        w13_weight_amax=(torch.rand(num_experts) * 4 + 1).to(dev),
+        w13_weight_outer_scale_denominator=torch.tensor([6.0 * 448.0], device=dev),
+        gate_cap=4.0,  # Inkling 2 Mini's softcaps
+        up_cap=25.0,
+    )
+    experts_order = [2, 0]
+    max_ctas = len(experts_order)
+    plan = ExpertPlan(tile=tile, max_ctas=max_ctas)
+    tiles = torch.zeros(2 * max_ctas + 3, dtype=torch.int32)
+    routed = []
+    for t, e in enumerate(experts_order):
+        tiles[t] = e
+        tiles[max_ctas + t] = t * tile + rows
+        routed += range(t * tile, t * tile + rows)
+    tiles[2 * max_ctas] = max_ctas
+    tiles = tiles.to(dev)
+    act = torch.randn(plan.rows, k, device=dev).to(torch.bfloat16)
+    gammas = torch.rand(plan.rows, device=dev) + 0.1
+    routed = torch.tensor(routed, dtype=torch.int32, device=dev)
+    num_routed = torch.tensor([routed.numel()], dtype=torch.int32, device=dev)
+
+    gate_up = gemm_nvfp4(
+        act,
+        experts.w13_weight,
+        experts.w13_weight_scale,
+        experts.w13_weight_amax,
+        experts.w13_weight_outer_scale_denominator,
+        tiles,
+        plan,
+    )
+    ref = swiglu_bf16(gate_up, gammas, 4.0, 25.0, (routed, num_routed), tile)
+    got = gemm_nvfp4_swiglu(act, experts, tiles, plan, gammas)
+    ref, got = ref[routed.long()].float(), got[routed.long()].float()
+    # Same bf16 GEMM outputs in; the activation may differ by a bf16 ulp.
+    torch.testing.assert_close(got, ref, rtol=1.6e-2, atol=1e-3 * ref.abs().max())

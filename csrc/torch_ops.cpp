@@ -19,7 +19,9 @@ void moe_gemm_bf16(torch::Tensor& c, const torch::Tensor& a,
 void nvfp4_moe_wmma(torch::Tensor& out, const torch::Tensor& act,
                     const torch::Tensor& packed, const torch::Tensor& scales,
                     const torch::Tensor& amax, const torch::Tensor& denominator,
-                    const torch::Tensor& tiles, int64_t max_ctas, int64_t tile_rows);
+                    const torch::Tensor& tiles, int64_t max_ctas, int64_t tile_rows,
+                    const std::optional<torch::Tensor>& gammas, double gate_cap,
+                    double up_cap);
 void moe_gemm_w4a16(torch::Tensor& c, const torch::Tensor& a,
                     const torch::Tensor& b, const torch::Tensor& scales,
                     const torch::Tensor& sorted_ids,
@@ -200,7 +202,8 @@ TORCH_LIBRARY(strix, m) {
   m.def(
       "nvfp4_moe_wmma(Tensor(a!) out, Tensor act, Tensor packed, Tensor scales, "
       "Tensor amax, Tensor denominator, Tensor tiles, int max_ctas, "
-      "int tile_rows) -> ()");
+      "int tile_rows, Tensor? gammas=None, float gate_cap=0.0, "
+      "float up_cap=0.0) -> ()");
   // Qwen3.8-Flash-Next hyper-connection up GEMM fused with the gated mix.
   m.def("hc_up_gate_mix_bf16(Tensor(a!) y, Tensor x, Tensor a, Tensor w) -> ()");
   // Qwen3.8-Flash-Next QSA indexer scores (single request).

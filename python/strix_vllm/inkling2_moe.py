@@ -17,6 +17,8 @@ checkpoint layout and the routing / combine kernels are the port's.
 
 from __future__ import annotations
 
+import os
+
 import strix  # noqa: F401  (registers torch.ops.strix)
 import torch
 from vllm import envs
@@ -36,6 +38,7 @@ from vllm.triton_utils import tl, triton
 # Batches up to this many tokens (8 experts each of 128: about a row per
 # expert tile) take the GEMVs.
 GEMV_MAX_CTAS = 64
+FUSED_SWIGLU = os.environ.get("STRIX_INKLING2_FUSED_SWIGLU", "1") == "1"
 # NVFP4 tile GEMV up to 152 expert tiles (64 tokens). Zipf-routed w13 at
 # 1 / 8 / 25 tokens: 0.14 / 0.64 / 1.32 ms against 0.17 / 0.80 / 1.39 for a
 # row per program; the grouped dot kernel takes over from about 96 tokens.
@@ -502,7 +505,7 @@ def gemm_nvfp4(act, weight, weight_scale, weight_amax, weight_denominator, tiles
     k = 2 * k_half
     out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
     tile = plan.tile
-    if tile >= 64 and n % 128 == 0 and k % 64 == 0:
+    if _wmma_ok(weight, plan):
         # fp16 WMMA (CIRU-derived): 31 / 29 TFLOPS (w13 / w2) at a 5k-token
         # prefill, against 24 for the Triton kernel below.
         torch.ops.strix.nvfp4_moe_wmma(
@@ -603,6 +606,35 @@ def gemm_mxfp8(act, weight, weight_scale, tiles, plan):
     return out
 
 
+def _wmma_ok(weight, plan) -> bool:
+    """Whether `gemm_nvfp4` runs `strix::nvfp4_moe_wmma` for this batch."""
+    return plan.tile >= 64 and weight.shape[1] % 128 == 0 and weight.shape[2] % 32 == 0
+
+
+def gemm_nvfp4_swiglu(act, experts, tiles, plan, gammas):
+    """w13 GEMM with the softcapped SwiGLU in its epilogue (`[rows, N / 2]`
+    bf16, as `swiglu_bf16` of `gemm_nvfp4`), for batches on the WMMA kernel."""
+    weight = experts.w13_weight
+    out = torch.empty(
+        (plan.rows, weight.shape[1] // 2), dtype=torch.bfloat16, device=act.device
+    )
+    torch.ops.strix.nvfp4_moe_wmma(
+        out,
+        act,
+        weight,
+        experts.w13_weight_scale,
+        experts.w13_weight_amax,
+        experts.w13_weight_outer_scale_denominator,
+        tiles,
+        plan.max_ctas,
+        plan.tile,
+        gammas,
+        float(experts.gate_cap or 0.0),
+        float(experts.up_cap or 0.0),
+    )
+    return out
+
+
 def _expert_gemm(experts, act, name, tiles, plan):
     if experts.nvfp4:
         _pretile_experts(experts)
@@ -645,16 +677,20 @@ def moe_forward(self, x: torch.Tensor, pass_idx: int = 0) -> torch.Tensor:
         is_padding,
     )
     src2dst, gammas, rows, tiles = routing
-    gate_up = _expert_gemm(experts, act, "w13", tiles, plan)
-    activated = swiglu_bf16(
-        gate_up,
-        gammas,
-        experts.gate_cap,
-        experts.up_cap,
-        (rows, tiles[2 * plan.max_ctas + 2 :]),
-        plan.tile,
-    )
-    del gate_up
+    if FUSED_SWIGLU and experts.nvfp4 and _wmma_ok(experts.w13_weight, plan):
+        _pretile_experts(experts)
+        activated = gemm_nvfp4_swiglu(act, experts, tiles, plan, gammas)
+    else:
+        gate_up = _expert_gemm(experts, act, "w13", tiles, plan)
+        activated = swiglu_bf16(
+            gate_up,
+            gammas,
+            experts.gate_cap,
+            experts.up_cap,
+            (rows, tiles[2 * plan.max_ctas + 2 :]),
+            plan.tile,
+        )
+        del gate_up
     down = _expert_gemm(experts, activated, "w2", tiles, plan)
     out = combine(down, src2dst, experts.topk, x.dtype)
     return out if experts.ep_size == 1 else tensor_model_parallel_all_reduce(out)

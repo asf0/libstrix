@@ -42,7 +42,20 @@ def _(
 
 
 @torch.library.register_fake("strix::nvfp4_moe_wmma")
-def _(out, act, packed, scales, amax, denominator, tiles, max_ctas, tile_rows):
+def _(
+    out,
+    act,
+    packed,
+    scales,
+    amax,
+    denominator,
+    tiles,
+    max_ctas,
+    tile_rows,
+    gammas=None,
+    gate_cap=0.0,
+    up_cap=0.0,
+):
     return None
 
 
