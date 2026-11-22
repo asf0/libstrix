@@ -160,9 +160,11 @@ def _blend_up_kernel(
         )
 
 
-def blend_up(dest, message, hidden, up, norm_weight, norm_eps, bt=32, bc=128):
+def blend_up(dest, message, hidden, up, norm_weight, norm_eps, bt=16, bc=128):
     """bf16 `(S, T, D)` blend and RMSNorm (as `blend_rms_norm`) of bf16
-    `hidden` `(S, T, R)` through `up` `(S, 2D, R)`."""
+    `hidden` `(S, T, R)` through `up` `(S, 2D, R)`. 16-token blocks keep the
+    second pass over `dest` / `message` in cache: 2.06 / 0.83 ms for 3 / 1
+    streams at 5k tokens (3.38 / 1.61 with 32)."""
     num_streams, num_tokens, d = message.shape
     rank = hidden.shape[2]
     out = message.new_empty((num_streams, num_tokens, d), dtype=torch.bfloat16)
