@@ -110,6 +110,7 @@ def _register_qsa_indexer() -> None:
         compress_ratio,
         num_columns=None,
         score_scale=None,
+        **kwargs,
     ):
         columns = (
             page_table.shape[1] * k_cache.shape[1] if num_columns is None else num_columns
@@ -143,6 +144,7 @@ def _register_qsa_indexer() -> None:
                 compress_ratio,
                 num_columns,
                 score_scale,
+                **kwargs,
             )
         divisor = math.sqrt(q.shape[2]) if score_scale is None else score_scale
         logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
