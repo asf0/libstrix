@@ -210,7 +210,7 @@ vcs-versioning==2.6.0
 watchfiles==1.3.0
 websockets==17.4
 wheel==0.48.0
-xgrammar==0.2.8
+xgrammar==0.2.9
 xxhash==4.0.2
 yarl==1.25.1
 zstandard==0.25.0
