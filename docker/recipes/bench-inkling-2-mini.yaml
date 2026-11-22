@@ -10,7 +10,8 @@ services:
     environment:
       MTP: 0
       HF_REPO: thinkingmachines/Inkling-2-Mini
-      STRIX_INKLING2_W4: ${STRIX_INKLING2_W4:-0}
+      STRIX_INKLING2_W4: ${STRIX_INKLING2_W4:-1}
+      STRIX_INKLING2_W4_HEAD: ${STRIX_INKLING2_W4_HEAD:-0}
     command:
       - /models/Inkling-2-Mini
       - --gpu-memory-utilization=${GPU_UTIL:-0.80}
