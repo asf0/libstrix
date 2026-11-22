@@ -41,6 +41,11 @@ def _(
     return None
 
 
+@torch.library.register_fake("strix::nvfp4_moe_wmma")
+def _(out, act, packed, scales, amax, denominator, tiles, max_ctas, tile_rows):
+    return None
+
+
 @torch.library.register_fake("strix::moe_gemm_w4a16")
 def _(
     c,

@@ -17,6 +17,7 @@ checkpoint layout and the routing / combine kernels are the port's.
 
 from __future__ import annotations
 
+import strix  # noqa: F401  (registers torch.ops.strix)
 import torch
 from vllm import envs
 from vllm.distributed import tensor_model_parallel_all_reduce
@@ -35,6 +36,10 @@ from vllm.triton_utils import tl, triton
 # Batches up to this many tokens (8 experts each of 128: about a row per
 # expert tile) take the GEMVs.
 GEMV_MAX_CTAS = 64
+# NVFP4 tile GEMV up to 152 expert tiles (64 tokens). Zipf-routed w13 at
+# 1 / 8 / 25 tokens: 0.14 / 0.64 / 1.32 ms against 0.17 / 0.80 / 1.39 for a
+# row per program; the grouped dot kernel takes over from about 96 tokens.
+NVFP4_TILE_GEMV_MAX_CTAS = 152
 
 
 @triton.jit
@@ -71,9 +76,24 @@ def _e4m3_f32(code):
 
 
 @triton.jit
-def _nvfp4_gemv_kernel(
+def _pt_bytes(expert, wrows, byte, N: tl.constexpr, K: tl.constexpr):
+    """Offsets of NVFP4 bytes `byte` (index in a K / 2 row) of weight rows
+    `wrows` in the pre-tiled layout (`pretile_nvfp4`)."""
+    tile = (expert * (N // 128) + wrows // 128) * (K // 64) + byte // 32
+    return tile * 4096 + (wrows % 128) * 32 + byte % 32
+
+
+@triton.jit
+def _pt_scales(expert, wrows, group, N: tl.constexpr, K: tl.constexpr):
+    """Offsets of e4m3 block scales `group` (16 columns each) of weight rows
+    `wrows` in the pre-tiled layout."""
+    tile = (expert * (N // 128) + wrows // 128) * (K // 64) + group // 4
+    return tile * 512 + (wrows % 128) * 4 + group % 4
+
+
+@triton.jit
+def _nvfp4_gemv_tile_kernel(
     A,
-    AScale,
     W,
     WScale,
     WAmax,
@@ -86,49 +106,41 @@ def _nvfp4_gemv_kernel(
     TILE: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
-    A_BF16: tl.constexpr,
 ):
-    # One routed row and BN output columns per program: streams the expert's
-    # NVFP4 rows once and reduces over K on the vector units. For decode,
-    # where each expert tile holds a row or two, this runs at memory speed
-    # where `tl.dot` on gfx1151 does not.
-    row = tl.program_id(1)
-    tile = row // TILE
+    # NVFP4 GEMV over all routed rows of an expert tile (decode, verify and
+    # small batches): each K step of the expert's weight rows is loaded and
+    # decoded once and reduced against every routed row on the vector units,
+    # at memory speed where `tl.dot` on gfx1151 is not (a sequence's tokens
+    # often share experts, so tiles hold several rows).
+    tile = tl.program_id(1)
     if tile >= tl.load(Tiles + 2 * max_ctas):
         return
-    if row >= tl.load(Tiles + max_ctas + tile):
-        return
+    row0 = tile * TILE
+    num_rows = tl.load(Tiles + max_ctas + tile) - row0
     expert = tl.load(Tiles + tile).to(tl.int64)
     outer = tl.load(WAmax + expert) / tl.load(WDenominator)
-    cols = tl.program_id(0) * BN + tl.arange(0, BN)
+    cols = (tl.program_id(0) * BN + tl.arange(0, BN)).to(tl.int64)
     half = tl.arange(0, BK // 2)
-    # Split layout (`split_nvfp4`): byte h of a K step holds column lo[h] in
-    # its low nibble and lo[h] + 16 in its high one.
-    lo = 32 * (half // 16) + half % 16
-    group = 2 * (half // 16)
-    weight_rows = (expert * N + cols[:, None]).to(tl.int64)
-    a_row = A + row.to(tl.int64) * K
-    acc = tl.zeros((BN,), tl.float32)
+    tile_rows = tl.arange(0, TILE)
+    acc = tl.zeros((TILE, BN), tl.float32)
     for k in range(0, K, BK):
-        if A_BF16:
-            a_lo = tl.load(a_row + k + lo).to(tl.float32)
-            a_hi = tl.load(a_row + k + lo + 16).to(tl.float32)
-        else:
-            a_scale = tl.load(
-                AScale + _scale_offsets(row, (k + lo) // 32, K // 32, TILE)
+        byte = k // 2 + half[None, :]
+        packed = tl.load(W + _pt_bytes(expert, cols[:, None], byte, N, K)).to(tl.int32)
+        scale = _e4m3_f32(
+            tl.load(WScale + _pt_scales(expert, cols[:, None], byte // 8, N, K)).to(
+                tl.int32
             )
-            a_mult = tl.exp2(a_scale.to(tl.float32) - 127.0)
-            a_lo = tl.load(a_row + k + lo).to(tl.float32) * a_mult
-            a_hi = tl.load(a_row + k + lo + 16).to(tl.float32) * a_mult
-        packed = tl.load(W + weight_rows * (K // 2) + k // 2 + half[None, :])
-        packed = packed.to(tl.int32)
-        scales = WScale + weight_rows * (K // 16) + k // 16 + group[None, :]
-        s_lo = _e4m3_f32(tl.load(scales).to(tl.int32))
-        s_hi = _e4m3_f32(tl.load(scales + 1).to(tl.int32))
-        partial = _e2m1_f32_bits(packed & 15) * a_lo[None, :] * s_lo
-        partial += _e2m1_f32_bits(packed >> 4) * a_hi[None, :] * s_hi
-        acc += tl.sum(partial, axis=1)
-    tl.store(Out + row.to(tl.int64) * N + cols, (acc * outer).to(tl.bfloat16))
+        )
+        w_even = _e2m1_f32_bits(packed & 15) * scale
+        w_odd = _e2m1_f32_bits(packed >> 4) * scale
+        for r in range(num_rows):
+            a_row = A + (row0 + r).to(tl.int64) * K + k
+            a_even = tl.load(a_row + 2 * half).to(tl.float32)
+            a_odd = tl.load(a_row + 2 * half + 1).to(tl.float32)
+            part = tl.sum(w_even * a_even[None, :] + w_odd * a_odd[None, :], axis=1)
+            acc += tl.where(tile_rows[:, None] == r, part[None, :], 0.0)
+    out = Out + (row0 + tile_rows[:, None]).to(tl.int64) * N + cols[None, :]
+    tl.store(out, (acc * outer).to(tl.bfloat16), tile_rows[:, None] < num_rows)
 
 
 @triton.jit
@@ -148,9 +160,8 @@ def _nvfp4_bmm_bf16_kernel(
     BN: tl.constexpr,
 ):
     # bf16 activation rows against NVFP4 weights decoded from their bits, K
-    # in steps of 32. Split layout (`split_nvfp4`): the low / high nibbles are
-    # the step's first / second 16 columns, so each meets a contiguous
-    # activation slice and one block scale per weight row in a K=16 dot.
+    # in steps of 32: even / odd activation columns meet the low / high
+    # nibbles in two K=16 dots. For tiles too small for `nvfp4_moe_wmma`.
     SUB: tl.constexpr = TILE // BM if TILE >= BM else 1
     pid_m = tl.program_id(1)
     tile = pid_m // SUB
@@ -164,23 +175,23 @@ def _nvfp4_bmm_bf16_kernel(
     outer = tl.load(WAmax + expert) / tl.load(WDenominator)
     rows = row0 + tl.arange(0, BM)
     row_mask = (rows < row_end)[:, None]
-    cols = tl.program_id(0) * BN + tl.arange(0, BN)
+    cols = (tl.program_id(0) * BN + tl.arange(0, BN)).to(tl.int64)
     j = tl.arange(0, 16)
-    weight_rows = (expert * N + cols).to(tl.int64)
-    a_ptrs = A + rows[:, None].to(tl.int64) * K + j[None, :]
-    w_ptrs = W + weight_rows[:, None] * (K // 2) + j[None, :]
-    ws_ptrs = WScale + weight_rows * (K // 16)
+    a_ptrs = A + rows[:, None].to(tl.int64) * K + 2 * j[None, :]
     acc = tl.zeros((BM, BN), tl.float32)
     for k in range(0, K, 32):
-        a_lo = tl.load(a_ptrs + k, row_mask, other=0.0)
-        a_hi = tl.load(a_ptrs + k + 16, row_mask, other=0.0)
-        packed = tl.load(w_ptrs + k // 2).to(tl.int32)
-        s_lo = _e4m3_f32(tl.load(ws_ptrs + k // 16).to(tl.int32)) * outer
-        s_hi = _e4m3_f32(tl.load(ws_ptrs + k // 16 + 1).to(tl.int32)) * outer
-        w_lo = _e2m1_bf16(packed & 15) * s_lo.to(tl.bfloat16)[:, None]
-        w_hi = _e2m1_bf16(packed >> 4) * s_hi.to(tl.bfloat16)[:, None]
-        acc = tl.dot(a_lo, tl.trans(w_lo), acc)
-        acc = tl.dot(a_hi, tl.trans(w_hi), acc)
+        a_even = tl.load(a_ptrs + k, row_mask, other=0.0)
+        a_odd = tl.load(a_ptrs + k + 1, row_mask, other=0.0)
+        byte = k // 2 + j[None, :]
+        packed = tl.load(W + _pt_bytes(expert, cols[:, None], byte, N, K)).to(tl.int32)
+        scale = _e4m3_f32(
+            tl.load(WScale + _pt_scales(expert, cols[:, None], byte // 8, N, K)).to(
+                tl.int32
+            )
+        )
+        scale = (scale * outer).to(tl.bfloat16)
+        acc = tl.dot(a_even, tl.trans(_e2m1_bf16(packed & 15) * scale), acc)
+        acc = tl.dot(a_odd, tl.trans(_e2m1_bf16(packed >> 4) * scale), acc)
     out_ptrs = Out + rows[:, None].to(tl.int64) * N + cols[None, :]
     tl.store(out_ptrs, acc.to(tl.bfloat16), row_mask)
 
@@ -201,7 +212,8 @@ def _mxfp8_gemv_kernel(
     BK: tl.constexpr,
     A_BF16: tl.constexpr,
 ):
-    # `_nvfp4_gemv_kernel` for MXFP8 weights (e4m3, an e8m0 scale per 32).
+    # A routed row and BN output columns per program, reduced over K on the
+    # vector units, for MXFP8 weights (e4m3, an e8m0 scale per 32).
     row = tl.program_id(1)
     tile = row // TILE
     if tile >= tl.load(Tiles + 2 * max_ctas):
@@ -452,37 +464,63 @@ def _gemv_launch(plan, k):
     return plan.tile == 16 and plan.max_ctas <= GEMV_MAX_CTAS and k % 128 == 0
 
 
-def split_nvfp4(weight: torch.Tensor) -> torch.Tensor:
-    """NVFP4 bytes `[..., K / 2]` (byte j: column 2j low, 2j + 1 high) in the
-    split layout the kernels read: in each 32-column block, byte j holds
-    column j low and j + 16 high."""
-    codes = torch.stack((weight & 15, weight >> 4), -1).view(*weight.shape[:-1], -1, 32)
-    return (codes[..., :16] | (codes[..., 16:] << 4)).reshape(weight.shape)
+def pretile_nvfp4(weight: torch.Tensor, scale: torch.Tensor):
+    """NVFP4 bytes `[..., N, K / 2]` and e4m3 scales `[..., N, K / 16]` in the
+    pre-tiled layout the kernels read: per 128 weight rows and 64 columns, the
+    rows' 32 code bytes (byte j: column 2j low, 2j + 1 high), and their 4
+    scale bytes, contiguous (`[N / 128, K / 64, 128, 32 | 4]`)."""
+    *lead, n, k_half = weight.shape
+    tiled = weight.reshape(*lead, n // 128, 128, k_half // 32, 32).transpose(-3, -2)
+    s8 = scale.view(torch.uint8)
+    tiled_s = s8.reshape(*lead, n // 128, 128, k_half // 32, 4).transpose(-3, -2)
+    return (
+        tiled.reshape(weight.shape),
+        tiled_s.reshape(scale.shape).view(scale.dtype),
+    )
 
 
-def _split_experts(experts) -> None:
-    """Rewrite the experts' NVFP4 weights in the split layout, in place, one
-    expert at a time (first forward: the profile run)."""
-    if getattr(experts, "_strix_split_nvfp4", False):
+def _pretile_experts(experts) -> None:
+    """Rewrite the experts' NVFP4 weights and block scales in the pre-tiled
+    layout, in place, one expert at a time (first forward: the profile run)."""
+    if getattr(experts, "_strix_pretiled_nvfp4", False):
         return
-    for name in ("w13_weight", "w2_weight"):
-        weight = getattr(experts, name)
-        assert weight.shape[-1] % 16 == 0
+    for name in ("w13", "w2"):
+        weight = getattr(experts, f"{name}_weight")
+        scale = getattr(experts, f"{name}_weight_scale")
+        assert weight.shape[-2] % 128 == 0 and weight.shape[-1] % 32 == 0
         for e in range(weight.shape[0]):
-            weight[e].copy_(split_nvfp4(weight[e]))
-    experts._strix_split_nvfp4 = True
+            w, sc = pretile_nvfp4(weight[e], scale[e])
+            weight[e].copy_(w)
+            scale[e].view(torch.uint8).copy_(sc.view(torch.uint8))
+    experts._strix_pretiled_nvfp4 = True
 
 
 def gemm_nvfp4(act, weight, weight_scale, weight_amax, weight_denominator, tiles, plan):
-    """Grouped NVFP4 GEMM; `weight` in the split layout (`split_nvfp4`)."""
+    """Grouped NVFP4 GEMM; `weight` / `weight_scale` pre-tiled
+    (`pretile_nvfp4`)."""
     _, n, k_half = weight.shape
     k = 2 * k_half
     out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
     tile = plan.tile
-    if _gemv_launch(plan, k):
-        bn, warps = (64, 4) if k >= 2048 else (16, 1)
-        _nvfp4_gemv_kernel[(n // bn, plan.rows)](
+    if tile >= 64 and n % 128 == 0 and k % 64 == 0:
+        # fp16 WMMA (CIRU-derived): 31 / 29 TFLOPS (w13 / w2) at a 5k-token
+        # prefill, against 24 for the Triton kernel below.
+        torch.ops.strix.nvfp4_moe_wmma(
+            out,
             act,
+            weight,
+            weight_scale,
+            weight_amax,
+            weight_denominator,
+            tiles,
+            plan.max_ctas,
+            tile,
+        )
+        return out
+    if plan.tile == 16 and plan.max_ctas <= NVFP4_TILE_GEMV_MAX_CTAS and k % 128 == 0:
+        # 16 columns, 1 warp, K step 128: w13 0.58 / 1.23 ms at 8 / 25
+        # Zipf-routed tokens (64 columns, 4 warps: 0.69 / 1.49).
+        _nvfp4_gemv_tile_kernel[(n // 16, plan.max_ctas)](
             act,
             weight,
             weight_scale.view(torch.uint8),
@@ -494,14 +532,12 @@ def gemm_nvfp4(act, weight, weight_scale, weight_amax, weight_denominator, tiles
             N=n,
             K=k,
             TILE=tile,
-            BN=bn,
-            BK=256 if k % 256 == 0 else 128,
-            A_BF16=True,
-            num_warps=warps,
+            BN=16,
+            BK=128,
+            num_warps=1,
         )
         return out
-    # 128x64 tiles, 1 stage: 24 TFLOPS at a 5k-token prefill.
-    bm = min(max(tile, 16), 128)
+    bm = min(max(tile, 16), 64)
     bn = 64
     sub = tile // bm if tile >= bm else 1
     _nvfp4_bmm_bf16_kernel[(n // bn, plan.max_ctas * sub)](
@@ -519,7 +555,7 @@ def gemm_nvfp4(act, weight, weight_scale, weight_amax, weight_denominator, tiles
         BM=bm,
         BN=bn,
         num_warps=4,
-        num_stages=1,
+        num_stages=2,
     )
     return out
 
@@ -569,7 +605,7 @@ def gemm_mxfp8(act, weight, weight_scale, tiles, plan):
 
 def _expert_gemm(experts, act, name, tiles, plan):
     if experts.nvfp4:
-        _split_experts(experts)
+        _pretile_experts(experts)
         return gemm_nvfp4(
             act,
             getattr(experts, f"{name}_weight"),

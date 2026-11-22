@@ -16,6 +16,10 @@ void moe_gemm_bf16(torch::Tensor& c, const torch::Tensor& a,
                    const std::optional<torch::Tensor>& topk_weights,
                    int64_t top_k, int64_t block_m, int64_t block_n,
                    bool silu_mul, c10::string_view activation);
+void nvfp4_moe_wmma(torch::Tensor& out, const torch::Tensor& act,
+                    const torch::Tensor& packed, const torch::Tensor& scales,
+                    const torch::Tensor& amax, const torch::Tensor& denominator,
+                    const torch::Tensor& tiles, int64_t max_ctas, int64_t tile_rows);
 void moe_gemm_w4a16(torch::Tensor& c, const torch::Tensor& a,
                     const torch::Tensor& b, const torch::Tensor& scales,
                     const torch::Tensor& sorted_ids,
@@ -192,6 +196,11 @@ TORCH_LIBRARY(strix, m) {
       "Tensor sorted_ids, Tensor expert_ids, Tensor num_post_padded, "
       "Tensor? topk_weights, int top_k, int block_m, int block_n, "
       "bool silu_mul=False, str activation='silu', int group_size=32) -> ()");
+  // Inkling 2 Mini NVFP4 expert GEMM, pre-tiled weights (CIRU-derived).
+  m.def(
+      "nvfp4_moe_wmma(Tensor(a!) out, Tensor act, Tensor packed, Tensor scales, "
+      "Tensor amax, Tensor denominator, Tensor tiles, int max_ctas, "
+      "int tile_rows) -> ()");
   // Qwen3.8-Flash-Next hyper-connection up GEMM fused with the gated mix.
   m.def("hc_up_gate_mix_bf16(Tensor(a!) y, Tensor x, Tensor a, Tensor w) -> ()");
   // Qwen3.8-Flash-Next QSA indexer scores (single request).
@@ -308,6 +317,7 @@ TORCH_LIBRARY_IMPL(strix, CUDA, m) {
   m.impl("_wmma_bf16_tile", &strix::_wmma_bf16_tile);
   m.impl("moe_gemm_bf16", &strix::moe_gemm_bf16);
   m.impl("moe_gemm_w4a16", &strix::moe_gemm_w4a16);
+  m.impl("nvfp4_moe_wmma", &strix::nvfp4_moe_wmma);
   m.impl("moe_act_quant_i8", &strix::moe_act_quant_i8);
   m.impl("qsa_union_attn_bf16", &strix::qsa_union_attn_bf16);
   m.impl("qsa_kv_to_f16", &strix::qsa_kv_to_f16);

@@ -6,8 +6,7 @@ reference that decodes the same NVFP4 bytes. Run inside the image:
 
 import pytest
 import torch
-
-from strix_vllm.inkling2_moe import gemm_mxfp8, gemm_nvfp4, split_nvfp4
+from strix_vllm.inkling2_moe import gemm_mxfp8, gemm_nvfp4, pretile_nvfp4
 from vllm.models.inkling2.amd.ops.triton_bmm import ExpertPlan, bmm, bmm_nvfp4
 
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
@@ -22,7 +21,19 @@ def decode(weight, scale, amax, denominator):
 
 
 @pytest.mark.parametrize("bf16_act", [False, True])
-@pytest.mark.parametrize("tile,rows", [(16, 5), (16, 16), (32, 23), (128, 100), (256, 200)])
+@pytest.mark.parametrize(
+    "tile,rows",
+    [
+        (16, 5),
+        (16, 16),
+        (32, 23),
+        (64, 40),
+        (128, 50),
+        (128, 100),
+        (256, 150),
+        (256, 200),
+    ],
+)
 def test_bmm_nvfp4_matches_reference(tile, rows, bf16_act):
     torch.manual_seed(0)
     num_experts, n, k = 3, 256, 384
@@ -45,7 +56,7 @@ def test_bmm_nvfp4_matches_reference(tile, rows, bf16_act):
     dev = torch.device("cuda")
     gpu = [t.to(dev) for t in (weight, scale, amax, denominator, tiles)]
     if bf16_act:  # libstrix's gfx1151 kernels
-        gpu[0] = split_nvfp4(gpu[0])
+        gpu[0], gpu[1] = pretile_nvfp4(gpu[0], gpu[1])
         out = gemm_nvfp4(act.to(torch.bfloat16).to(dev), *gpu, plan)
     else:  # the port's portable path
         out = bmm_nvfp4(act.to(dev), act_scale.to(dev), *gpu, plan)
@@ -128,3 +139,31 @@ def test_blend_up_matches_blend_rms_norm(tokens, streams, broadcast):
     ref = blend_rms_norm(dest, message, gain_forget, norm_weight, 1e-6)
     got = blend_up(dest, message, hidden, up, norm_weight, 1e-6)
     torch.testing.assert_close(got.float(), ref.float(), rtol=1.6e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("rows", [1, 7, 16])
+def test_nvfp4_tile_gemv_matches_reference(rows):
+    torch.manual_seed(0)
+    num_experts, n, k, tile = 3, 256, 384, 16
+    weight = torch.randint(0, 256, (num_experts, n, k // 2), dtype=torch.uint8)
+    scale = (torch.rand(num_experts, n, k // 16) * 2 + 0.1).to(torch.float8_e4m3fn)
+    amax = torch.rand(num_experts) + 0.5
+    denominator = torch.tensor([6.0 * 448.0])
+    experts = [2, 0, 1]
+    max_ctas = len(experts)
+    plan = ExpertPlan(tile=tile, max_ctas=max_ctas)
+    tiles = torch.zeros(2 * max_ctas + 1, dtype=torch.int32)
+    for t, e in enumerate(experts):
+        tiles[t] = e
+        tiles[max_ctas + t] = t * tile + max(rows - t, 1)
+    tiles[2 * max_ctas] = max_ctas
+    act = torch.randn(plan.rows, k).to(torch.bfloat16)
+    dev = torch.device("cuda")
+    gpu = [t.to(dev) for t in (weight, scale, amax, denominator, tiles)]
+    gpu[0], gpu[1] = pretile_nvfp4(gpu[0], gpu[1])
+    out = gemm_nvfp4(act.to(dev), *gpu, plan).float().cpu()
+    w = decode(weight, scale, amax, denominator)
+    for t, e in enumerate(experts):
+        sl = slice(t * tile, t * tile + max(rows - t, 1))
+        ref = act[sl].float() @ w[e].T
+        torch.testing.assert_close(out[sl], ref, rtol=2e-2, atol=2e-2 * ref.abs().max())
