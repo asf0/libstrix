@@ -19,6 +19,11 @@ services:
       - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-8192}
       - --max-num-seqs=${MAX_NUM_SEQS:-4}
       # Tool calls and reasoning come back parsed, as chat clients expect.
+      # DSpark (the checkpoint's mtp.safetensors): 2 drafts for a single
+      # request, none for 2+ (verify steps there cost more than they win).
+      # 44.0 -> 48.4 tok/s at 1 request, 86 at 4 either way; 139k KV tokens
+      # instead of 161k.
+      - '--speculative-config={"method":"dspark","model":"/models/Inkling-2-Mini","num_speculative_tokens":7,"num_speculative_tokens_per_batch_size":[[1,1,2],[2,64,0]]}'
       - --enable-auto-tool-choice
       - --tool-call-parser=inkling
       - --reasoning-parser=inkling
