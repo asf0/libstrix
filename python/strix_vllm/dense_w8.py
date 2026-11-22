@@ -57,6 +57,7 @@ def skinny_ok(rows: int, w_q: torch.Tensor) -> bool:
         rows <= MAX_SKINNY_BATCH_SIZE and w_q.numel() >= _W8_LARGE_NUMEL
     )
 
+
 _GROUP = 128
 _MAX_BYTES = float(os.environ.get("STRIX_DENSE_W8_MAX_GB", "12")) * 2**30
 # weight.data_ptr() -> (w_q, w_s, group, cu_count) for every converted layer.
@@ -211,7 +212,9 @@ def register() -> None:
                 pass
         w_q, w_s, group = _quantize(w.data)
         try:
-            got = torch.ops.strix.w8a16_skinny_gemm(w_q, x, w_s, None, cu, group).float()
+            got = torch.ops.strix.w8a16_skinny_gemm(
+                w_q, x, w_s, None, cu, group
+            ).float()
         except RuntimeError:
             return
         err = (got - want).norm() / want.norm().clamp_min(1e-6)
@@ -228,7 +231,9 @@ def register() -> None:
         if w4 is not None:
             w_q, w_s, cu = w4
             x_2d = x.reshape(-1, x.shape[-1])
-            out = torch.ops.vllm.strix_dense_w4_apply(x_2d, layer.weight, w_q, w_s, bias, cu)
+            out = torch.ops.vllm.strix_dense_w4_apply(
+                x_2d, layer.weight, w_q, w_s, bias, cu
+            )
             return out.reshape(*x.shape[:-1], layer.weight.size(0))
         w8 = getattr(layer, "_strix_w8", None)
         if w8 is None:
@@ -268,3 +273,26 @@ def register() -> None:
 
     UnquantizedEmbeddingMethod.process_weights_after_loading = embedding_process
     UnquantizedEmbeddingMethod.apply = embedding_apply
+
+    # fp32 heads (`head_dtype`, e.g. Inkling2's) skip quant_method.apply for
+    # torch.mm(out_dtype=float32) on the bf16 weight; decode batches read the
+    # int8 copy instead (bf16 output, upcast). Inkling 2 Mini's 201k-vocab
+    # head: 5.3 ms per step in bf16.
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+    head_apply = LogitsProcessor._apply_head
+
+    def apply_head(self, lm_head, hidden_states, embedding_bias):
+        w8 = getattr(lm_head, "_strix_w8", None)
+        if (
+            w8 is None
+            or self.head_dtype != torch.float32
+            or not skinny_ok(
+                hidden_states.reshape(-1, hidden_states.shape[-1]).size(0), w8[0]
+            )
+        ):
+            return head_apply(self, lm_head, hidden_states, embedding_bias)
+        out = apply_w8(lm_head, hidden_states, embedding_bias, emb_apply, None)
+        return out.float()
+
+    LogitsProcessor._apply_head = apply_head

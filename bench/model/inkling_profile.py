@@ -27,10 +27,25 @@ out = llm.chat(prompt, params)
 decode_s = time.time() - t0
 print(f"32 tokens in {decode_s:.2f} s ({32 / decode_s:.1f} tok/s, eager)")
 
-with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-    llm.chat(prompt, SamplingParams(temperature=0, max_tokens=16, ignore_eos=True))
+import os
+
+if os.environ.get("PROFILE_PREFILL"):
+    words = " ".join(["amber basil cedar delta ember fable garnet harbor"] * 400)
+    target = [{"role": "user", "content": "Summarize: " + words}]
+    params = SamplingParams(temperature=0, max_tokens=1)
+    llm.chat(target, params)  # compile the prefill shapes
+    target = [{"role": "user", "content": "Summarize briefly: " + words}]
+else:
+    target = prompt
+    params = SamplingParams(temperature=0, max_tokens=16, ignore_eos=True)
+with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+    llm.chat(target, params)
 print(
     prof.key_averages().table(
         sort_by="self_device_time_total", row_limit=35, max_name_column_width=90
     )
 )
+rows = [e for e in prof.key_averages(group_by_input_shape=True) if e.key in ("aten::mm", "aten::addmm", "aten::linear", "aten::bmm", "aten::matmul")]
+rows.sort(key=lambda e: -e.device_time_total)
+for e in rows[:14]:
+    print(f"SHAPE {e.key:12s} calls {e.count:5d} dev {e.device_time_total/1000:8.1f} ms  {e.input_shapes}")

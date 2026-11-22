@@ -20,8 +20,9 @@ def decode(weight, scale, amax, denominator):
     return values * blocks * (amax / denominator)[:, None, None]
 
 
-@pytest.mark.parametrize("tile,rows", [(16, 5), (16, 16), (32, 23)])
-def test_bmm_nvfp4_matches_reference(tile, rows):
+@pytest.mark.parametrize("bf16_act", [False, True])
+@pytest.mark.parametrize("tile,rows", [(16, 5), (16, 16), (32, 23), (128, 100)])
+def test_bmm_nvfp4_matches_reference(tile, rows, bf16_act):
     torch.manual_seed(0)
     num_experts, n, k = 3, 256, 384
     weight = torch.randint(0, 256, (num_experts, n, k // 2), dtype=torch.uint8)
@@ -42,8 +43,8 @@ def test_bmm_nvfp4_matches_reference(tile, rows):
 
     dev = torch.device("cuda")
     out = bmm_nvfp4(
-        act.to(dev),
-        act_scale.to(dev),
+        act.to(torch.bfloat16).to(dev) if bf16_act else act.to(dev),
+        None if bf16_act else act_scale.to(dev),
         weight.to(dev),
         scale.to(dev),
         amax.to(dev),
@@ -59,8 +60,9 @@ def test_bmm_nvfp4_matches_reference(tile, rows):
         torch.testing.assert_close(out[sl], ref, rtol=2e-2, atol=2e-2 * ref.abs().max())
 
 
-@pytest.mark.parametrize("tile,rows", [(16, 1), (16, 7)])
-def test_bmm_mxfp8_decode_matches_reference(tile, rows):
+@pytest.mark.parametrize("bf16_act", [False, True])
+@pytest.mark.parametrize("tile,rows", [(16, 1), (16, 7), (64, 40)])
+def test_bmm_mxfp8_decode_matches_reference(tile, rows, bf16_act):
     from vllm.models.inkling2.amd.ops.triton_bmm import bmm
 
     torch.manual_seed(0)
@@ -79,8 +81,9 @@ def test_bmm_mxfp8_decode_matches_reference(tile, rows):
     act_scale = torch.full((plan.rows * k // 32,), 127, dtype=torch.uint8)
     dev = torch.device("cuda")
     out = bmm(
-        act.to(dev), act_scale.to(dev), weight.to(dev), scale.to(dev),
-        tiles.to(dev), plan,
+        act.to(torch.bfloat16).to(dev) if bf16_act else act.to(dev),
+        None if bf16_act else act_scale.to(dev),
+        weight.to(dev), scale.to(dev), tiles.to(dev), plan,
     ).float().cpu()
     w = weight.float() * torch.exp2(scale.float() - 127).repeat_interleave(32, -1)
     for t, e in enumerate(experts):

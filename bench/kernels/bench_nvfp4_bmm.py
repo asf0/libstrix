@@ -9,7 +9,7 @@ import sys
 import torch
 
 sys.path.insert(0, "/work/bench/kernels")
-from nvfp4_bmm_v2 import bmm_nvfp4_gemv, bmm_nvfp4_v2  # noqa: E402
+from nvfp4_bmm_v2 import bmm_nvfp4_dequant, bmm_nvfp4_v4  # noqa: E402
 
 from vllm.models.inkling2.amd.ops.triton_bmm import ExpertPlan, bmm_nvfp4  # noqa: E402
 
@@ -29,7 +29,7 @@ def setup(n, k, tile, rows_per_tile, num_tiles=8, num_experts=128):
     scale = (torch.rand(num_experts, n, k // 16, generator=g) * 2 + 0.1).to(torch.float8_e4m3fn)
     amax = torch.rand(num_experts, generator=g) + 0.5
     denominator = torch.tensor([6.0 * 448.0])
-    experts = torch.randperm(num_experts, generator=g)[:num_tiles].tolist()
+    experts = torch.randperm(num_experts, generator=g)[:min(num_tiles, num_experts)].tolist()
     plan = ExpertPlan(tile=tile, max_ctas=num_tiles)
     tiles = torch.zeros(2 * num_tiles + 1, dtype=torch.int32)
     for t, e in enumerate(experts):
@@ -55,22 +55,26 @@ def time_us(fn, iters=50):
     return start.elapsed_time(end) * 1000 / iters
 
 
-for name, n, k in (("w13", 2304, 2304), ("w2", 2304, 1152)):
-    for tile, rows in ((16, 1), (16, 4)):
-        host, args, plan, experts = setup(n, k, tile, rows)
-        act, _, weight, scale, amax, denominator, _ = host
-        w = decode(weight, scale, amax, denominator)
-        ref = torch.cat([act[t * tile : t * tile + rows].float() @ w[e].T for t, e in enumerate(experts)])
-        for label, fn in (
-            ("v1", lambda: bmm_nvfp4(*args, plan)),
-            *[
-                (f"gemv bn{bn} bk{bk} w{nw}", (lambda bn=bn, bk=bk, nw=nw: bmm_nvfp4_gemv(*args, plan, bn=bn, bk=bk, num_warps=nw)))
-                for bn in (8, 16, 32, 64) for bk in (128, 256, 512) for nw in (1, 2, 4)
-            ],
-        ):
-            out = fn().float().cpu()
-            got = torch.cat([out[t * tile : t * tile + rows] for t in range(len(experts))])
-            err = ((got - ref).abs().max() / ref.abs().max()).item()
-            bytes_moved = len(experts) * n * (k // 2 + k // 16)
-            us = time_us(fn)
-            print(f"{name} tile{tile} rows{rows} {label:18s} {us:8.1f} us  {bytes_moved / us / 1e3:6.1f} GB/s  rel_err {err:.2e}", flush=True)
+if __name__ != "__main__":
+    pass
+else:
+  for name, n, k in (("w13", 2304, 2304), ("w2", 2304, 1152)):
+      for tile, rows, num_tiles in ((128, 128, 128), (256, 256, 128)):
+          host, args, plan, experts = setup(n, k, tile, rows, num_tiles=num_tiles)
+          act, _, weight, scale, amax, denominator, _ = host
+          w = decode(weight, scale, amax, denominator)
+          ref = torch.cat([act[t * tile : t * tile + rows].float() @ w[e].T for t, e in enumerate(experts)])
+          for label, fn in (
+              ("v1", lambda: bmm_nvfp4(*args, plan)),
+              ("v4 64x64 w4", lambda: bmm_nvfp4_v4(*args, plan, bm=64, bn=64, num_warps=4)),
+              *[
+                  (f"deq {bm}x{bn} w{nw}", (lambda bm=bm, bn=bn, nw=nw: bmm_nvfp4_dequant(*args, plan, bm=bm, bn=bn, num_warps=nw)))
+                  for bm, bn, nw in ((64, 128, 4), (64, 64, 4), (128, 128, 8))
+              ],
+          ):
+              out = fn().float().cpu()
+              got = torch.cat([out[t * tile : t * tile + rows] for t in range(len(experts))])
+              err = ((got - ref).abs().max() / ref.abs().max()).item()
+              flops = 2 * len(experts) * rows * n * k
+              us = time_us(fn, iters=10)
+              print(f"{name} tile{tile} rows{rows}x{len(experts)} {label:18s} {us:9.1f} us  {flops / us / 1e6:6.1f} TFLOPS  rel_err {err:.2e}", flush=True)
