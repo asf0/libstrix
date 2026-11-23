@@ -105,8 +105,9 @@ jobs:
             echo
             awk '/^## /{n++} n==1' CHANGELOG.md
           } > notes.md
-          gh release create "$GITHUB_REF_NAME" --verify-tag --notes-file notes.md \
-            --title "$GITHUB_REF_NAME" ||
-            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          # The repository's releases are immutable once published: attach the
+          # bundle to a draft, then publish it.
           docker/release-recipes.sh "${{ steps.build.outputs.tag }}" docker/recipes dist
-          gh release upload "$GITHUB_REF_NAME" dist/libstrix-recipes-*.zip --clobber
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --notes-file notes.md \
+            --title "$GITHUB_REF_NAME" dist/libstrix-recipes-*.zip
+          gh release edit "$GITHUB_REF_NAME" --draft=false
