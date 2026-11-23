@@ -38,6 +38,8 @@
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
 
+#include "../strix_common.h"
+
 namespace strix {
 namespace {
 
@@ -97,8 +99,6 @@ __device__ __forceinline__ void unpack_nvfp4_16(uint32_t p0, uint32_t p1,
   o1 = make_uint4(dst[4], dst[5], dst[6], dst[7]);
 }
 
-// cap * tanh(x / cap) with the port's division (`_div_rn`: the product with
-// the rounded reciprocal and one FMA correction, exact for its caps 4, 25).
 // 16 e4m3 bytes and their e8m0 scale byte -> 16 fp16.
 __device__ __forceinline__ void unpack_mxfp8_16(uint4 w, uint32_t scale_byte, uint4& o0,
                                                 uint4& o1) {
@@ -123,10 +123,23 @@ __device__ __forceinline__ void unpack_mxfp8_16(uint4 w, uint32_t scale_byte, ui
   o1 = make_uint4(dst[4], dst[5], dst[6], dst[7]);
 }
 
-__device__ __forceinline__ float softcap(float x, float cap, float inv_cap) {
+
+// The w13 epilogue's softcap and sigmoid on the hardware exp2 / rcp. q = x / cap
+// with the port's division (`_div_rn`: the product with the rounded reciprocal
+// and one FMA correction, exact for its caps 4, 25), then
+// cap * tanh(q) = cap * sign(q) * (1 - 2 / (1 + e^(2|q|))), absolute error
+// ~1e-7 * cap, under the bf16 rounding that follows. (libm tanhf, an exp2f
+// with range checks and an IEEE division were ~20% of the w13 GEMM time.)
+__device__ __forceinline__ float softcap_fast(float x, float cap, float inv_cap) {
   float q = x * inv_cap;
   q = fmaf(-fmaxf(fmaf(q, cap, -x), -3.4028234663852886e38f), inv_cap, q);
-  return cap > 0.f ? cap * tanhf(q) : x;
+  const float e = __builtin_amdgcn_exp2f(fabsf(q) * 2.8853900817779268f);
+  const float t = 1.f - 2.f * __builtin_amdgcn_rcpf(1.f + e);
+  return cap > 0.f ? cap * copysignf(t, q) : x;
+}
+
+__device__ __forceinline__ float sigmoid_fast(float x) {
+  return __builtin_amdgcn_rcpf(1.f + __builtin_amdgcn_exp2f(x * -1.4426950408889634f));
 }
 
 // One program: M_TILE rows of one expert tile x 128 output columns.
@@ -321,11 +334,12 @@ __global__ __launch_bounds__(32 * W_M * W_N, 2) void nvfp4_moe_wmma_kernel(
           // up column -> softcap(u). One softcap per lane, branch-free.
           const uint16_t v_bits = f32_to_bf16_rtne(acc[im][in][i] * outer);
           const float v = __uint_as_float((uint32_t)v_bits << 16);
-          const float sig = gate_lane ? 1.f / (1.f + exp2f(v * -1.4426950408889634f)) : 1.f;
-          const float part = softcap(v, my_cap, my_inv_cap) * sig;
-          const float y = (part * __shfl_xor(part, 1, 32)) * gamma;
+          const float sig = gate_lane ? sigmoid_fast(v) : 1.f;
+          const float part = softcap_fast(v, my_cap, my_inv_cap) * sig;
+          // (gate, up) in lanes (2j, 2j + 1); output pairs in lanes (4j, 4j + 2).
+          const float y = (part * xor_shuffle_f32(part, 1)) * gamma;
           const uint32_t h = f32_to_bf16_rtne(y);
-          const uint32_t h_next = __shfl_down(h, 2, 16);
+          const uint32_t h_next = uint32_t(xor_shuffle_b32(int(h), 2));
           if ((lane16 & 3) == 0 && r < valid) {
             const int col = (col_base + in * 16 + lane16) >> 1;
             *reinterpret_cast<uint32_t*>(out + (int64_t)(row0 + r) * (n / 2) + col) =
@@ -336,7 +350,7 @@ __global__ __launch_bounds__(32 * W_M * W_N, 2) void nvfp4_moe_wmma_kernel(
 #pragma unroll
         for (int in = 0; in < kBn; ++in) {
           const uint16_t h0 = f32_to_bf16_rtne(acc[im][in][i] * outer);
-          const uint32_t h1 = __shfl_down((uint32_t)h0, 1, 16);
+          const uint32_t h1 = uint32_t(xor_shuffle_b32(int(h0), 1));
           if ((lane16 & 1) == 0 && r < valid) {
             const int col = col_base + in * 16 + lane16;
             *reinterpret_cast<uint32_t*>(out + (int64_t)(row0 + r) * n + col) =
