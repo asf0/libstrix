@@ -254,6 +254,15 @@ def _(
     return None
 
 
+@torch.library.register_fake("strix::inkling2_kv_conv")
+def _(
+    k, v, wk, wv, k_dyn, v_dyn, cache, key_cache, value_cache, kv_slot_mapping,
+    positions, seq_idx, slot_mapping, block_table, query_start, scale,
+    clip_threshold, clip_eps, norm_eps,
+):
+    return None
+
+
 @torch.library.register_fake("strix::attn_prefill_bf16")
 def _(
     out,

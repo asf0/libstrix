@@ -132,6 +132,14 @@ void inkling_rel_attn_prefill(torch::Tensor& out, const torch::Tensor& q,
                               const torch::Tensor& tile_offsets, int64_t max_tiles,
                               double scale, int64_t window_left, int64_t q_tiles,
                               int64_t block_n);
+void inkling2_kv_conv(const torch::Tensor& k, const torch::Tensor& v, const torch::Tensor& wk,
+                      const torch::Tensor& wv, const std::optional<torch::Tensor>& k_dyn,
+                      const std::optional<torch::Tensor>& v_dyn, const torch::Tensor& cache,
+                      const torch::Tensor& key_cache, const torch::Tensor& value_cache,
+                      const torch::Tensor& kv_slot_mapping, const torch::Tensor& positions,
+                      const torch::Tensor& seq_idx, const torch::Tensor& slot_mapping,
+                      const torch::Tensor& block_table, const torch::Tensor& query_start,
+                      double scale, double clip_threshold, double clip_eps, double norm_eps);
 void attn_decode_bf16(torch::Tensor& out, const torch::Tensor& q,
                       const torch::Tensor& key_cache,
                       const torch::Tensor& value_cache,
@@ -292,6 +300,12 @@ TORCH_LIBRARY(strix, m) {
       "Tensor tile_offsets, int max_tiles, float scale, int window_left, "
       "int q_tiles, int block_n) -> ()");
   m.def(
+      "inkling2_kv_conv(Tensor k, Tensor v, Tensor wk, Tensor wv, Tensor? k_dyn, "
+      "Tensor? v_dyn, Tensor(a!) cache, Tensor(b!) key_cache, Tensor(c!) value_cache, "
+      "Tensor kv_slot_mapping, Tensor positions, Tensor seq_idx, Tensor slot_mapping, "
+      "Tensor block_table, Tensor query_start, float scale, float clip_threshold, "
+      "float clip_eps, float norm_eps) -> ()");
+  m.def(
       "attn_prefill32_bf16(Tensor(a!) out, Tensor q, Tensor key_cache, "
       "Tensor value_cache, Tensor cu_seqlens_q, Tensor seq_lens, "
       "Tensor block_table, Tensor tile_offsets, int max_tiles, float scale)"
@@ -373,6 +387,7 @@ TORCH_LIBRARY_IMPL(strix, CUDA, m) {
          &strix::gdn_chunk_fwd_k128_v128_c64_bf16);
   m.impl("attn_prefill_bf16", &strix::attn_prefill_bf16);
   m.impl("inkling_rel_attn_prefill", &strix::inkling_rel_attn_prefill);
+  m.impl("inkling2_kv_conv", &strix::inkling2_kv_conv);
   m.impl("attn_prefill32_bf16", &strix::attn_prefill32_bf16);
   m.impl("w8a16_skinny_gemm", &strix::w8a16_skinny_gemm);
   m.impl("fp8_skinny_gemm", &strix::fp8_skinny_gemm);

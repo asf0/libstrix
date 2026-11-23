@@ -30,6 +30,7 @@ _W4_MAX_ROWS = 5
 
 def register() -> None:
     _register_attention()
+    _register_kv_conv()
     _register_moe()
     _register_loop()
     _register_linear()
@@ -97,6 +98,72 @@ def _register_attention() -> None:
         result[nt:].zero_()
 
     attention.gated_rel_attention = gated_rel_attention
+
+
+_KV_CONV_TAPS: dict[tuple, torch.Tensor] = {}
+
+
+def _kv_conv_taps(weight: torch.Tensor, dynamic: bool) -> torch.Tensor:
+    """fp32 `[C, 4]` taps for strix::inkling2_kv_conv, made once per weight:
+    static `[C, W]` rounded to bf16 as the port's kernel reads them, dynamic
+    `[W, C]` (the static part) transposed."""
+    key = (weight.data_ptr(), dynamic)
+    taps = _KV_CONV_TAPS.get(key)
+    if taps is None:
+        taps = weight.t() if dynamic else weight.to(torch.bfloat16)
+        taps = taps.float().contiguous()
+        _KV_CONV_TAPS[key] = taps
+    return taps
+
+
+def _register_kv_conv() -> None:
+    """The attention prologue's K/V convs for prefill batches on the HIP
+    kernel (5k tokens: 1.15-1.19 -> 0.78-0.85 ms a layer)."""
+    if disabled("inkling2_kv_conv"):
+        return
+    try:
+        from vllm.models.inkling2.amd.ops import sconv
+    except ImportError:
+        return
+    if not hasattr(sconv, "kv_conv_prefill"):
+        return
+
+    def aligned(*tensors) -> bool:
+        return all(t.data_ptr() % 16 == 0 for t in tensors)
+
+    def kv_conv_prefill(
+        k, v, k_weight, v_weight, k_dynamic, v_dynamic, cache, key_cache,
+        value_cache, kv_slot_mapping, positions, seq_idx, slot_mapping,
+        block_table, query_start, *, scale, clip_threshold, clip_eps, norm_eps,
+    ) -> bool:
+        dynamic = k_dynamic is not None
+        page, n = key_cache.shape[1], cache.shape[2]
+        if (
+            key_cache.shape[3] != 128
+            or k.dtype != torch.bfloat16
+            or cache.dtype != torch.bfloat16
+            or key_cache.dtype != torch.bfloat16
+            or (k_weight.shape[0] if dynamic else k_weight.shape[1]) != 4
+            or page & (page - 1)
+            or n & (n - 1)
+            or k.stride(0) % 8
+            or v.stride(0) % 8
+            or any(st % 8 for st in cache.stride()[:3])
+            or not aligned(k, v, cache, key_cache, value_cache)
+            or (dynamic and (k_dynamic.dtype != torch.bfloat16
+                             or k_dynamic.stride(0) % 4 or v_dynamic.stride(0) % 4
+                             or k_dynamic.data_ptr() % 8 or v_dynamic.data_ptr() % 8))
+        ):
+            return False
+        torch.ops.strix.inkling2_kv_conv(
+            k, v, _kv_conv_taps(k_weight, dynamic), _kv_conv_taps(v_weight, dynamic),
+            k_dynamic, v_dynamic, cache, key_cache, value_cache, kv_slot_mapping,
+            positions, seq_idx, slot_mapping, block_table, query_start, scale,
+            clip_threshold, clip_eps, norm_eps,
+        )
+        return True
+
+    sconv.kv_conv_prefill = kv_conv_prefill
 
 
 def _register_draft_head() -> None:
