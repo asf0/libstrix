@@ -1038,6 +1038,38 @@ decode tok/s
 | 131,072 | 28.20 | - | 39.65 | - |
 | 261,120 | - | - | 28.46 | - |
 
+### Inkling 2 Mini
+
+thinkingmachines/Inkling-2-Mini (NVFP4 experts, MXFP8 in layers 20-23,
+looped core) on the strix-vllm `inkling2-rocm` branch with libstrix, bf16 KV,
+8k prefill chunks, prefix caching off. No stock column: upstream vLLM does not
+run this model on gfx1151 without the fork.
+
+prefill (one request)
+
+| prompt tokens | tok/s |
+| ---: | ---: |
+| 2,700 | 2,674 |
+| 10,800 | 2,688 |
+| 21,500 | 2,570 |
+
+decode, 256 tokens a request, distinct prompts (offline)
+
+| requests | tok/s total | tok/s per request |
+| ---: | ---: | ---: |
+| 1 | 47.2 | 47.2 |
+| 4 | 94.3 | 23.6 |
+| 8 | 111.1 | 13.9 |
+| 16 | 155.4 | 9.7 |
+
+Decode streams the experts at DRAM bandwidth: a request touches 8 of 128
+experts per layer visit, four distinct requests about 29, so the step time
+grows with the batch and total throughput keeps rising past the recipe's
+`MAX_NUM_SEQS=4`. DSpark (2 drafts for a single request, the recipe default)
+serves one request at 55.7 tok/s and four at 92.6 (server, 512 tokens each).
+GSM8K 213-216 of 250 across these kernel changes (McNemar p >= 0.45 between
+any two).
+
 ### gemma-4-26B-A4B
 
 prefill tok/s

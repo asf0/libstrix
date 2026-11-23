@@ -32,6 +32,8 @@ def decode(weight, scale, amax, denominator):
         (128, 100),
         (256, 150),
         (256, 200),
+        (256, 250),
+        (512, 400),
     ],
 )
 def test_bmm_nvfp4_matches_reference(tile, rows, bf16_act):
@@ -73,7 +75,10 @@ def test_bmm_nvfp4_matches_reference(tile, rows, bf16_act):
 @pytest.mark.parametrize("bf16_act", [False, True])
 @pytest.mark.parametrize(
     "tile,rows",
-    [(16, 1), (16, 7), (64, 40), (128, 20), (128, 50), (128, 100), (256, 150), (256, 200)],
+    [
+        (16, 1), (16, 7), (64, 40), (128, 20), (128, 50), (128, 100), (256, 150), (256, 200),
+        (512, 400),
+    ],
 )
 def test_bmm_mxfp8_decode_matches_reference(tile, rows, bf16_act, scale_lo):
     torch.manual_seed(0)
@@ -175,9 +180,11 @@ def test_nvfp4_tile_gemv_matches_reference(rows):
 
 @pytest.mark.parametrize("gather", [False, True])
 # Tile 16: the HIP GEMV's epilogue; larger tiles: the WMMA kernel's.
-# Tile >= 128: M64 and M128 blocks, alone and together.
+# Tile >= 128: M64 and M128 blocks, alone and together (several per tile).
 @pytest.mark.parametrize(
-    "tile,rows", [(16, 5), (16, 16), (64, 40), (128, 20), (128, 80), (128, 100), (256, 150)]
+    "tile,rows",
+    [(16, 5), (16, 16), (64, 40), (128, 20), (128, 80), (128, 100), (256, 150), (256, 250),
+     (512, 400)],
 )
 def test_wmma_swiglu_matches_gemm_then_swiglu(tile, rows, gather):
     from types import SimpleNamespace

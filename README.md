@@ -2,7 +2,7 @@
 
 **Fast vLLM on AMD Strix Halo** (Ryzen AI Max, Radeon 8060S, gfx1151).
 One `docker compose` command serves Qwen3.6, Qwen3.8, gemma-4, LFM2.5,
-MiniCPM-V, Muse-Glimmer and Flint behind an OpenAI-compatible API, with
+MiniCPM-V, Muse-Glimmer, Flint and Inkling 2 Mini behind an OpenAI-compatible API, with
 prefill 11-31x faster than stock vLLM at 64k context and decode up to 2.4x
 faster (more on gemma-4 and the FP8 27B).
 
@@ -41,6 +41,11 @@ Against stock upstream vLLM on one gfx1151 APU, single stream, int8 KV
 - **Speculative decoding:** DFlash 2 decodes the FP8 27B at 29.6 tok/s (7.7
   without a draft, 16.4 with MTP 2) and the FP8 35B at 85.1 (45.7 / 63.5);
   LFM2.5's DSpark draft takes it from 51.7 to 66.7 tok/s.
+- **Inkling 2 Mini** (NVFP4/MXFP8 experts, which gfx1151 has no FP4/FP8 hardware
+  for): prefill 2.6-2.7k tok/s from 2.7k to 21.5k tokens, decode 47 tok/s for
+  one request (56 with DSpark) and 155 tok/s total for 16; needs the fork's
+  `inkling2-rocm` branch. See
+  [docs/performance.md](docs/performance.md#inkling-2-mini).
 - **NPU prefill** (Flash-Next, `STRIX_ENABLE=npu`, kernel 7.4+): TTFT 7-8 %
   lower from 16k to 100k tokens served and prefill 9-11 % faster at 8k-32k
   offline, decode and short prompts unchanged, GSM8K unchanged; the NPU also

@@ -7,10 +7,11 @@ Installing the package registers the `vllm.general_plugins` entry point
 does. `STRIX_DISABLE=all`, or a comma-separated list of the names below, keeps
 vLLM's own kernels for A/B runs.
 
-`dense_w8` and `moe_w4a8` change numerics or memory and were measured on
-Qwen3.8-Flash-Next only, so they turn on for that architecture
-(`Qwen4Exp*`) alone and log `libstrix: <op> on/off for <arch>` at load.
-`STRIX_ENABLE=dense_w8,moe_w4a8` turns them on for another model;
+`dense_w8` and `moe_w4a8` change numerics or memory, so they turn on only for
+the architectures they were measured on (`dense_w8`: Qwen3.8-Flash-Next,
+Flint and Inkling 2; `moe_w4a8`: Qwen3.8-Flash-Next) and log `libstrix: <op>
+on/off for <arch>` at load. `STRIX_ENABLE=dense_w8,moe_w4a8` turns them on for
+another model;
 `STRIX_DISABLE` still wins. `dense_w8` stops adding int8 copies at
 `STRIX_DENSE_W8_MAX_GB` (default 12).
 
@@ -86,6 +87,12 @@ projection shape turns it off the same way.
 | `qsa_indexer` | `qsa_indexer_bf16` | the QSA indexer's paged scores (`qsa_mqa_paged`) for a single-request prefill of >= 128 rows (1.7-1.9x the tl.dot kernel) | 4 indexer heads, head_dim 128, one KV head, bf16, one request |
 | `hc_up_gate_mix` | `hc_up_gate_mix_bf16` | Qwen4Exp hyper-connection up projection fused with `hc_gate_mix` (6.7 -> 5.2 ms per site at 16k rows, no gate in memory) | hc_count 4, bf16, K % 64 == 0, batch >= 512 rows |
 | `dense_w8` | `w8a16_skinny_gemm` on int8 copies | **decode** copies of unquantized bf16 linears and the LM head: the bf16 weight stays for prefill, batches of <= 5 rows read an int8 copy, and 6-8 rows (a DFlash 2 verify step) on weights of 8M elements or more (Qwen3.8-Flash-Next decode 51 -> 37 ms/step; GSM8K 93 vs 92; LM head at 7 rows 3.3 ms against 5.5 ms bf16) | bf16 2-D weights, K % 16 == 0; each copy is checked against bf16 at load |
+| `inkling2_moe` | `nvfp4_moe_wmma`, `mxfp8_moe_wmma` (prefill, fp16 WMMA with the e2m1 / e4m3 decode at the LDS commit), `nvfp4_moe_gemv` (decode-sized tiles of <= 16 rows) | the ROCm Inkling2 port's MoE forward (`Inkling2MoE.forward`): bf16 rows instead of MXFP8 activations, the experts rewritten in place to a pre-tiled layout, the port's softcapped SwiGLU and the routing weights in the w13 epilogue (hardware exp2 / rcp), w13 reading token rows directly | NVFP4 experts with e4m3 block scales and MXFP8 experts (layers 20-23 of Inkling 2 Mini, scale bytes in the fp16 range), K % 64 == 0, N % 128 == 0 |
+| `inkling2_loop` | Triton (`python/strix_vllm/inkling2_loop.py`) | the loop message controllers (`Inkling2LoopDecoderLayer.blend`): split-K down / up kernels for <= 16 tokens, and for prefill the gain/forget made in place inside the blend and RMSNorm (never stored) | rank 16-128, hidden % 128 == 0 |
+| `inkling2_attention` | `inkling_rel_attn_prefill` (`attn_prefill_bf16` with Inkling's relative logits and gate/sink epilogue) | the port's `gated_rel_attention` (prefill and mixed batches) and its `rel_attention_prefill` hook: window layers compute their relative logits in the kernel from the clipped r (one WMMA per 16 distances, sheared through LDS), so the prologue skips the 315 MB sheared table of a 5k-token chunk; full layers read the table. The output gate and the per-token sink are applied in the epilogue (bf16 out) | head 128, GQA 3, bf16 KV, page % 32 == 0; 4 query tiles per block on full layers, 2 on window layers |
+| `inkling2_kv_conv` | `inkling2_kv_conv` | the K/V short convolutions of the port's attention prologue for prefill batches (>= 2048 tokens), with the K clip, V RMS norm and the KV- and conv-cache writes (1.15-1.19 -> 0.78-0.85 ms a layer at 5k tokens) | W = 4 taps (static or dynamic), head 128, bf16, power-of-two KV page and conv block |
+| `inkling2_linear` | `w8a16_skinny_gemm` / vLLM's `wvSplitK_int4_g` | the port's `inkling2_linear` (attention projections) for decode batches: int4-g32 copies for <= 5 rows (`STRIX_INKLING2_W4=0` keeps int8), `dense_w8`'s int8 copies otherwise | needs `dense_w8`; bf16 weights, K % 32 == 0 |
+| `inkling2_draft_head` | `w8a16_skinny_gemm` on `dense_w8` copies | the DSpark draft's base logits and draft-layer GEMMs (`draft_linear`) for skinny batches | needs `dense_w8` |
 
 Some swaps live in code that `torch.compile` traces. vLLM keys its compile
 caches on its own env vars and config only, so the plugin adds
