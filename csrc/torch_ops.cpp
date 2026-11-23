@@ -131,7 +131,8 @@ void inkling_rel_attn_prefill(torch::Tensor& out, const torch::Tensor& q,
                               const torch::Tensor& block_table,
                               const torch::Tensor& tile_offsets, int64_t max_tiles,
                               double scale, int64_t window_left, int64_t q_tiles,
-                              int64_t block_n);
+                              int64_t block_n,
+                              const std::optional<torch::Tensor>& rel_proj_t);
 void inkling2_kv_conv(const torch::Tensor& k, const torch::Tensor& v, const torch::Tensor& wk,
                       const torch::Tensor& wv, const std::optional<torch::Tensor>& k_dyn,
                       const std::optional<torch::Tensor>& v_dyn, const torch::Tensor& cache,
@@ -298,7 +299,7 @@ TORCH_LIBRARY(strix, m) {
       "Tensor value_cache, Tensor rel_logits, Tensor gate, Tensor sinks, "
       "Tensor cu_seqlens_q, Tensor seq_lens, Tensor block_table, "
       "Tensor tile_offsets, int max_tiles, float scale, int window_left, "
-      "int q_tiles, int block_n) -> ()");
+      "int q_tiles, int block_n, Tensor? rel_proj_t=None) -> ()");
   m.def(
       "inkling2_kv_conv(Tensor k, Tensor v, Tensor wk, Tensor wv, Tensor? k_dyn, "
       "Tensor? v_dyn, Tensor(a!) cache, Tensor(b!) key_cache, Tensor(c!) value_cache, "

@@ -249,7 +249,7 @@ def gdn_chunk_fwd(
 def _(
     out, q, key_cache, value_cache, rel_logits, gate, sinks, cu_seqlens_q,
     seq_lens, block_table, tile_offsets, max_tiles, scale, window_left,
-    q_tiles, block_n,
+    q_tiles, block_n, rel_proj_t=None,
 ):
     return None
 

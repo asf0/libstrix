@@ -46,9 +46,38 @@ _REL_Q_TILES_WINDOW = 2
 _REL_BLOCK_N = 32
 
 
+_REL_PROJ_T: dict[int, torch.Tensor] = {}
+
+
+def _rel_attention(
+    q, key_cache, value_cache, rel, gate, sinks, result, block_table, cache_seqlens,
+    cu_seqlens_q, num_actual_tokens, softmax_scale, window, rel_proj_t=None,
+) -> None:
+    """strix::inkling_rel_attn_prefill over the requests' tokens (later rows
+    of `result` are zeroed); `rel` is the sheared logits, or with
+    `rel_proj_t` the clipped r."""
+    nt = num_actual_tokens
+    q_tiles = _REL_Q_TILES_WINDOW if window >= 0 else _REL_Q_TILES_FULL
+    tile = 16 * q_tiles
+    cu = cu_seqlens_q.to(torch.int32)
+    offsets = torch.zeros_like(cu)
+    torch.cumsum((cu[1:] - cu[:-1] + tile - 1) // tile, 0, out=offsets[1:])
+    max_tiles = (nt + tile - 1) // tile + cu.numel() - 1
+    torch.ops.strix.inkling_rel_attn_prefill(
+        result, q, key_cache, value_cache, rel, gate, sinks, cu,
+        cache_seqlens.to(torch.int32), block_table, offsets, max_tiles,
+        softmax_scale, window, q_tiles, _REL_BLOCK_N, rel_proj_t,
+    )
+    result[nt:].zero_()
+
+
 def _register_attention() -> None:
     """Prefill (and mixed-batch) relative attention on the HIP kernel, with
-    the output gate and sink in its epilogue."""
+    the output gate and sink in its epilogue. Window layers compute their
+    relative logits in the kernel (the port's prologue then writes only the
+    clipped r, not the 315 MB sheared table of a 5k-token chunk); full layers
+    read the table (their logits only cover the last 1024 of many keys, and
+    the in-kernel version's registers and LDS slowed every step)."""
     if disabled("inkling2_attention"):
         return
     try:
@@ -83,21 +112,40 @@ def _register_attention() -> None:
                 num_actual_tokens=num_actual_tokens, softmax_scale=softmax_scale,
                 window=window,
             )
-        nt = num_actual_tokens
-        q_tiles = _REL_Q_TILES_WINDOW if window >= 0 else _REL_Q_TILES_FULL
-        tile = 16 * q_tiles
-        cu = cu_seqlens_q.to(torch.int32)
-        offsets = torch.zeros_like(cu)
-        torch.cumsum((cu[1:] - cu[:-1] + tile - 1) // tile, 0, out=offsets[1:])
-        max_tiles = (nt + tile - 1) // tile + cu.numel() - 1
-        torch.ops.strix.inkling_rel_attn_prefill(
-            result, q, key_cache, value_cache, sheared_bias, gate, sinks, cu,
-            cache_seqlens.to(torch.int32), block_table, offsets, max_tiles,
-            softmax_scale, window, q_tiles, _REL_BLOCK_N,
+        _rel_attention(
+            q, key_cache, value_cache, sheared_bias, gate, sinks, result, block_table,
+            cache_seqlens, cu_seqlens_q, num_actual_tokens, softmax_scale, window,
         )
-        result[nt:].zero_()
 
     attention.gated_rel_attention = gated_rel_attention
+    if not hasattr(attention, "rel_attention_prefill"):
+        return
+
+    def rel_attention_prefill(
+        q, key_cache, value_cache, r, rel_proj, gate, sinks, result, *,
+        block_table, cache_seqlens, cu_seqlens_q, max_seqlen_q,
+        num_actual_tokens, softmax_scale, window,
+    ) -> None:
+        proj_t = _REL_PROJ_T.get(rel_proj.data_ptr())
+        if proj_t is None:
+            proj_t = rel_proj.t().contiguous()
+            _REL_PROJ_T[rel_proj.data_ptr()] = proj_t
+        _rel_attention(
+            q, key_cache, value_cache, r, gate, sinks, result, block_table,
+            cache_seqlens, cu_seqlens_q, num_actual_tokens, softmax_scale, window,
+            proj_t,
+        )
+
+    def supports(num_heads, num_kv_heads, head_dim, block_size, extent, window) -> bool:
+        return (
+            window >= 0
+            and head_dim == 128
+            and num_heads == 3 * num_kv_heads
+            and block_size % _REL_BLOCK_N == 0
+        )
+
+    rel_attention_prefill.supports = supports
+    attention.rel_attention_prefill = rel_attention_prefill
 
 
 _KV_CONV_TAPS: dict[tuple, torch.Tensor] = {}
