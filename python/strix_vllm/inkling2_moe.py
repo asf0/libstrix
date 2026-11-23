@@ -39,6 +39,7 @@ from vllm.triton_utils import tl, triton
 # expert tile) take the GEMVs.
 GEMV_MAX_CTAS = 64
 FUSED_SWIGLU = os.environ.get("STRIX_INKLING2_FUSED_SWIGLU", "1") == "1"
+HIP_GEMV = os.environ.get("STRIX_INKLING2_HIP_GEMV", "1") == "1"
 # NVFP4 tile GEMV up to 152 expert tiles (64 tokens). Zipf-routed w13 at
 # 1 / 8 / 25 tokens: 0.14 / 0.64 / 1.32 ms against 0.17 / 0.80 / 1.39 for a
 # row per program; the grouped dot kernel takes over from about 96 tokens.
@@ -523,6 +524,19 @@ def gemm_nvfp4(act, weight, weight_scale, weight_amax, weight_denominator, tiles
         # fp16 WMMA (CIRU-derived): 31 / 29 TFLOPS (w13 / w2) at a 5k-token
         # prefill, against 24 for the Triton kernel below.
         torch.ops.strix.nvfp4_moe_wmma(
+            out,
+            act,
+            weight,
+            weight_scale,
+            weight_amax,
+            weight_denominator,
+            tiles,
+            plan.max_ctas,
+            tile,
+        )
+        return out
+    if HIP_GEMV and plan.tile == 16 and plan.max_ctas <= NVFP4_TILE_GEMV_MAX_CTAS:
+        torch.ops.strix.nvfp4_moe_gemv(
             out,
             act,
             weight,

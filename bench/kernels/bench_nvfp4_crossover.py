@@ -44,12 +44,11 @@ for name, n, k in (("w13", 2304, 2304), ("w2", 2304, 1152)):
                 N=n, K=k, TILE=plan.tile, BN=16, BK=128, num_warps=1)
             return out
 
-        for label, cap in (("gemv", 1 << 30), ("grouped", 0), ("tile", None)):
-            if cap is None:
-                fn = tile_gemv
-            else:
-                M.NVFP4_ROW_GEMV_MAX_CTAS = cap; M.NVFP4_TILE_GEMV_MAX_CTAS = cap
-                fn = lambda w: M.gemm_nvfp4(act, w, scale, amax, den, tiles, plan)  # noqa: E731
+        def hip_gemv(w):
+            torch.ops.strix.nvfp4_moe_gemv(out, act, w, scale, amax, den, tiles, plan.max_ctas, plan.tile)
+            return out
+
+        for label, fn in (("tile", tile_gemv), ("hip", hip_gemv)):
             for w in weights:
                 fn(w)
             torch.cuda.synchronize()
@@ -62,11 +61,10 @@ for name, n, k in (("w13", 2304, 2304), ("w2", 2304, 1152)):
             torch.cuda.synchronize()
             res[label] = s.elapsed_time(e_) * 1000 / (3 * LAYERS)
         used = int((counts > 0).sum())
-        M.NVFP4_ROW_GEMV_MAX_CTAS = 1 << 30
-        ref = M.gemm_nvfp4(act, weights[0], scale, amax, den, tiles, plan)
-        got = tile_gemv(weights[0])
+        ref = tile_gemv(weights[0]).clone()
+        got = hip_gemv(weights[0])
         valid = torch.cat([torch.arange(i * plan.tile, int(tiles[plan.max_ctas + i])) for i in range(int(tiles[2 * plan.max_ctas]))]).to(dev)
         err = ((got[valid].float() - ref[valid].float()).abs().max() / ref[valid].float().abs().max()).item()
         print(f"{name} skew {skew} tokens {tokens:4d} experts {used:3d} max/expert {int(counts.max()):2d} "
-              f"gemv {res['gemv']:7.1f} grouped {res['grouped']:7.1f} tile {res['tile']:7.1f} us err {err:.0e} "
+              f"triton tile {res['tile']:7.1f} hip {res['hip']:7.1f} us err {err:.0e} "
               f"(experts once at 165 GB/s: {used * n * (k // 2 + k // 16) / 165e3:6.1f} us)", flush=True)

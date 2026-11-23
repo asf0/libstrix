@@ -49,8 +49,15 @@ if os.environ.get("PROFILE_PREFILL"):
 else:
     target = prompt
     params = SamplingParams(temperature=0, max_tokens=16, ignore_eos=True)
+# STRIX_PROFILE_BATCH=n: n concurrent requests (distinct prompts).
+batch = int(os.environ.get("STRIX_PROFILE_BATCH", "1"))
+targets = [target] if batch == 1 else [
+    [{"role": "user", "content": f"{target[0]['content']} ({i})"}] for i in range(batch)
+]
+if batch > 1:
+    llm.chat(targets, params)  # warm up the batch shapes
 with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
-    llm.chat(target, params)
+    llm.chat(targets if batch > 1 else target, params)
 print(
     prof.key_averages().table(
         sort_by="self_device_time_total", row_limit=35, max_name_column_width=90
