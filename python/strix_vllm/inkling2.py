@@ -33,6 +33,31 @@ def register() -> None:
     _register_loop()
     _register_linear()
     _register_head()
+    _register_draft_head()
+
+
+def _register_draft_head() -> None:
+    """DSpark draft base logits from the int8 copy of the shared LM head for
+    skinny batches (drafts are verified, so this only moves acceptance)."""
+    if disabled("dense_w8") or disabled("inkling2_draft_head"):
+        return
+    try:
+        from vllm.models.inkling2.amd import dspark
+    except ImportError:
+        return
+    bf16_logits = dspark.Inkling2DSparkModel.compute_base_logits
+
+    def compute_base_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        w8 = getattr(self.lm_head, "_strix_w8", None)
+        x_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
+        if w8 is None or not dense_w8.skinny_ok(x_2d.size(0), w8[0]):
+            return bf16_logits(self, hidden_states)
+        w_q, w_s, group, cu = w8
+        return torch.ops.vllm.strix_dense_w8_apply(
+            x_2d, self.lm_head.weight, w_q, w_s, None, cu, group
+        )
+
+    dspark.Inkling2DSparkModel.compute_base_logits = compute_base_logits
 
 
 def _register_loop() -> None:
