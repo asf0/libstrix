@@ -535,7 +535,7 @@ def gemm_nvfp4(act, weight, weight_scale, weight_amax, weight_denominator, tiles
             tile,
         )
         return out
-    if HIP_GEMV and plan.tile == 16 and plan.max_ctas <= NVFP4_TILE_GEMV_MAX_CTAS:
+    if _hip_gemv_ok(plan):
         torch.ops.strix.nvfp4_moe_gemv(
             out,
             act,
@@ -656,11 +656,17 @@ def _wmma_ok(weight, plan) -> bool:
     return plan.tile >= 64 and weight.shape[1] % 128 == 0 and weight.shape[2] % 32 == 0
 
 
+def _hip_gemv_ok(plan) -> bool:
+    """Whether an NVFP4 GEMM of this batch runs on the HIP tile GEMV."""
+    return HIP_GEMV and plan.tile == 16 and plan.max_ctas <= NVFP4_TILE_GEMV_MAX_CTAS
+
+
 def _swiglu_wmma_ok(experts, plan) -> bool:
-    """Whether the w13 GEMM of this batch runs on a WMMA kernel."""
+    """Whether the w13 GEMM of this batch has a SwiGLU epilogue (a WMMA
+    kernel, or the HIP GEMV for NVFP4)."""
     weight = experts.w13_weight
     if experts.nvfp4:
-        return _wmma_ok(weight, plan)
+        return _wmma_ok(weight, plan) or _hip_gemv_ok(plan)
     n, k = weight.shape[1], weight.shape[2]
     return (
         plan.tile >= 64
@@ -672,7 +678,8 @@ def _swiglu_wmma_ok(experts, plan) -> bool:
 
 def gemm_nvfp4_swiglu(act, experts, tiles, plan, gammas, row_token=None):
     """w13 GEMM with the softcapped SwiGLU in its epilogue (`[rows, N / 2]`
-    bf16, as `swiglu_bf16` of the GEMM), for batches on a WMMA kernel. With
+    bf16, as `swiglu_bf16` of the GEMM), for batches on a WMMA kernel or the
+    HIP GEMV. With
     `row_token`, `act` is the token rows and layout row r reads
     `act[row_token[r]]`."""
     weight = experts.w13_weight
@@ -694,7 +701,12 @@ def gemm_nvfp4_swiglu(act, experts, tiles, plan, gammas, row_token=None):
             row_token,
         )
         return out
-    torch.ops.strix.nvfp4_moe_wmma(
+    op = (
+        torch.ops.strix.nvfp4_moe_gemv
+        if _hip_gemv_ok(plan)
+        else torch.ops.strix.nvfp4_moe_wmma
+    )
+    op(
         out,
         act,
         weight,

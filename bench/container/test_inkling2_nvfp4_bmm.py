@@ -173,7 +173,8 @@ def test_nvfp4_tile_gemv_matches_reference(rows):
 
 
 @pytest.mark.parametrize("gather", [False, True])
-@pytest.mark.parametrize("tile,rows", [(64, 40), (128, 100), (256, 150)])
+# Tile 16: the HIP GEMV's epilogue; larger tiles: the WMMA kernel's.
+@pytest.mark.parametrize("tile,rows", [(16, 5), (16, 16), (64, 40), (128, 100), (256, 150)])
 def test_wmma_swiglu_matches_gemm_then_swiglu(tile, rows, gather):
     from types import SimpleNamespace
 

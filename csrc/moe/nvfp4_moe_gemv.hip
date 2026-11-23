@@ -14,6 +14,11 @@
 // activations (staged in LDS) in v_dot2_f32_bf16; each 16-column group's
 // partial sum takes its e4m3 scale in fp32, and the expert's amax /
 // denominator scales the result.
+//
+// With `gammas`, the epilogue is the port's softcapped SwiGLU, as in
+// nvfp4_moe_wmma: w13 rows are interleaved (gate, up) pairs, held by
+// neighbouring lanes, and out is [rows, N / 2]. With `row_token`, A row r is
+// act[row_token[r]].
 
 #include <ATen/hip/HIPContext.h>
 #include <torch/all.h>
@@ -58,13 +63,22 @@ __device__ __forceinline__ float e4m3_to_f32(uint32_t b) {
   return (b & 0x80u) ? -v : v;
 }
 
+// cap * tanh(x / cap) with the port's division (see nvfp4_moe_wmma.hip).
+__device__ __forceinline__ float softcap(float x, float cap, float inv_cap) {
+  float q = x * inv_cap;
+  q = fmaf(-fmaxf(fmaf(q, cap, -x), -3.4028234663852886e38f), inv_cap, q);
+  return cap > 0.f ? cap * tanhf(q) : x;
+}
+
+template <bool SWIGLU>
 __global__ __launch_bounds__(kThreads) void nvfp4_moe_gemv_kernel(
     const uint16_t* __restrict__ act,     // bf16 [rows, K]
     const uint4* __restrict__ packed,     // [E, N/128, K/64, 128, 2] uint4
     const uint32_t* __restrict__ scales,  // [E, N/128, K/64, 128] u32
     const float* __restrict__ amax, const float* __restrict__ denominator,
     const int32_t* __restrict__ tiles, uint16_t* __restrict__ out,  // bf16
-    int max_ctas, int tile_rows, int n, int k) {
+    const float* __restrict__ gammas, float gate_cap, float up_cap,
+    const int32_t* __restrict__ row_token, int max_ctas, int tile_rows, int n, int k) {
   const int tile = blockIdx.x;
   if (tile >= min(tiles[2 * max_ctas], max_ctas)) return;
   const int row0 = tile * tile_rows;
@@ -92,8 +106,9 @@ __global__ __launch_bounds__(kThreads) void nvfp4_moe_gemv_kernel(
     __syncthreads();
     for (int i = tid; i < num_rows * vec_per_row; i += kThreads) {
       const int r = i / vec_per_row, v = i % vec_per_row;
+      const int64_t src = row_token ? row_token[row0 + r] : row0 + r;
       a_lds[r * (kChunk / 8) + v] =
-          *reinterpret_cast<const uint4*>(act + (int64_t)(row0 + r) * k + c0 + v * 8);
+          *reinterpret_cast<const uint4*>(act + src * k + c0 + v * 8);
     }
     __syncthreads();
     const int kt0 = c0 / 64;
@@ -144,13 +159,26 @@ __global__ __launch_bounds__(kThreads) void nvfp4_moe_gemv_kernel(
   if (half == 0) {
     const float outer = amax[expert] / denominator[0];
     const int col = n_blk * 128 + wrow;
+    const bool gate_lane = (wrow & 1) == 0;
+    const float my_cap = gate_lane ? gate_cap : up_cap;
+    const float my_inv_cap = my_cap > 0.f ? 1.f / my_cap : 0.f;
 #pragma unroll
     for (int r = 0; r < kMaxRows; ++r) {
-      if (r < num_rows) {
+      if (r < num_rows) {  // uniform across the block
         const float v = (acc[r] + red[r][wrow]) * outer;
         uint32_t u = __float_as_uint(v);
         u += 0x7FFFu + ((u >> 16) & 1u);
-        out[(int64_t)(row0 + r) * n + col] = (uint16_t)(u >> 16);
+        if constexpr (SWIGLU) {
+          const float g = __uint_as_float((u >> 16) << 16);
+          const float sig = gate_lane ? 1.f / (1.f + exp2f(g * -1.4426950408889634f)) : 1.f;
+          const float part = softcap(g, my_cap, my_inv_cap) * sig;
+          const float y = (part * __shfl_xor(part, 1, 32)) * gammas[row0 + r];
+          uint32_t h = __float_as_uint(y);
+          h += 0x7FFFu + ((h >> 16) & 1u);
+          if (gate_lane) out[(int64_t)(row0 + r) * (n / 2) + (col >> 1)] = (uint16_t)(h >> 16);
+        } else {
+          out[(int64_t)(row0 + r) * n + col] = (uint16_t)(u >> 16);
+        }
       }
     }
   }
@@ -161,7 +189,9 @@ __global__ __launch_bounds__(kThreads) void nvfp4_moe_gemv_kernel(
 void nvfp4_moe_gemv(torch::Tensor& out, const torch::Tensor& act, const torch::Tensor& packed,
                     const torch::Tensor& scales, const torch::Tensor& amax,
                     const torch::Tensor& denominator, const torch::Tensor& tiles,
-                    int64_t max_ctas, int64_t tile_rows) {
+                    int64_t max_ctas, int64_t tile_rows,
+                    const std::optional<torch::Tensor>& gammas, double gate_cap,
+                    double up_cap, const std::optional<torch::Tensor>& row_token) {
   TORCH_CHECK(act.scalar_type() == at::kBFloat16 && act.is_contiguous(), "act: contiguous bf16");
   TORCH_CHECK(out.scalar_type() == at::kBFloat16 && out.is_contiguous(), "out: contiguous bf16");
   TORCH_CHECK(packed.scalar_type() == at::kByte && packed.dim() == 3 && packed.is_contiguous(),
@@ -173,16 +203,31 @@ void nvfp4_moe_gemv(torch::Tensor& out, const torch::Tensor& act, const torch::T
   TORCH_CHECK(tile_rows <= kMaxRows, "tile_rows must be <= 16");
   const int64_t n = packed.size(1), k = packed.size(2) * 2;
   TORCH_CHECK(n % 128 == 0 && k % 64 == 0, "N % 128 and K % 64 must be 0");
-  TORCH_CHECK(act.size(1) == k && out.size(1) == n, "shape mismatch");
-  TORCH_CHECK(act.size(0) >= max_ctas * tile_rows && out.size(0) >= max_ctas * tile_rows,
-              "act / out rows < max_ctas * tile_rows");
+  const bool swiglu = gammas.has_value();
+  TORCH_CHECK(act.size(1) == k && out.size(1) == (swiglu ? n / 2 : n), "shape mismatch");
+  TORCH_CHECK(out.size(0) >= max_ctas * tile_rows, "out rows < max_ctas * tile_rows");
+  if (row_token) {
+    TORCH_CHECK(row_token->scalar_type() == at::kInt && row_token->is_contiguous() &&
+                    row_token->numel() >= max_ctas * tile_rows,
+                "row_token: contiguous int32 [rows]");
+  } else {
+    TORCH_CHECK(act.size(0) >= max_ctas * tile_rows, "act rows < max_ctas * tile_rows");
+  }
+  if (swiglu) {
+    TORCH_CHECK(gammas->scalar_type() == at::kFloat && gammas->is_contiguous() &&
+                    gammas->numel() >= max_ctas * tile_rows,
+                "gammas: contiguous fp32 [rows]");
+  }
   auto stream = at::hip::getCurrentHIPStream();
-  hipLaunchKernelGGL(nvfp4_moe_gemv_kernel, dim3(max_ctas, n / 128), dim3(kThreads), 0, stream,
+  auto kernel = swiglu ? nvfp4_moe_gemv_kernel<true> : nvfp4_moe_gemv_kernel<false>;
+  hipLaunchKernelGGL(kernel, dim3(max_ctas, n / 128), dim3(kThreads), 0, stream,
                      reinterpret_cast<const uint16_t*>(act.data_ptr()),
                      reinterpret_cast<const uint4*>(packed.data_ptr()),
                      reinterpret_cast<const uint32_t*>(scales.data_ptr()),
                      amax.data_ptr<float>(), denominator.data_ptr<float>(),
                      tiles.data_ptr<int32_t>(), reinterpret_cast<uint16_t*>(out.data_ptr()),
+                     swiglu ? gammas->data_ptr<float>() : nullptr, float(gate_cap),
+                     float(up_cap), row_token ? row_token->data_ptr<int32_t>() : nullptr,
                      int(max_ctas), int(tile_rows), int(n), int(k));
 }
 

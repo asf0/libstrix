@@ -25,7 +25,9 @@ void nvfp4_moe_wmma(torch::Tensor& out, const torch::Tensor& act,
 void nvfp4_moe_gemv(torch::Tensor& out, const torch::Tensor& act, const torch::Tensor& packed,
                     const torch::Tensor& scales, const torch::Tensor& amax,
                     const torch::Tensor& denominator, const torch::Tensor& tiles,
-                    int64_t max_ctas, int64_t tile_rows);
+                    int64_t max_ctas, int64_t tile_rows,
+                    const std::optional<torch::Tensor>& gammas, double gate_cap,
+                    double up_cap, const std::optional<torch::Tensor>& row_token);
 void mxfp8_moe_wmma(torch::Tensor& out, const torch::Tensor& act,
                     const torch::Tensor& weight, const torch::Tensor& scales,
                     const torch::Tensor& tiles, int64_t max_ctas, int64_t tile_rows,
@@ -216,7 +218,8 @@ TORCH_LIBRARY(strix, m) {
   m.def(
       "nvfp4_moe_gemv(Tensor(a!) out, Tensor act, Tensor packed, Tensor scales, "
       "Tensor amax, Tensor denominator, Tensor tiles, int max_ctas, "
-      "int tile_rows) -> ()");
+      "int tile_rows, Tensor? gammas=None, float gate_cap=0.0, "
+      "float up_cap=0.0, Tensor? row_token=None) -> ()");
   m.def(
       "mxfp8_moe_wmma(Tensor(a!) out, Tensor act, Tensor weight, Tensor scales, "
       "Tensor tiles, int max_ctas, int tile_rows, Tensor? gammas=None, "
