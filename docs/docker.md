@@ -174,7 +174,10 @@ About 40 minutes, mostly vLLM's C++: `docker/build-and-push.sh`, or
 no GPU needed). Pushing a tag `vX.Y.Z` builds the strix-vllm commit pinned in
 `docker/strix-vllm.ref`, pushes `ghcr.io/asf0/strix-vllm:X.Y.Z` and `:latest`, and
 publishes a GitHub release whose notes are the top entry of
-[CHANGELOG.md](../CHANGELOG.md) plus the libstrix and fork commits. Pin a version in
+[CHANGELOG.md](../CHANGELOG.md) plus the libstrix and fork commits (the fork commit
+is also tagged `strix/vX.Y.Z` in asf0/strix-vllm). The release carries
+`libstrix-recipes-X.Y.Z.zip`: these recipes with the image pinned to `X.Y.Z`, ready to
+unzip and `docker compose up` without cloning. Pin a version in
 your recipes (`IMAGE=ghcr.io/asf0/strix-vllm:0.1.0`) to keep it across releases. A
 manual run of the workflow (any fork branch or commit) builds a dev image tagged
 `<libstrix commit>-<fork commit>`, without a release.

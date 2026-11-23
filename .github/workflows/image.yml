@@ -8,7 +8,9 @@
 # Releases: pushing a tag vX.Y.Z (semantic versioning, the version in
 # pyproject.toml) builds the fork commit pinned in docker/strix-vllm.ref, tags
 # the image X.Y.Z and :latest, and publishes a GitHub release whose notes are
-# the top entry of CHANGELOG.md.
+# the top entry of CHANGELOG.md, with the recipes pinned to that image
+# (libstrix-recipes-X.Y.Z.zip, docker/release-recipes.sh) attached. Tag the
+# fork commit strix/vX.Y.Z in asf0/strix-vllm as well (the notes link it).
 # A manual run builds a dev image (<libstrix>-<fork> commit tag) of any fork
 # branch or commit, without a release.
 name: image
@@ -97,10 +99,14 @@ jobs:
           {
             echo "Image: \`$IMAGE:${{ steps.build.outputs.tag }}\` (also \`:latest\`)"
             echo
-            echo "Built from libstrix $GITHUB_SHA and asf0/strix-vllm ${{ steps.build.outputs.fork }}."
+            echo "Built from libstrix $GITHUB_SHA and asf0/strix-vllm ${{ steps.build.outputs.fork }} (tag [strix/$GITHUB_REF_NAME](https://github.com/asf0/strix-vllm/tree/strix/$GITHUB_REF_NAME))."
+            echo
+            echo "Recipes pinned to this image: \`libstrix-recipes-${{ steps.build.outputs.tag }}.zip\` below."
             echo
             awk '/^## /{n++} n==1' CHANGELOG.md
           } > notes.md
           gh release create "$GITHUB_REF_NAME" --verify-tag --notes-file notes.md \
             --title "$GITHUB_REF_NAME" ||
             gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          docker/release-recipes.sh "${{ steps.build.outputs.tag }}" docker/recipes dist
+          gh release upload "$GITHUB_REF_NAME" dist/libstrix-recipes-*.zip --clobber

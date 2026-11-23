@@ -8,9 +8,12 @@ until the API is called stable.
 
 Changes land under **Unreleased**. To release: rename that heading to
 `vX.Y.Z (date): summary`, set `version` in `pyproject.toml`, pin the fork
-commit in `docker/strix-vllm.ref`, commit, and push the tag `vX.Y.Z`. The
-image workflow then publishes `ghcr.io/asf0/strix-vllm:X.Y.Z` (and `:latest`)
-and a GitHub release with this entry and the two commits it was built from.
+commit in `docker/strix-vllm.ref`, commit, tag that fork commit
+`strix/vX.Y.Z` in asf0/strix-vllm (upstream vLLM owns the plain `vX.Y.Z`
+tags there), and push the tag `vX.Y.Z` here. The image workflow then
+publishes `ghcr.io/asf0/strix-vllm:X.Y.Z` (and `:latest`) and a GitHub
+release with this entry, the two commits it was built from and
+`libstrix-recipes-X.Y.Z.zip` (the recipes pinned to that image).
 
 ## Unreleased
 
@@ -27,6 +30,10 @@ Recipes:
   overlay `npu/qwen3.8-flash-next.yaml` went with `qwen3.8-flash-next`.
 - New `inkling-2-mini`: Inkling 2 Mini with its DSpark draft, 131k context
   (smoke: text, image, tool call and reasoning pass).
+
+Releases: each version's GitHub release carries `libstrix-recipes-X.Y.Z.zip`
+(the recipes with the image pinned to that version; `docker/release-recipes.sh`),
+and the fork commit it builds is tagged `strix/vX.Y.Z` in asf0/strix-vllm.
 
 ## v0.1.0 (2026-11-23): Inkling 2 Mini, fork on upstream main
 
