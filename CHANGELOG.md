@@ -13,9 +13,9 @@ and a GitHub release with this entry and the two commits it was built from.
 
 ## v0.1.0 (2026-11-23): Inkling 2 Mini, fork on upstream main
 
-Fork commit: `5c214f256f` (branch `inkling2-rocm`).
+Fork commit: `5c214f256f` (branch `v0.1.x`).
 
-### Fork (asf0/strix-vllm, branch `inkling2-rocm`)
+### Fork (asf0/strix-vllm, branch `v0.1.x`)
 
 - Follows upstream vLLM `main` instead of the v0.34.0 release; the image
   reports `0.35.0.dev0+strix.g<fork commit>`. The `gfx1151` branch (v0.34.0

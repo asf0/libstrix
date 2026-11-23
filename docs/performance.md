@@ -1041,7 +1041,7 @@ decode tok/s
 ### Inkling 2 Mini
 
 thinkingmachines/Inkling-2-Mini (NVFP4 experts, MXFP8 in layers 20-23,
-looped core) on the strix-vllm `inkling2-rocm` branch with libstrix, bf16 KV,
+looped core) on the strix-vllm `v0.1.x` branch with libstrix, bf16 KV,
 8k prefill chunks, prefix caching off. No stock column: upstream vLLM does not
 run this model on gfx1151 without the fork.
 

@@ -44,7 +44,7 @@ Against stock upstream vLLM on one gfx1151 APU, single stream, int8 KV
 - **Inkling 2 Mini** (NVFP4/MXFP8 experts, which gfx1151 has no FP4/FP8 hardware
   for): prefill 2.6-2.7k tok/s from 2.7k to 21.5k tokens, decode 47 tok/s for
   one request (56 with DSpark) and 155 tok/s total for 16; needs the fork's
-  `inkling2-rocm` branch. See
+  `v0.1.x` branch. See
   [docs/performance.md](docs/performance.md#inkling-2-mini).
 - **NPU prefill** (Flash-Next, `STRIX_ENABLE=npu`, kernel 7.4+): TTFT 7-8 %
   lower from 16k to 100k tokens served and prefill 9-11 % faster at 8k-32k
