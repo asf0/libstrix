@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "libstrix"
-version = "0.0.1"
+version = "0.1.0"
 description = "gfx1151 (Strix Halo) HIP kernels and a vLLM plugin that uses them"
 requires-python = ">=3.10"
 license = "MIT AND Apache-2.0"

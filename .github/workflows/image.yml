@@ -4,13 +4,22 @@
 #   IMAGE=ghcr.io/asf0/strix-vllm:<tag> python bench/container/smoke.py
 # Needs the repository secret GHCR_TOKEN (a PAT with write:packages), because
 # the package is not linked to this repository.
+#
+# Releases: pushing a tag vX.Y.Z (semantic versioning, the version in
+# pyproject.toml) builds the fork commit pinned in docker/strix-vllm.ref, tags
+# the image X.Y.Z and :latest, and publishes a GitHub release whose notes are
+# the top entry of CHANGELOG.md.
+# A manual run builds a dev image (<libstrix>-<fork> commit tag) of any fork
+# branch or commit, without a release.
 name: image
 on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
   workflow_dispatch:
     inputs:
       fork_ref:
-        description: strix-vllm branch or commit
-        default: gfx1151
+        description: strix-vllm branch or commit (empty = docker/strix-vllm.ref)
+        default: ""
       latest:
         description: also move the :latest tag
         type: boolean
@@ -46,6 +55,8 @@ jobs:
   image:
     needs: toolchain
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # the release of a version tag
     steps:
       - uses: actions/checkout@v4
       - uses: docker/login-action@v3
@@ -55,16 +66,41 @@ jobs:
           password: ${{ secrets.GHCR_TOKEN }}
       - uses: docker/setup-buildx-action@v3
       - name: Build and push
+        id: build
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache
-          fork=$(git ls-remote https://github.com/asf0/strix-vllm.git "${{ inputs.fork_ref }}" | cut -c1-40 | head -1)
-          fork=${fork:-${{ inputs.fork_ref }}}
-          tag="$(git rev-parse --short=10 HEAD)-$(echo "$fork" | cut -c1-10)"
-          tags=(-t "$IMAGE:$tag")
-          [ "${{ inputs.latest }}" = true ] && tags+=(-t "$IMAGE:latest")
+          ref="${{ inputs.fork_ref }}"
+          [ -n "$ref" ] || ref=$(grep -v '^#' docker/strix-vllm.ref | head -1)
+          fork=$(git ls-remote https://github.com/asf0/strix-vllm.git "$ref" | cut -c1-40 | head -1)
+          fork=${fork:-$ref}
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            tags=(-t "$IMAGE:$tag" -t "$IMAGE:latest")
+          else
+            tag="$(git rev-parse --short=10 HEAD)-$(echo "$fork" | cut -c1-10)"
+            tags=(-t "$IMAGE:$tag")
+            [ "${{ inputs.latest }}" = true ] && tags+=(-t "$IMAGE:latest")
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "fork=$fork" >> "$GITHUB_OUTPUT"
           docker buildx build -f docker/Dockerfile --push "${tags[@]}" \
             --build-arg TOOLCHAIN="$TOOLCHAIN_IMAGE:${{ needs.toolchain.outputs.tag }}" \
             --build-arg STRIX_VLLM_REF="$fork" \
             --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --build-arg MAX_JOBS=4 .
           echo "pushed $IMAGE:$tag"
+      - name: Release with the CHANGELOG.md entry
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Image: \`$IMAGE:${{ steps.build.outputs.tag }}\` (also \`:latest\`)"
+            echo
+            echo "Built from libstrix $GITHUB_SHA and asf0/strix-vllm ${{ steps.build.outputs.fork }}."
+            echo
+            awk '/^## /{n++} n==1' CHANGELOG.md
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" --verify-tag --notes-file notes.md \
+            --title "$GITHUB_REF_NAME" ||
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
