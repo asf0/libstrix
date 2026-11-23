@@ -1,6 +1,8 @@
-# Qwen3.8-27B INT8 W8A16 with its MTP head: the docs/performance.md serving
-# config (MTP 2, 40 sequences, 131k, int8 KV), with RecoverSSM
-# (--use-replayssm) so MTP keeps one GDN state per request.
+# Qwen3.8-27B INT8 W8A16 + speculative decoding with the DFlash 2 draft
+# (incoai/Qwen3.8-27B-DFlash2, mounted next to the target under /models),
+# with ReplaySSM (--use-replayssm) so the draft keeps one GDN state per
+# request. SPEC_TOKENS sets the draft tokens per step (the draft's block size
+# minus one at most).
 #
 #   docker compose -f qwen3.8-27b-int8.yaml up -d
 #
@@ -11,11 +13,12 @@ services:
       file: common.yaml
       service: strix
     environment:
-      MTP: ${MTP:-2}
+      MTP: 0
       REPLAYSSM: ${REPLAYSSM:-1}
       HF_REPO: lued/Qwen3.8-27B-INT8-W8A16-MTP
     command:
       - /models/Qwen3.8-27B-INT8-W8A16-MTP
+      - '--speculative-config={"method": "dflash", "model": "/models/Qwen3.8-27B-DFlash2", "num_speculative_tokens": ${SPEC_TOKENS:-7}}'
       - --mm-encoder-attn-backend=TRITON_ATTN
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head

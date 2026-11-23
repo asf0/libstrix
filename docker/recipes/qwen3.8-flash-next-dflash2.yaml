@@ -1,7 +1,6 @@
 # Qwen3.8-Flash-Next AWQ W4A16 + DFlash 2 draft (incoai/Qwen3.8-Flash-Next-DFlash2,
-# mounted next to the target under /models). Same serving setup as
-# qwen3.8-flash-next.yaml (n-gram table streamed from disk, 16k chunks) with
-# DFlash 2 speculation in place of MTP. SPEC_TOKENS sets the draft tokens per
+# mounted next to the target under /models). The n-gram table streams from
+# disk in 16k chunks. SPEC_TOKENS sets the draft tokens per
 # step: 4 is fastest, for one request and for several (at most 7).
 #
 #   docker compose -f qwen3.8-flash-next-dflash2.yaml up -d

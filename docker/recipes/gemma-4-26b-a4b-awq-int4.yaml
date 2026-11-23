@@ -1,4 +1,6 @@
-# gemma-4-26B-A4B AWQ 4-bit.
+# gemma-4-26B-A4B AWQ 4-bit + speculative decoding with the DFlash draft
+# (z-lab/gemma-4-26B-A4B-it-DFlash, mounted under /models). SPEC_TOKENS sets
+# the draft tokens per step (the draft's block size of 16 minus one at most).
 #
 #   docker compose -f gemma-4-26b-a4b-awq-int4.yaml up -d
 #
@@ -9,10 +11,11 @@ services:
       file: common.yaml
       service: strix
     environment:
-      MTP: ${MTP:-0}
+      MTP: 0
       HF_REPO: cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit
     command:
       - /models/gemma-4-26B-A4B-it-AWQ-4bit
+      - '--speculative-config={"method": "dflash", "model": "/models/gemma-4-26B-A4B-it-DFlash", "num_speculative_tokens": ${SPEC_TOKENS:-15}}'
       - --mm-encoder-attn-backend=TRITON_ATTN
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head

@@ -6,8 +6,8 @@ Greedy, thinking off, the same instruction as bench/model/gsm8k_check.py.
 same questions with an exact McNemar test, which looks only at the questions
 the two sides disagree on and is far more sensitive than comparing totals.
 
-    python bench/container/gsm8k.py qwen3.6-35b-a3b-fp8.yaml:STRIX_DISABLE=all --out stock.json
-    python bench/container/gsm8k.py qwen3.6-35b-a3b-fp8.yaml --out strix.json
+    python bench/container/gsm8k.py qwen3.6-35b-a3b-fp8-dflash2.yaml:STRIX_DISABLE=all --out stock.json
+    python bench/container/gsm8k.py qwen3.6-35b-a3b-fp8-dflash2.yaml --out strix.json
     python bench/container/gsm8k.py --compare stock.json strix.json
 """
 

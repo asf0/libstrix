@@ -1,4 +1,9 @@
-# Flint FP8 (FP8 routed experts, bf16 elsewhere; HawkBearPig/flint-FP8-BF16).
+# Flint FP8 (FP8 routed experts, bf16 elsewhere; HawkBearPig/flint-FP8-BF16)
+# + speculative decoding with the DFlash 2 draft (incoai/Flint-DFlash2,
+# mounted next to the target under /models). SPEC_TOKENS sets the draft
+# tokens per step (at most 7: the draft's block size is 8). 3 is the measured
+# best: a longer verify batch reads more of the 256 experts per step than
+# the extra accepted tokens pay for.
 # Text only. Tool calls and reasoning use the GLM parsers (glm45): Flint writes
 # <tool_call> and <think> in that layout.
 #
@@ -11,9 +16,11 @@ services:
       file: common.yaml
       service: strix
     environment:
+      MTP: 0
       HF_REPO: HawkBearPig/flint-FP8-BF16
     command:
       - /models/flint-FP8-BF16
+      - '--speculative-config={"method": "dflash", "model": "/models/Flint-DFlash2", "num_speculative_tokens": ${SPEC_TOKENS:-3}}'
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head
       - --gpu-memory-utilization=${GPU_UTIL:-0.85}

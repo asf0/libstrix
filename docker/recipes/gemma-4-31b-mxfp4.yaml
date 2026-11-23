@@ -1,4 +1,7 @@
-# gemma-4-31B MXFP4 (fp4 weights x bf16 activations in libstrix).
+# gemma-4-31B MXFP4 (fp4 weights x bf16 activations in libstrix) +
+# speculative decoding with the DFlash draft (z-lab/gemma-4-31B-it-DFlash,
+# mounted under /models). SPEC_TOKENS sets the draft tokens per step (the
+# draft's block size of 16 minus one at most).
 # Text only (--language-model-only): this checkpoint's vision tower does not
 # load in vLLM.
 #
@@ -11,10 +14,11 @@ services:
       file: common.yaml
       service: strix
     environment:
-      MTP: ${MTP:-0}
+      MTP: 0
       HF_REPO: amd/gemma-4-31B-it-MXFP4
     command:
       - /models/gemma-4-31B-it-MXFP4
+      - '--speculative-config={"method": "dflash", "model": "/models/gemma-4-31B-it-DFlash", "num_speculative_tokens": ${SPEC_TOKENS:-15}}'
       - --language-model-only
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head

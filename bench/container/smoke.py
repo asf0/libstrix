@@ -8,7 +8,7 @@ when the recipe sets `--tool-call-parser`, and parsed reasoning when it sets
 docs/docker.md. Run before pushing an image.
 
     python bench/container/smoke.py                       # every recipe
-    python bench/container/smoke.py qwen3.8-27b-fp8.yaml muse-glimmer-30b-fp8.yaml
+    python bench/container/smoke.py qwen3.8-27b-fp8-dflash2.yaml muse-glimmer-30b-fp8-dflash2.yaml
 """
 
 from __future__ import annotations

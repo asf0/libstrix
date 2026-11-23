@@ -6,10 +6,27 @@ Versions follow [semantic versioning](https://semver.org): the minor version
 for new models and features, the patch version for fixes and tuning; 0.x
 until the API is called stable.
 
-To release: add the entry, set `version` in `pyproject.toml`, pin the fork
+Changes land under **Unreleased**. To release: rename that heading to
+`vX.Y.Z (date): summary`, set `version` in `pyproject.toml`, pin the fork
 commit in `docker/strix-vllm.ref`, commit, and push the tag `vX.Y.Z`. The
 image workflow then publishes `ghcr.io/asf0/strix-vllm:X.Y.Z` (and `:latest`)
 and a GitHub release with this entry and the two commits it was built from.
+
+## Unreleased
+
+Recipes:
+
+- Every recipe except `lfm2.5-24b-a2b` speculates with a draft by default:
+  the incoai DFlash 2 drafts (Qwen3.6/3.8, Flint, Flash-Next), the
+  meta-models Muse-Glimmer assistant, the z-lab gemma-4 DFlash drafts and the
+  DSpark drafts (LFM2.5 FP8, MiniCPM-V-4.7); `MTP=<n>` still selects a
+  checkpoint's own MTP head.
+- Removed the draftless duplicates: `qwen3.6-35b-a3b-fp8`, `qwen3.8-27b-fp8`,
+  `qwen3.8-27b-uncensored-fp8`, `qwen3.8-flash-next`, `muse-glimmer-30b-fp8`,
+  `lfm2.5-24b-a2b-fp8`; `flint-fp8-dflash2` is now `flint-fp8`. The NPU
+  overlay `npu/qwen3.8-flash-next.yaml` went with `qwen3.8-flash-next`.
+- New `inkling-2-mini`: Inkling 2 Mini with its DSpark draft, 131k context
+  (smoke: text, image, tool call and reasoning pass).
 
 ## v0.1.0 (2026-11-23): Inkling 2 Mini, fork on upstream main
 

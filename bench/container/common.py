@@ -9,7 +9,7 @@ from $MODELS, compile caches from $CACHE (default docker/recipes/cache);
 CACHE_TMPFS=1 keeps those caches in RAM instead (local testing).
 
 A target is `recipe.yaml` optionally followed by env overrides:
-`qwen3.6-35b-a3b-fp8.yaml:MTP=0,MAX_MODEL_LEN=16384`; a `+` layers an
+`qwen3.8-27b.yaml:MTP=0,MAX_MODEL_LEN=16384`; a `+` layers an
 overlay over its base: `qwen3.8-27b.yaml+npu/qwen3.8-27b.yaml`.
 """
 

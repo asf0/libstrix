@@ -1,0 +1,39 @@
+# Inkling 2 Mini (thinkingmachines/Inkling-2-Mini: looped MoE, NVFP4 experts
+# with MXFP8 in layers 20-23) + speculative decoding with its DSpark draft
+# (mtp.safetensors in the checkpoint folder). Needs an image built from the
+# strix-vllm v0.1.x branch or later (ghcr.io/asf0/strix-vllm:0.1.0+).
+#
+# DSpark drafts 2 tokens for a single request and none for 2 or more (verify
+# steps there cost more than they win): 56 tok/s at 1 request, 47 without.
+# Decode streams the experts at DRAM bandwidth, so more concurrent requests
+# raise total throughput (offline: 94 / 111 / 155 tok/s at 4 / 8 / 16) at a
+# lower speed per request; raise MAX_NUM_SEQS for parallel serving.
+#
+# The KV cache is bf16 (the Inkling 2 attention has no int8 KV path).
+# GPU_UTIL is 0.80: 75.6 GiB of KV with the draft loaded, 3.6 full
+# 131k-token requests at once (smoke run, 2026-11-23).
+#
+#   docker compose -f inkling-2-mini.yaml up -d
+#
+# Overrides go in .env (see .env.example) or the shell.
+services:
+  inkling-2-mini:
+    extends:
+      file: common.yaml
+      service: strix
+    environment:
+      MTP: 0
+      HF_REPO: thinkingmachines/Inkling-2-Mini
+      # int4-g32 decode copies of the attention projections (0 keeps int8).
+      STRIX_INKLING2_W4: ${STRIX_INKLING2_W4:-1}
+    command:
+      - /models/Inkling-2-Mini
+      - '--speculative-config={"method": "dspark", "model": "/models/Inkling-2-Mini", "num_speculative_tokens": 7, "num_speculative_tokens_per_batch_size": [[1, 1, 2], [2, 64, 0]]}'
+      - --gpu-memory-utilization=${GPU_UTIL:-0.80}
+      - --max-model-len=${MAX_MODEL_LEN:-131072}
+      - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-8192}
+      - --max-num-seqs=${MAX_NUM_SEQS:-4}
+      # Tool calls and reasoning come back parsed, as chat clients expect.
+      - --enable-auto-tool-choice
+      - --tool-call-parser=inkling
+      - --reasoning-parser=inkling

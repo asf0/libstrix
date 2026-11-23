@@ -1,7 +1,8 @@
-# Muse-Glimmer-30B FP8 (block-scaled) + DFlash 2 draft. Context caps at 131,072.
-# Speculative decoding with the DFlash 2 block-diffusion draft
-# (incoai/Muse-Glimmer-30B-DFlash2, mounted next to the target under /models). SPEC_TOKENS
-# sets the draft tokens per step (the draft's block size minus one at most).
+# Muse-Glimmer-30B FP8 (block-scaled) + DFlash draft. Context caps at 131,072.
+# Speculative decoding with the DFlash block-diffusion draft
+# (meta-models/Muse-Glimmer-30B-assistant, mounted next to the target under
+# /models). SPEC_TOKENS sets the draft tokens per step (the draft's block
+# size of 16 minus one at most).
 #
 #   docker compose -f muse-glimmer-30b-fp8-dflash2.yaml up -d
 #
@@ -16,7 +17,7 @@ services:
       HF_REPO: RedHatAI/Muse-Glimmer-30B-FP8-block
     command:
       - /models/Muse-Glimmer-30B-FP8-block
-      - '--speculative-config={"method": "dflash", "model": "/models/Muse-Glimmer-30B-DFlash2", "num_speculative_tokens": ${SPEC_TOKENS:-15}}'
+      - '--speculative-config={"method": "dflash", "model": "/models/Muse-Glimmer-30B-assistant", "num_speculative_tokens": ${SPEC_TOKENS:-15}}'
       - --mm-encoder-attn-backend=TRITON_ATTN
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head

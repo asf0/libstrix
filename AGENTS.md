@@ -42,24 +42,30 @@ plain name for bf16.
 | --- | --- | --- |
 | Qwen/Qwen3.6-35B-A3B | Qwen3.6-35B-A3B | `qwen3.6-35b-a3b` |
 | Avesed/Qwen3.6-35B-A3B-INT8-W8A8 | Qwen3.6-35B-A3B W8A8 | `qwen3.6-35b-a3b-w8a8` |
-| Qwen/Qwen3.6-35B-A3B-FP8 | Qwen3.6-35B-A3B FP8 | `qwen3.6-35b-a3b-fp8`, `-fp8-dflash2` |
+| Qwen/Qwen3.6-35B-A3B-FP8 | Qwen3.6-35B-A3B FP8 | `qwen3.6-35b-a3b-fp8-dflash2` |
 | InternScience/Sage-A1.5-FP8 | Sage-A1.5 FP8 | `sage-a1.5-fp8` |
 | openbmb/MiniCPM-V-4.7-35B-A3B-FP8 | MiniCPM-V-4.7 FP8 | `minicpm-v-4.7-35b-a3b-fp8` |
+| openbmb/MiniCPM-V-4.7-35B-A3B-DSpark | MiniCPM-V-4.7 DSpark draft | draft of `minicpm-v-4.7-35b-a3b-fp8` |
 | Qwen/Qwen3.8-27B | Qwen3.8-27B | `qwen3.8-27b` |
 | lued/Qwen3.8-27B-INT8-W8A16-MTP | Qwen3.8-27B INT8 | `qwen3.8-27b-int8` |
 | amd/Qwen3.8-27B-Quark-AWQ-INT4-W4A16 | Qwen3.8-27B AWQ INT4 | `qwen3.8-27b-awq-int4` |
 | amd/Qwen3.8-27B-Quark-AWQ-MXFP4 | Qwen3.8-27B AWQ MXFP4 | `qwen3.8-27b-awq-mxfp4` |
-| Qwen/Qwen3.8-27B-FP8 | Qwen3.8-27B FP8 | `qwen3.8-27b-fp8`, `-fp8-dflash2` |
-| wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 | Qwen3.8-Flash-Next AWQ | `qwen3.8-flash-next` |
+| Qwen/Qwen3.8-27B-FP8 | Qwen3.8-27B FP8 | `qwen3.8-27b-fp8-dflash2` |
+| wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 | Qwen3.8-Flash-Next AWQ | `qwen3.8-flash-next-dflash2` |
 | LiquidAI/LFM2.5-24B-A2B | LFM2.5-24B-A2B | `lfm2.5-24b-a2b` |
-| LiquidAI/LFM2.5-24B-A2B-FP8 | LFM2.5-24B-A2B FP8 | `lfm2.5-24b-a2b-fp8`, `-fp8-dspark` |
-| RedHatAI/Muse-Glimmer-30B-FP8-block | Muse-Glimmer-30B FP8 | `muse-glimmer-30b-fp8`, `-fp8-dflash2` |
-| HawkBearPig/flint-FP8-BF16 | Flint FP8 | `flint-fp8`, `-fp8-dflash2` |
+| LiquidAI/LFM2.5-24B-A2B-FP8 | LFM2.5-24B-A2B FP8 | `lfm2.5-24b-a2b-fp8-dspark` |
+| RedHatAI/Muse-Glimmer-30B-FP8-block | Muse-Glimmer-30B FP8 | `muse-glimmer-30b-fp8-dflash2` |
+| meta-models/Muse-Glimmer-30B-assistant | Muse-Glimmer-30B DFlash draft | draft of `muse-glimmer-30b-fp8-dflash2` |
+| HawkBearPig/flint-FP8-BF16 | Flint FP8 | `flint-fp8` |
+| incoai/Flint-DFlash2 | Flint DFlash 2 draft | draft of `flint-fp8` |
+| thinkingmachines/Inkling-2-Mini | Inkling 2 Mini (DSpark draft in the checkpoint) | `inkling-2-mini`, `bench-inkling-2-mini` |
 | google/gemma-4-26B-A4B-it | gemma-4-26B-A4B | `gemma-4-26b-a4b` |
 | cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit | gemma-4-26B-A4B AWQ | `gemma-4-26b-a4b-awq-int4` |
 | RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic | gemma-4-26B-A4B FP8 | `gemma-4-26b-a4b-fp8` |
+| z-lab/gemma-4-26B-A4B-it-DFlash | gemma-4-26B-A4B DFlash draft | draft of `gemma-4-26b-a4b` (all quants) |
 | amd/gemma-4-31B-it-MXFP4 | gemma-4-31B MXFP4 | `gemma-4-31b-mxfp4` |
 | google/gemma-4-31B-it-qat-w4a16-ct | gemma-4-31B QAT W4A16 | `gemma-4-31b-qat-int4` |
+| z-lab/gemma-4-31B-it-DFlash | gemma-4-31B DFlash draft | draft of `gemma-4-31b-mxfp4`, `-qat-int4` |
 
 Recipe files are `<model>-<size>[-<quant>][-dflash2|-dspark].yaml`, lowercase, with the
 compose service named like the file. Quant suffixes come from a fixed set:
@@ -88,9 +94,16 @@ A `-dflash2` or `-dspark` recipe sits directly under its base recipe.
 - Each recipe `extends` `common.yaml` and sets only what differs. Defaults:
   `GPU_UTIL` 0.85, `int8_per_token_head` KV, `TRITON_ATTN`, 131,072 context
   unless the model needs otherwise.
-- Speculation: `MTP: ${MTP:-2}` where the checkpoint has an MTP head.
-  DFlash 2 and DSpark recipes set `MTP: 0` and pass `--speculative-config`
-  with `"num_speculative_tokens": ${SPEC_TOKENS:-N}`, N the measured best.
+- Speculation: every recipe except `lfm2.5-24b-a2b` sets `MTP: 0` and passes
+  `--speculative-config` with an external draft `"model"` and
+  `"num_speculative_tokens": ${SPEC_TOKENS:-N}`, N the measured best:
+  the incoai `*-DFlash2` drafts (Qwen3.6/3.8, Flint, Flash-Next), the
+  meta-models Muse-Glimmer assistant, the z-lab gemma-4 `*-DFlash` drafts, and
+  the DSpark drafts (LFM2.5 FP8, MiniCPM-V-4.7). Inkling 2 Mini's DSpark draft
+  ships in its checkpoint (`mtp.safetensors`): its recipes point `"model"` at
+  the target folder and set the drafts per batch size
+  (`num_speculative_tokens_per_batch_size`) instead. `MTP=<n>` still overrides
+  with the checkpoint's own MTP head where it has one (`MTP=0` = off).
   `REPLAYSSM: ${REPLAYSSM:-1}` on every Qwen GDN recipe that speculates (the
   entrypoint adds `--use-replayssm` for MTP and DFlash alike). Flash-Next does
   not support ReplaySSM.

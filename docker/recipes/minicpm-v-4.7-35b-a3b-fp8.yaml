@@ -1,4 +1,8 @@
-# MiniCPM-V-4.7-35B-A3B FP8 (per-channel). The checkpoint has no MTP weights.
+# MiniCPM-V-4.7-35B-A3B FP8 (per-channel) + speculative decoding with the
+# DSpark draft (openbmb/MiniCPM-V-4.7-35B-A3B-DSpark, mounted next to the
+# target under /models). The checkpoint ships no MTP weights of its own.
+# SPEC_TOKENS sets the draft tokens per step (at most 15: the draft's block
+# size); 4 is the default until spec_equiv picks the measured best.
 #
 #   docker compose -f minicpm-v-4.7-35b-a3b-fp8.yaml up -d
 #
@@ -9,10 +13,11 @@ services:
       file: common.yaml
       service: strix
     environment:
-      MTP: ${MTP:-0}
+      MTP: 0
       HF_REPO: openbmb/MiniCPM-V-4.7-35B-A3B-FP8
     command:
       - /models/MiniCPM-V-4.7-35B-A3B-FP8
+      - '--speculative-config={"method": "dspark", "model": "/models/MiniCPM-V-4.7-35B-A3B-DSpark", "num_speculative_tokens": ${SPEC_TOKENS:-4}}'
       - --mm-encoder-attn-backend=TRITON_ATTN
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head

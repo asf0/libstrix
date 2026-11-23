@@ -14,8 +14,8 @@ position the baseline was sure about is a bug (wrong draft acceptance, KV or
 state corruption).
 
     python bench/container/spec_equiv.py \
-        --baseline qwen3.6-35b-a3b-fp8.yaml:MTP=0 \
-        qwen3.6-35b-a3b-fp8.yaml:MTP=2 qwen3.6-35b-a3b-fp8-dflash2.yaml
+        --baseline qwen3.8-27b.yaml:MTP=0 \
+        qwen3.8-27b.yaml:MTP=2 qwen3.8-27b-fp8-dflash2.yaml
 
 `--concurrency 2,8` adds a 2-request pass: a verify step of 2 requests is
 2 x (K+1) rows, which can cross a kernel's row limit that neither 1 nor 8

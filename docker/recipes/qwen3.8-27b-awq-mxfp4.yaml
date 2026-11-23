@@ -1,5 +1,8 @@
-# Qwen3.8-27B Quark AWQ MXFP4. Not benchmarked; it should take the same
-# libstrix MXFP4 kernels as gemma-4-31B MXFP4.
+# Qwen3.8-27B Quark AWQ MXFP4 + speculative decoding with the DFlash 2 draft
+# (incoai/Qwen3.8-27B-DFlash2, mounted next to the target under /models).
+# SPEC_TOKENS sets the draft tokens per step (the draft's block size minus one
+# at most). Not benchmarked; it should take the same libstrix MXFP4 kernels as
+# gemma-4-31B MXFP4.
 #
 #   docker compose -f qwen3.8-27b-awq-mxfp4.yaml up -d
 #
@@ -10,10 +13,12 @@ services:
       file: common.yaml
       service: strix
     environment:
-      MTP: ${MTP:-0}
+      MTP: 0
+      REPLAYSSM: ${REPLAYSSM:-1}
       HF_REPO: amd/Qwen3.8-27B-Quark-AWQ-MXFP4
     command:
       - /models/Qwen3.8-27B-Quark-AWQ-MXFP4
+      - '--speculative-config={"method": "dflash", "model": "/models/Qwen3.8-27B-DFlash2", "num_speculative_tokens": ${SPEC_TOKENS:-7}}'
       - --mm-encoder-attn-backend=TRITON_ATTN
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head

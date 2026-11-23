@@ -1,4 +1,7 @@
-# Qwen3.8-27B bf16. MTP 2 by default (its MTP head); MTP=0 turns it off.
+# Qwen3.8-27B bf16 + speculative decoding with the DFlash 2 draft
+# (incoai/Qwen3.8-27B-DFlash2, mounted next to the target under /models).
+# SPEC_TOKENS sets the draft tokens per step (the draft's block size minus one
+# at most).
 #
 #   docker compose -f qwen3.8-27b.yaml up -d
 #
@@ -9,11 +12,12 @@ services:
       file: common.yaml
       service: strix
     environment:
-      MTP: ${MTP:-2}
+      MTP: 0
       REPLAYSSM: ${REPLAYSSM:-1}
       HF_REPO: Qwen/Qwen3.8-27B
     command:
       - /models/Qwen3.8-27B
+      - '--speculative-config={"method": "dflash", "model": "/models/Qwen3.8-27B-DFlash2", "num_speculative_tokens": ${SPEC_TOKENS:-7}}'
       - --mm-encoder-attn-backend=TRITON_ATTN
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head

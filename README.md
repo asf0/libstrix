@@ -9,7 +9,7 @@ faster (more on gemma-4 and the FP8 27B).
 ```sh
 git clone https://github.com/asf0/libstrix && cd libstrix/docker/recipes
 cp .env.example .env              # set MODELS=/path/to/your/models
-docker compose -f qwen3.6-35b-a3b-fp8.yaml up -d
+docker compose -f qwen3.6-35b-a3b-fp8-dflash2.yaml up -d
 ```
 
 Host setup (GPU memory cap, BIOS) is a one-time step; see [Docker](#docker).
@@ -43,8 +43,8 @@ Against stock upstream vLLM on one gfx1151 APU, single stream, int8 KV
   LFM2.5's DSpark draft takes it from 51.7 to 66.7 tok/s.
 - **Inkling 2 Mini** (NVFP4/MXFP8 experts, which gfx1151 has no FP4/FP8 hardware
   for): prefill 2.6-2.7k tok/s from 2.7k to 21.5k tokens, decode 47 tok/s for
-  one request (56 with DSpark) and 155 tok/s total for 16; needs the fork's
-  `v0.1.x` branch. See
+  one request (56 with DSpark) and 155 tok/s total for 16; recipe
+  `inkling-2-mini` (image 0.1.0 or later). See
   [docs/performance.md](docs/performance.md#inkling-2-mini).
 - **NPU prefill** (Flash-Next, `STRIX_ENABLE=npu`, kernel 7.4+): TTFT 7-8 %
   lower from 16k to 100k tokens served and prefill 9-11 % faster at 8k-32k
@@ -95,8 +95,8 @@ The image cannot set these; they belong to the host kernel.
 ```sh
 git clone https://github.com/asf0/libstrix && cd libstrix/docker/recipes
 cp .env.example .env              # set MODELS=/path/to/your/models
-docker compose -f qwen3.8-flash-next.yaml up -d
-docker compose -f qwen3.8-flash-next.yaml logs -f   # first start compiles: minutes
+docker compose -f qwen3.8-flash-next-dflash2.yaml up -d
+docker compose -f qwen3.8-flash-next-dflash2.yaml logs -f   # first start compiles: minutes
 curl localhost:8000/v1/models
 ```
 
