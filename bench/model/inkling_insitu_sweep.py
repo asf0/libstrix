@@ -8,6 +8,7 @@ current launch), then runs as before.
 """
 
 import itertools
+import os
 import random
 
 import torch
@@ -18,6 +19,10 @@ from vllm.models.inkling2.amd.ops import sconv as ops
 from vllm.triton_utils import triton
 
 MIN_TOKENS = 4096
+# STRIX_SWEEP_WORDS: prompt length (~1.3 tokens per word); STRIX_SWEEP_MIN_CTX:
+# sweep attention only once the cached context reaches this many tokens.
+WORDS = int(os.environ.get("STRIX_SWEEP_WORDS", "4000"))
+MIN_CTX = int(os.environ.get("STRIX_SWEEP_MIN_CTX", "0"))
 # Configs whose time is reported for every call variant.
 PROBE = {"attn_res": ((4096, 4), (4096, 8), (2048, 4)), "gate_sink": ((4096, 8),)}
 done: set[str] = set()
@@ -170,10 +175,129 @@ res_ops.attn_res = attn_res_sweep
 loop_mod.attn_res = attn_res_sweep
 model_mod.attn_res = attn_res_sweep
 
-llm = LLM("/models/Inkling-2-Mini", max_model_len=16384, max_num_seqs=4,
+orig_launch = attn_ops._launch
+
+
+def launch_sweep(q, key_cache, value_cache, bias, out, lse, block_table, cache_seqlens,
+                 cu_seqlens_q, max_seqlen_q, softmax_scale, window, draft, num_splits=0):
+    num_tokens, num_heads, head_dim = q.shape
+    split = out is None or lse is None
+    key = f"rel_attention window={window}"
+    if (
+        num_tokens >= MIN_TOKENS
+        and not split
+        and key not in done
+        and int(cache_seqlens.max()) >= MIN_CTX
+    ):
+        done.add(key)
+        page, num_kv_heads = key_cache.shape[1:3]
+        group = num_heads // num_kv_heads
+        num_reqs = cache_seqlens.shape[0]
+        head_split = window < 0
+
+        def run(bm, bn, nw, ns, o, l):
+            block_h = 1 if head_split else triton.next_power_of_2(group)
+            block_q = max(1, bm // block_h)
+            grid = (triton.cdiv(max_seqlen_q, block_q),
+                    num_heads if head_split else num_kv_heads, num_reqs)
+            attn_ops._rel_attention_kernel[grid](
+                q, key_cache, value_cache, bias, o, l, block_table, cache_seqlens,
+                cu_seqlens_q, softmax_scale * attn_ops._LOG2E, 0, num_tokens,
+                q.stride(0), q.stride(1), key_cache.stride(0), key_cache.stride(1),
+                key_cache.stride(2), value_cache.stride(0), value_cache.stride(1),
+                value_cache.stride(2), bias.stride(0), bias.stride(1), o.stride(0),
+                o.stride(1), l.stride(0), block_table.stride(0), GROUP=group, D=head_dim,
+                PAGE=page, E_PAD=bias.shape[2], WINDOW=window, DRAFT=draft, SPLIT=False,
+                BLOCK_Q=block_q, BLOCK_H=block_h, BLOCK_N=bn, HEAD_SPLIT=head_split,
+                num_warps=nw, num_stages=ns)
+
+        ref_o, ref_l = torch.empty_like(out), torch.empty_like(lse)
+        run(64, 16, 4, 1, ref_o, ref_l) if window >= 0 else run(128, 16, 8, 1, ref_o, ref_l)
+        results = []
+        for bm, bn, nw, ns in itertools.product((32, 64, 128, 256), (16,), (2, 4, 8, 16), (1,)):
+            if bn > page:
+                continue
+            o, l = torch.empty_like(out), torch.empty_like(lse)
+            try:
+                t = timed(lambda: run(bm, bn, nw, ns, o, l), reps=3)
+            except Exception:
+                continue
+            results.append((t, (bm, bn, nw, ns), torch.equal(o, ref_o) and torch.equal(l, ref_l)))
+        ctx = int(cache_seqlens.max())
+        print(f"SWEEP {key} page {page} heads {num_heads}/{num_kv_heads} tokens {num_tokens} ctx {ctx}")
+        report(key, results, (64, 16, 4, 1) if window >= 0 else (128, 16, 8, 1))
+    return orig_launch(q, key_cache, value_cache, bias, out, lse, block_table,
+                       cache_seqlens, cu_seqlens_q, max_seqlen_q, softmax_scale, window,
+                       draft, num_splits)
+
+
+attn_ops._launch = launch_sweep
+
+
+class _Warps:
+    """`kernel[grid](...)` with num_warps overridden."""
+
+    def __init__(self, kernel, num_warps):
+        self.kernel, self.num_warps = kernel, num_warps
+
+    def __getitem__(self, grid):
+        launch = self.kernel[grid]
+        return lambda *a, **k: launch(*a, **{**k, "num_warps": self.num_warps})
+
+
+orig_prologue = ops.attention_prologue
+orig_block_t = ops._prologue_block_t
+orig_prologue_kernel = ops._attn_prologue_kernel
+
+
+def prologue_sweep(*args, **kwargs):
+    q, k = args[0], args[2]
+    key_cache, value_cache, kv_slots = args[18], args[19], args[20]
+    num_tokens = q.shape[0]
+    key = f"attn_prologue dynamic={args[10] is not None}"
+    if num_tokens >= MIN_TOKENS and key not in done:
+        done.add(key)
+        slots = kv_slots.long()
+
+        def snapshot():
+            kc = key_cache.flatten(0, 1)[slots].clone()
+            vc = value_cache.flatten(0, 1)[slots].clone()
+            return kc, vc, args[21].clone(), args[22][:num_tokens].clone()
+
+        def run(bt, nw):
+            ops._prologue_block_t = lambda n: bt
+            ops._attn_prologue_kernel = _Warps(orig_prologue_kernel, nw)
+            try:
+                orig_prologue(*args, **kwargs)
+            finally:
+                ops._prologue_block_t = orig_block_t
+                ops._attn_prologue_kernel = orig_prologue_kernel
+
+        run(orig_block_t(num_tokens), 4)
+        ref = snapshot()
+        results = []
+        for bt, nw in itertools.product((2, 4, 8, 16, 32, 64), (1, 2, 4, 8)):
+            try:
+                t = timed(lambda: run(bt, nw), reps=3)
+            except Exception:
+                continue
+            got = snapshot()
+            results.append((t, (bt, nw), all(torch.equal(a, b) for a, b in zip(got, ref))))
+        run(orig_block_t(num_tokens), 4)
+        report(key, results, (orig_block_t(num_tokens), 4))
+        return None
+    return orig_prologue(*args, **kwargs)
+
+
+ops.attention_prologue = prologue_sweep
+attn_ops_mod = __import__("vllm.models.inkling2.amd.attention", fromlist=["x"])
+if hasattr(attn_ops_mod, "attention_prologue"):
+    attn_ops_mod.attention_prologue = prologue_sweep
+
+llm = LLM("/models/Inkling-2-Mini", max_model_len=32768, max_num_seqs=4,
           max_num_batched_tokens=8192, gpu_memory_utilization=0.8,
           enforce_eager=True, enable_prefix_caching=False)
 words = "amber basil cedar delta ember fable garnet harbor indigo juniper".split()
 rng = random.Random(0)
-text = " ".join(rng.choice(words) for _ in range(4000))
+text = " ".join(rng.choice(words) for _ in range(WORDS))
 llm.chat([{"role": "user", "content": "Summarize: " + text}], SamplingParams(max_tokens=1))
