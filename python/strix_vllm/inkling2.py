@@ -37,8 +37,8 @@ def register() -> None:
 
 
 def _register_draft_head() -> None:
-    """DSpark draft base logits from the int8 copy of the shared LM head for
-    skinny batches (drafts are verified, so this only moves acceptance)."""
+    """DSpark draft base logits and draft layers from dense_w8's int8 copies
+    for skinny batches (drafts are verified, so this only moves acceptance)."""
     if disabled("dense_w8") or disabled("inkling2_draft_head"):
         return
     try:
@@ -58,6 +58,20 @@ def _register_draft_head() -> None:
         )
 
     dspark.Inkling2DSparkModel.compute_base_logits = compute_base_logits
+    if not hasattr(dspark, "draft_linear"):
+        return
+    bf16_linear = dspark.draft_linear
+
+    def draft_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        entry = dense_w8.lookup(weight)
+        x_2d = x.reshape(-1, x.shape[-1])
+        if entry is None or not dense_w8.skinny_ok(x_2d.size(0), entry[0]):
+            return bf16_linear(x, weight)
+        w_q, w_s, group, cu = entry
+        out = torch.ops.strix.w8a16_skinny_gemm(w_q, x_2d, w_s, None, cu, group)
+        return out.reshape(*x.shape[:-1], weight.size(0))
+
+    dspark.draft_linear = draft_linear
 
 
 def _register_loop() -> None:
