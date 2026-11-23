@@ -245,6 +245,15 @@ def gdn_chunk_fwd(
     return o, final_state
 
 
+@torch.library.register_fake("strix::inkling_rel_attn_prefill")
+def _(
+    out, q, key_cache, value_cache, rel_logits, gate, sinks, cu_seqlens_q,
+    seq_lens, block_table, tile_offsets, max_tiles, scale, window_left,
+    q_tiles, block_n,
+):
+    return None
+
+
 @torch.library.register_fake("strix::attn_prefill_bf16")
 def _(
     out,

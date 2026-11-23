@@ -84,9 +84,23 @@ constexpr int kBM = 16;     // query tokens per block
 // LDS *without* the scale, which is exact (|v| <= 127); the scale is applied
 // once per (query, key) instead - to the score for K, to the P fragment for
 // V - so the per-element cost is one convert, not a convert and a multiply.
-template <int D, int G, int HPB, int BN, typename XT, bool ALIAS, bool Q8>
-__global__ __launch_bounds__(HPB * (D / dims_per_wave(D)) * kWave)
-__attribute__((amdgpu_waves_per_eu(waves_target(HPB * (D / dims_per_wave(D)))))) void
+//
+// QT: 16-query tiles per block (each its own wave per head): more queries
+// per staged K/V tile for small head groups. tile_off counts 16 * QT-query
+// tiles.
+//
+// REL (Inkling 2): relative attention. A sheared bf16 logit table
+// rel[T + 128][Hq][e_pad] holds, for the queries of each 128-query tile of a
+// sequence, the logits of the e_pad keys ending at the tile's last 128-key
+// boundary (see Inkling2's attention_prologue): key j of a query in that tile
+// reads column j - key0, key0 = ceil128(context + tile_end) - e_pad; keys
+// before key0 have no logit. The epilogue applies the output gate and the
+// per-token attention sink: out = o * sigmoid(gate) * sigmoid(lse - sink),
+// with gate [T, Hq * D] and sink [T, Hq] (bf16, row strides sg_t / ss_t).
+template <int D, int G, int HPB, int BN, typename XT, bool ALIAS, bool Q8, int QT = 1,
+          bool REL = false>
+__global__ __launch_bounds__(HPB * (D / dims_per_wave(D)) * QT * kWave)
+__attribute__((amdgpu_waves_per_eu(waves_target(HPB * (D / dims_per_wave(D)) * QT)))) void
 attn_prefill_kernel(
     uint16_t* __restrict__ out, const uint16_t* __restrict__ q,
     const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc,
@@ -99,14 +113,20 @@ attn_prefill_kernel(
     int64_t sk_b, int64_t sk_s, int64_t sk_h, int64_t sv_b, int64_t sv_s,
     int64_t sv_h, int64_t sc_b, int64_t sc_s, int64_t sc_h, float scale_log2,
     int win_left, int nseg, float* __restrict__ o_part,
-    float* __restrict__ ml_part, const float* __restrict__ sinks) {
+    float* __restrict__ ml_part, const float* __restrict__ sinks,
+    const uint16_t* __restrict__ rel, int64_t sr_t, int64_t sr_h, int e_pad,
+    const uint16_t* __restrict__ gate, int64_t sg_t,
+    const uint16_t* __restrict__ tsink, int64_t ss_t) {
   constexpr int kHalf = dims_per_wave(D);
   constexpr int kHD = D, W = D / kHalf;  // waves per head
   constexpr int kPK = kHD + 8;     // LDS pitch of the K tile [key][d]
-  constexpr int kThreads = HPB * W * kWave;
+  constexpr int kThreads = HPB * W * QT * kWave;
   constexpr int NS = BN / 16;      // 16-key subtiles per step
   constexpr int kPV = BN + 8;      // LDS pitch of the V^T tile [d][key]
-  typedef XT xbuf_t[W * HPB][NS][kWave][8];
+  static_assert(!REL || (128 % (16 * QT) == 0 && 128 % BN == 0 && W == 1 && !Q8),
+                "REL: a block lies in one 128-query tile, a step in one side of key0");
+  // Cross-wave score partials: only heads split over W > 1 waves use them.
+  typedef XT xbuf_t[W > 1 ? W * HPB * QT : 1][W > 1 ? NS : 1][kWave][8];
   constexpr int kKBytes = BN * kPK * 2, kXBytes = sizeof(xbuf_t);
   __shared__ __attribute__((aligned(16)))
   uint8_t s_kx[ALIAS ? (kKBytes > kXBytes ? kKBytes : kXBytes) : kKBytes + kXBytes];
@@ -126,23 +146,38 @@ attn_prefill_kernel(
   for (int i = 1; i < nseq; ++i) n += tile_off[i] <= tile;
 
   const int tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
-  const int pair = wave / W, half = wave % W, lo = lane % 16, hi = lane / 16;
+  // grp: (query tile, head) of this wave; W waves split the head's dims.
+  const int grp = wave / W, half = wave % W, lo = lane % 16, hi = lane / 16;
+  const int pair = grp % HPB, qt = grp / HPB;
   const int h = kvh * G + hgroup * HPB + pair;
   const int q0 = cu_q[n], q_len = cu_q[n + 1] - q0;
   const int kv_len = seq_lens[n], context = kv_len - q_len;
-  const int local0 = (tile - tile_off[n]) * kBM;
-  const int rows = min(kBM, q_len - local0);
+  const int block0 = (tile - tile_off[n]) * kBM * QT;
+  const int local0 = block0 + qt * kBM;
+  // A wave past the sequence's last query (QT > 1) has no rows.
+  const int rows = max(0, min(kBM, q_len - local0));
   // Invalid rows reuse the last valid row's position (never written back).
-  const int my_row = min(lo, rows - 1);
-  const int my_pos = context + local0 + my_row;
-  const int last_pos = context + local0 + rows - 1;
+  const int my_q = rows > 0 ? local0 + min(lo, rows - 1) : q_len - 1;
+  const int my_pos = context + my_q;
+  // The block's first and last query positions bound its keys.
+  const int first_pos = context + block0;
+  const int last_pos = context + min(block0 + kBM * QT, q_len) - 1;
   const int32_t* bt = block_table + int64_t(n) * bt_stride;
+  // REL: the block's queries share key0 (one 128-query tile); rel_row[j]
+  // is key j's logit for this lane's query.
+  int key0 = 0;
+  const uint16_t* rel_row = nullptr;
+  if constexpr (REL) {
+    const int tile_end = min((block0 / 128 + 1) * 128, q_len);
+    key0 = (context + tile_end + 127) / 128 * 128 - e_pad;
+    rel_row = rel + int64_t(q0 + my_q) * sr_t + h * sr_h - key0;
+  }
 
   // Q^T B fragments: row = query lo, k = this half's dims.
   bf16x16 qf[kHalf / 16];
   {
     const uint16_t* qrow =
-        q + int64_t(q0 + local0 + my_row) * sq_t + h * sq_h + half * kHalf;
+        q + int64_t(q0 + my_q) * sq_t + h * sq_h + half * kHalf;
 #pragma unroll
     for (int kk = 0; kk < kHalf / 16; ++kk) qf[kk] = load_frag_bf16(qrow + kk * 16, 0, 0);
     // Q8 runs the WMMAs in fp16 (the K/V bytes widen to fp16 with one perm
@@ -274,7 +309,10 @@ attn_prefill_kernel(
   // this tile needs; with nseg == 1 it is all of them.
   // Sliding window (vLLM's (window - 1, 0)): a query at p sees keys
   // p - win_left .. p, so the block starts at its first row's window.
-  const int k_lo = win_left >= 0 ? max(0, context + local0 - win_left) : 0;
+  // REL aligns it down to a step, so a step lies on one side of key0 and
+  // its logits are 16-byte aligned (the extra keys are masked).
+  int k_lo = win_left >= 0 ? max(0, first_pos - win_left) : 0;
+  if constexpr (REL) k_lo = k_lo / BN * BN;
   const int seg = blockIdx.z, keys_needed = last_pos + 1;
   const int seg_len = ((keys_needed - k_lo + nseg - 1) / nseg + BN - 1) / BN * BN;
   const int k_begin = k_lo + seg * seg_len;
@@ -356,8 +394,25 @@ attn_prefill_kernel(
     // first and last one or two. The block-uniform branch drops ~2 compares
     // and a select per element.
     constexpr bool kMaskSkip = PrefillTune<D, G, Q8>::mask_skip;
-    const bool full_step = kMaskSkip && k0 + BN - 1 <= context + local0 &&
+    const bool full_step = kMaskSkip && k0 + BN - 1 <= first_pos &&
                            (win_left < 0 || last_pos - k0 <= win_left);
+    if constexpr (REL) {
+      // Relative logits (natural log) of keys from key0 on. Key 2e + hi of a
+      // subtile is the low (hi = 0) or high half of word e of its 16 logits.
+      if (k0 >= key0) {
+        const uint32_t sel = hi ? 0x03020c0cu : 0x01000c0cu;
+#pragma unroll
+        for (int j = 0; j < NS; ++j) {
+          const uint4* p = reinterpret_cast<const uint4*>(rel_row + k0 + 16 * j);
+          const uint4 a = p[0], b = p[1];
+          const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+          for (int e = 0; e < 8; ++e)
+            s[j][e] = fmaf(__uint_as_float(__builtin_amdgcn_perm(0u, w[e], sel)),
+                           1.4426950408889634f, s[j][e]);
+        }
+      }
+    }
     float m_loc = -INFINITY;
     if (full_step) {
 #pragma unroll
@@ -366,7 +421,7 @@ attn_prefill_kernel(
         for (int e = 0; e < 8; ++e) {
 #pragma unroll
           for (int o = 1; o < W; ++o)
-            s[j][e] += static_cast<float>(s_x[pair * W + (half + o) % W][j][lane][e]);
+            s[j][e] += static_cast<float>(s_x[grp * W + (half + o) % W][j][lane][e]);
           m_loc = fmaxf(m_loc, s[j][e]);
         }
     } else {
@@ -378,7 +433,7 @@ attn_prefill_kernel(
           float v = s[j][e];
 #pragma unroll
           for (int o = 1; o < W; ++o)
-            v += static_cast<float>(s_x[pair * W + (half + o) % W][j][lane][e]);
+            v += static_cast<float>(s_x[grp * W + (half + o) % W][j][lane][e]);
           const bool seen = key <= my_pos && (win_left < 0 || my_pos - key <= win_left);
           s[j][e] = seen ? v : -INFINITY;
           m_loc = fmaxf(m_loc, s[j][e]);
@@ -451,6 +506,30 @@ attn_prefill_kernel(
     if (half == 0 && hi == 0) {
       ml_part[2 * r] = m_run;
       ml_part[2 * r + 1] = l_run;
+    }
+  } else if (REL && lo < rows) {
+    // out = o / l * sigmoid(gate) * sigmoid(lse - sink), lse natural-log.
+    const int64_t token = q0 + local0 + lo;
+    const float inv = 1.f / l_run;
+    const float lse = (m_run + __log2f(l_run)) * 0.6931471805599453f;
+    const float snk = bf16_lo(tsink[token * ss_t + h]);
+    const float g_sink = 1.f / (1.f + __builtin_amdgcn_exp2f((snk - lse) * 1.4426950408889634f));
+    const uint16_t* grow = gate + token * sg_t + h * kHD;
+    uint16_t* orow = out + token * so_t + h * so_h;
+    const uint32_t sel = hi ? 0x03020c0cu : 0x01000c0cu;
+#pragma unroll
+    for (int dt = 0; dt < kHalf / 16; ++dt) {
+      const uint4* p = reinterpret_cast<const uint4*>(grow + dt * 16);
+      const uint4 a = p[0], b = p[1];
+      const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const float g = __uint_as_float(__builtin_amdgcn_perm(0u, w[e], sel));
+        const float y = o_acc[dt][e] * inv *
+                        (1.f / (1.f + __builtin_amdgcn_exp2f(-g * 1.4426950408889634f))) *
+                        g_sink;
+        orow[dt * 16 + 2 * e + hi] = static_cast<uint16_t>(round_bf16_hi(y) >> 16);
+      }
     }
   } else if (lo < rows) {
     float inv = 1.f / l_run;
@@ -618,7 +697,7 @@ void attn_prefill_bf16(torch::Tensor& out, const torch::Tensor& q,
       key_cache.stride(2), value_cache.stride(0), value_cache.stride(1),     \
       value_cache.stride(2), sc_b, sc_s, sc_h, scale_log2,                   \
       static_cast<int>(window_left), static_cast<int>(num_splits), op, mp, \
-      sink_ptr)
+      sink_ptr, nullptr, 0, 0, 0, nullptr, 0, nullptr, 0)
 // Every tile exchanges its cross-wave score partials in fp16 (XT): ~5e-4
 // relative on a partial, the order of P's own bf16 rounding, and the LDS
 // and VGPRs it frees are worth 2-4 % at 256 and make HPB 8 fit at 512.
@@ -659,6 +738,89 @@ void attn_prefill_bf16(torch::Tensor& out, const torch::Tensor& q,
         reinterpret_cast<uint16_t*>(out.data_ptr()), op, mp,
         static_cast<int>(num_splits), hq, out.stride(0), out.stride(1));
   }
+}
+
+// Inkling 2 relative attention for prefill (REL above): q [T, Hq, 128] bf16
+// with GQA 3; caches as attn_prefill_bf16 (bf16); rel_logits [T + 128, Hq, E]
+// sheared bf16 logits; gate [T, Hq * 128] and sinks [T, Hq] bf16 views (row
+// strides free); out [T, Hq * 128] bf16, written for the tokens of the
+// sequences. tile_offsets: [N + 1] int32, cumulative ceil(q_len / (16 *
+// q_tiles)); max_tiles bounds its last entry. window_left as attn_prefill_bf16.
+void inkling_rel_attn_prefill(torch::Tensor& out, const torch::Tensor& q,
+                              const torch::Tensor& key_cache,
+                              const torch::Tensor& value_cache,
+                              const torch::Tensor& rel_logits,
+                              const torch::Tensor& gate, const torch::Tensor& sinks,
+                              const torch::Tensor& cu_seqlens_q,
+                              const torch::Tensor& seq_lens,
+                              const torch::Tensor& block_table,
+                              const torch::Tensor& tile_offsets, int64_t max_tiles,
+                              double scale, int64_t window_left, int64_t q_tiles,
+                              int64_t block_n) {
+  TORCH_CHECK(q.dim() == 3 && q.size(2) == 128 && q.scalar_type() == at::kBFloat16 &&
+                  q.stride(2) == 1 && q.stride(0) % 8 == 0 && q.stride(1) % 8 == 0,
+              "q must be bf16 [T, H, 128] with 16-byte aligned rows");
+  const int64_t T = q.size(0), hq = q.size(1), hkv = key_cache.size(2);
+  TORCH_CHECK(hq == 3 * hkv, "GQA 3 only");
+  for (const auto* t : {&key_cache, &value_cache})
+    TORCH_CHECK(t->dim() == 4 && t->scalar_type() == at::kBFloat16 && t->size(3) >= 128 &&
+                    t->stride(3) == 1 && t->stride(0) % 8 == 0 && t->stride(1) % 8 == 0 &&
+                    t->stride(2) % 8 == 0 && key_cache.size(1) * t->stride(1) < (int64_t(1) << 31),
+                "bf16 caches [blocks, block_size, Hkv, D] with aligned rows");
+  const int64_t e_pad = rel_logits.size(2);
+  TORCH_CHECK(rel_logits.dim() == 3 && rel_logits.scalar_type() == at::kBFloat16 &&
+                  rel_logits.size(0) >= T + 128 && rel_logits.size(1) == hq &&
+                  rel_logits.stride(2) == 1 && e_pad % 128 == 0 &&
+                  rel_logits.stride(0) % 8 == 0 && rel_logits.stride(1) % 8 == 0,
+              "rel_logits must be bf16 [T + 128, H, E] (E % 128 == 0)");
+  TORCH_CHECK(gate.dim() == 2 && gate.scalar_type() == at::kBFloat16 && gate.size(0) >= T &&
+                  gate.size(1) == hq * 128 && gate.stride(1) == 1 && gate.stride(0) % 8 == 0 &&
+                  reinterpret_cast<uintptr_t>(gate.data_ptr()) % 16 == 0,
+              "gate must be bf16 [T, H * 128] with 16-byte aligned rows");
+  TORCH_CHECK(sinks.dim() == 2 && sinks.scalar_type() == at::kBFloat16 && sinks.size(0) >= T &&
+                  sinks.size(1) == hq && sinks.stride(1) == 1,
+              "sinks must be bf16 [T, H]");
+  TORCH_CHECK(out.scalar_type() == at::kBFloat16 && out.dim() == 2 && out.size(0) >= T &&
+                  out.size(1) == hq * 128 && out.is_contiguous(),
+              "out must be contiguous bf16 [T, H * 128]");
+  for (const auto* t : {&cu_seqlens_q, &seq_lens, &block_table, &tile_offsets})
+    TORCH_CHECK(t->scalar_type() == at::kInt, "int32 metadata");
+  TORCH_CHECK(block_table.stride(1) == 1, "block_table rows contiguous");
+  TORCH_CHECK(key_cache.size(1) % block_n == 0, "block_size % block_n");
+  if (max_tiles == 0 || T == 0) return;
+  const int nseq = cu_seqlens_q.numel() - 1;
+  auto stream = at::hip::getCurrentHIPStream();
+  const float scale_log2 = static_cast<float>(scale) * 1.4426950408889634f;
+#define STRIX_REL(QT, BN)                                                          \
+  attn_prefill_kernel<128, 3, 3, BN, float, false, false, QT, true>                \
+      <<<dim3(hkv, max_tiles, 1), 3 * QT * kWave, 0, stream>>>(                     \
+          reinterpret_cast<uint16_t*>(out.data_ptr()),                             \
+          reinterpret_cast<const uint16_t*>(q.data_ptr()),                         \
+          reinterpret_cast<const uint16_t*>(key_cache.data_ptr()),                 \
+          reinterpret_cast<const uint16_t*>(value_cache.data_ptr()), nullptr,      \
+          nullptr, nullptr, nullptr, cu_seqlens_q.data_ptr<int32_t>(),             \
+          seq_lens.data_ptr<int32_t>(), block_table.data_ptr<int32_t>(),           \
+          tile_offsets.data_ptr<int32_t>(), nseq, block_table.stride(0),           \
+          key_cache.size(1), q.stride(0), q.stride(1), out.stride(0), 128,         \
+          key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),           \
+          value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), 0,  \
+          0, 0, scale_log2, static_cast<int>(window_left), 1, nullptr, nullptr,    \
+          nullptr, reinterpret_cast<const uint16_t*>(rel_logits.data_ptr()),       \
+          rel_logits.stride(0), rel_logits.stride(1), static_cast<int>(e_pad),     \
+          reinterpret_cast<const uint16_t*>(gate.data_ptr()), gate.stride(0),      \
+          reinterpret_cast<const uint16_t*>(sinks.data_ptr()), sinks.stride(0))
+  if (q_tiles == 1 && block_n == 16) STRIX_REL(1, 16);
+  else if (q_tiles == 1 && block_n == 32) STRIX_REL(1, 32);
+  else if (q_tiles == 2 && block_n == 16) STRIX_REL(2, 16);
+  else if (q_tiles == 2 && block_n == 32) STRIX_REL(2, 32);
+  else if (q_tiles == 4 && block_n == 16) STRIX_REL(4, 16);
+  else if (q_tiles == 4 && block_n == 32) STRIX_REL(4, 32);
+  else if (q_tiles == 2 && block_n == 64) STRIX_REL(2, 64);
+  else if (q_tiles == 4 && block_n == 64) STRIX_REL(4, 64);
+  else if (q_tiles == 8 && block_n == 32) STRIX_REL(8, 32);
+  else if (q_tiles == 8 && block_n == 16) STRIX_REL(8, 16);
+  else TORCH_CHECK(false, "inkling_rel_attn_prefill: q_tiles 1/2/4, block_n 16/32");
+#undef STRIX_REL
 }
 
 }  // namespace strix

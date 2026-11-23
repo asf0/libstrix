@@ -29,11 +29,74 @@ _W4_MAX_ROWS = 5
 
 
 def register() -> None:
+    _register_attention()
     _register_moe()
     _register_loop()
     _register_linear()
     _register_head()
     _register_draft_head()
+
+
+# Query tiles of 16 per block (GQA 3, 32-key steps): full layers 4, window
+# layers 2. Inkling 2 Mini, 8k-token chunk over 16k keys: full 88 -> 37-39 ms,
+# window 10.0 -> 5.0 ms (attention + gate/sink, against the Triton kernel).
+_REL_Q_TILES_FULL = 4
+_REL_Q_TILES_WINDOW = 2
+_REL_BLOCK_N = 32
+
+
+def _register_attention() -> None:
+    """Prefill (and mixed-batch) relative attention on the HIP kernel, with
+    the output gate and sink in its epilogue."""
+    if disabled("inkling2_attention"):
+        return
+    try:
+        from vllm.models.inkling2.amd import attention
+    except ImportError:
+        return
+    if not hasattr(attention, "gated_rel_attention"):
+        return
+    triton_attention = attention.gated_rel_attention
+
+    def gated_rel_attention(
+        q, key_cache, value_cache, sheared_bias, gate, sinks, result, *,
+        block_table, cache_seqlens, cu_seqlens_q, max_seqlen_q,
+        num_actual_tokens, softmax_scale, window,
+    ) -> None:
+        num_heads, head_dim = q.shape[1:]
+        page = key_cache.shape[1]
+        if (
+            q.dtype != torch.bfloat16
+            or key_cache.dtype != torch.bfloat16
+            or head_dim != 128
+            or num_heads != 3 * key_cache.shape[2]
+            or page % _REL_BLOCK_N
+            or gate.stride(0) % 8
+            or gate.data_ptr() % 16
+            or block_table.dtype != torch.int32
+        ):
+            return triton_attention(
+                q, key_cache, value_cache, sheared_bias, gate, sinks, result,
+                block_table=block_table, cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q, max_seqlen_q=max_seqlen_q,
+                num_actual_tokens=num_actual_tokens, softmax_scale=softmax_scale,
+                window=window,
+            )
+        nt = num_actual_tokens
+        q_tiles = _REL_Q_TILES_WINDOW if window >= 0 else _REL_Q_TILES_FULL
+        tile = 16 * q_tiles
+        cu = cu_seqlens_q.to(torch.int32)
+        offsets = torch.zeros_like(cu)
+        torch.cumsum((cu[1:] - cu[:-1] + tile - 1) // tile, 0, out=offsets[1:])
+        max_tiles = (nt + tile - 1) // tile + cu.numel() - 1
+        torch.ops.strix.inkling_rel_attn_prefill(
+            result, q, key_cache, value_cache, sheared_bias, gate, sinks, cu,
+            cache_seqlens.to(torch.int32), block_table, offsets, max_tiles,
+            softmax_scale, window, q_tiles, _REL_BLOCK_N,
+        )
+        result[nt:].zero_()
+
+    attention.gated_rel_attention = gated_rel_attention
 
 
 def _register_draft_head() -> None:

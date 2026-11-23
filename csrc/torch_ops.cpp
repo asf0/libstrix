@@ -121,6 +121,17 @@ void attn_prefill_bf16(torch::Tensor& out, const torch::Tensor& q,
                             int64_t max_tiles, double scale,
                             int64_t num_splits, int64_t window_left,
                             const std::optional<torch::Tensor>& sinks);
+void inkling_rel_attn_prefill(torch::Tensor& out, const torch::Tensor& q,
+                              const torch::Tensor& key_cache,
+                              const torch::Tensor& value_cache,
+                              const torch::Tensor& rel_logits,
+                              const torch::Tensor& gate, const torch::Tensor& sinks,
+                              const torch::Tensor& cu_seqlens_q,
+                              const torch::Tensor& seq_lens,
+                              const torch::Tensor& block_table,
+                              const torch::Tensor& tile_offsets, int64_t max_tiles,
+                              double scale, int64_t window_left, int64_t q_tiles,
+                              int64_t block_n);
 void attn_decode_bf16(torch::Tensor& out, const torch::Tensor& q,
                       const torch::Tensor& key_cache,
                       const torch::Tensor& value_cache,
@@ -275,6 +286,12 @@ TORCH_LIBRARY(strix, m) {
       "Tensor block_table, Tensor tile_offsets, int max_tiles, float scale, "
       "int num_splits, int window_left=-1, Tensor? sinks=None) -> ()");
   m.def(
+      "inkling_rel_attn_prefill(Tensor(a!) out, Tensor q, Tensor key_cache, "
+      "Tensor value_cache, Tensor rel_logits, Tensor gate, Tensor sinks, "
+      "Tensor cu_seqlens_q, Tensor seq_lens, Tensor block_table, "
+      "Tensor tile_offsets, int max_tiles, float scale, int window_left, "
+      "int q_tiles, int block_n) -> ()");
+  m.def(
       "attn_prefill32_bf16(Tensor(a!) out, Tensor q, Tensor key_cache, "
       "Tensor value_cache, Tensor cu_seqlens_q, Tensor seq_lens, "
       "Tensor block_table, Tensor tile_offsets, int max_tiles, float scale)"
@@ -355,6 +372,7 @@ TORCH_LIBRARY_IMPL(strix, CUDA, m) {
   m.impl("gdn_chunk_fwd_k128_v128_c64_bf16",
          &strix::gdn_chunk_fwd_k128_v128_c64_bf16);
   m.impl("attn_prefill_bf16", &strix::attn_prefill_bf16);
+  m.impl("inkling_rel_attn_prefill", &strix::inkling_rel_attn_prefill);
   m.impl("attn_prefill32_bf16", &strix::attn_prefill32_bf16);
   m.impl("w8a16_skinny_gemm", &strix::w8a16_skinny_gemm);
   m.impl("fp8_skinny_gemm", &strix::fp8_skinny_gemm);
