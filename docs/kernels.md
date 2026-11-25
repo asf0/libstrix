@@ -121,7 +121,7 @@ registration has no row.
 
 The kernels need no patched vLLM sources: the plugin runs on a stock upstream
 build. A few things the recipes use come from the
-[strix-vllm](https://github.com/asf0/strix-vllm) fork (branch `gfx1151`)
+[strix-vllm](https://github.com/asf0/strix-vllm) fork
 instead, which the Docker image ships:
 
 - streaming Qwen3.8-Flash-Next's n-gram table from disk

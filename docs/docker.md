@@ -172,7 +172,8 @@ About 40 minutes, mostly vLLM's C++: `docker/build-and-push.sh`, or
 
 **Releases.** GitHub Actions builds the published image (`.github/workflows/image.yml`,
 no GPU needed). Pushing a tag `vX.Y.Z` builds the strix-vllm commit pinned in
-`docker/strix-vllm.ref`, pushes `ghcr.io/asf0/strix-vllm:X.Y.Z` and `:latest`, and
+`docker/strix-vllm.ref`, pushes `ghcr.io/asf0/strix-vllm:X.Y.Z` (and `:latest` when X.Y.Z is the highest
+release version, so a patch for an older line does not move it), and
 publishes a GitHub release whose notes are the top entry of
 [CHANGELOG.md](../CHANGELOG.md) plus the libstrix and fork commits (the fork commit
 is also tagged `strix/vX.Y.Z` in asf0/strix-vllm). The release carries

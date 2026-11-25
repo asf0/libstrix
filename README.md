@@ -55,7 +55,8 @@ Against stock upstream vLLM on one gfx1151 APU, single stream, int8 KV
 ## Docker
 
 `ghcr.io/asf0/strix-vllm` bundles the [strix-vllm](https://github.com/asf0/strix-vllm)
-fork (branch `gfx1151`), this plugin and ROCm 10.1 on Ubuntu 26.04 / Python 3.14.
+fork (the commit pinned in `docker/strix-vllm.ref`, on a `vX.Y.x` release line,
+currently `v0.1.x`), this plugin and ROCm 10.1 on Ubuntu 26.04 / Python 3.14.
 Nothing to build. `docker/recipes/` has one compose file per tested model.
 
 ### Host setup (once)

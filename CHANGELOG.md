@@ -11,7 +11,8 @@ Changes land under **Unreleased**. To release: rename that heading to
 commit in `docker/strix-vllm.ref`, commit, tag that fork commit
 `strix/vX.Y.Z` in asf0/strix-vllm (upstream vLLM owns the plain `vX.Y.Z`
 tags there), and push the tag `vX.Y.Z` here. The image workflow then
-publishes `ghcr.io/asf0/strix-vllm:X.Y.Z` (and `:latest`) and a GitHub
+publishes `ghcr.io/asf0/strix-vllm:X.Y.Z` (and `:latest` if it is the highest
+release) and a GitHub
 release with this entry, the two commits it was built from and
 `libstrix-recipes-X.Y.Z.zip` (the recipes pinned to that image).
 
