@@ -364,6 +364,14 @@ KERNELS: list[Kernel] = [
             "note": "direct global loads; LDS-staged was 11% slower at x16",
         },
     ),
+    Kernel(
+        "gdn_recoverssm_verify_bf16",
+        "gdn_recoverssm",
+        "ReplaySSM speculative verify of the Qwen GDN layers: the window's "
+        "decay, normalized key and correction records plus the output, from a "
+        "read-only checkpoint state (vLLM's Triton gdn_recoverssm_verify)",
+        {"head_k": 128, "head_v": 128, **_BF16, "spec_query_len": Range(hi=8)},
+    ),
     # ----------------------------------------------------------- attention
     Kernel(
         "attn_prefill_bf16",

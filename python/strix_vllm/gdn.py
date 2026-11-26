@@ -187,6 +187,63 @@ def _register_mtp_decode() -> None:
     _mtp_lib._register_fake(_MTP_OP, lambda *args, **kwargs: None)
 
 
+def _wrap_recoverssm_verify(verify):
+    """ReplaySSM's verify (vLLM's `gdn_recoverssm_verify`, Triton): the HIP
+    kernel for the shapes it takes, the Triton one otherwise."""
+
+    def gdn_recoverssm_verify(
+        q, k, v, a, b, A_log, dt_bias, checkpoint_state, correction_cache,
+        key_cache, decay_cache, query_start_loc, state_indices, spec_query_len,
+        scale=None,
+    ):
+        _, tokens, hk, key_dim = q.shape
+        hv, value_dim = v.shape[2:]
+        ratio = hv // hk if hk else 0
+        if (
+            key_dim != 128
+            or value_dim != 128
+            or spec_query_len > 8
+            or hv % hk
+            or not (1 <= ratio <= 4 or ratio == 8)
+            or q.dtype != torch.bfloat16
+            or checkpoint_state.dtype not in (torch.float32, torch.bfloat16)
+            or k.dtype != torch.bfloat16
+            or v.dtype != torch.bfloat16
+            or a.dtype != torch.bfloat16
+            or b.dtype != torch.bfloat16
+            or A_log.dtype != torch.float32
+            or not dt_bias.is_contiguous()
+            or state_indices.ndim != 1
+            or any(t.stride()[2:] != (128, 1) for t in (q, k, v))
+            or checkpoint_state.stride()[1:] != (128 * 128, 128, 1)
+            or checkpoint_state.data_ptr() % 16
+            or checkpoint_state.stride(0) % (4 if checkpoint_state.dtype == torch.float32 else 8)
+            or correction_cache.shape[2] != spec_query_len
+            or any(r.dtype != torch.float32 or r.stride(-1) != 1
+                   for r in (correction_cache, key_cache, decay_cache))
+        ):
+            return verify(
+                q, k, v, a, b, A_log, dt_bias, checkpoint_state, correction_cache,
+                key_cache, decay_cache, query_start_loc, state_indices,
+                spec_query_len, scale,
+            )
+        from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+        out = torch.empty_like(v)
+        if tokens == 0 or state_indices.shape[0] == 0:
+            return out
+        torch.ops.strix.gdn_recoverssm_verify_bf16(
+            q[0], k[0], v[0], a, b, A_log, dt_bias, checkpoint_state,
+            correction_cache, key_cache, decay_cache,
+            query_start_loc.to(torch.int32).contiguous(),
+            state_indices.to(torch.int64).contiguous(), out[0],
+            key_dim**-0.5 if scale is None else scale, NULL_BLOCK_ID,
+        )
+        return out
+
+    return gdn_recoverssm_verify
+
+
 def register() -> None:
     import vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn as gdn_layer
 
@@ -197,6 +254,11 @@ def register() -> None:
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         ChunkGatedDeltaRule,
     )
+
+    if not disabled("gdn_recoverssm") and hasattr(gdn_layer, "gdn_recoverssm_verify"):
+        gdn_layer.gdn_recoverssm_verify = _wrap_recoverssm_verify(
+            gdn_layer.gdn_recoverssm_verify
+        )
 
     if not disabled("gdn_conv"):
         gdn_layer.causal_conv1d_fn = _wrap_conv(gdn_layer.causal_conv1d_fn)

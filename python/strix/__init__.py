@@ -18,6 +18,14 @@ from strix.registry import (
 torch.ops.load_library(str(Path(__file__).with_name("_C.so")))
 
 
+@torch.library.register_fake("strix::gdn_recoverssm_verify_bf16")
+def _(
+    q, k, v, a, b, A_log, dt_bias, state, correction, keys, decays, cu_seqlens,
+    state_indices, out, scale, null_block,
+):
+    return None
+
+
 @torch.library.register_fake("strix::gdn_gated_rmsnorm_h128_bf16")
 def _(x, z, weight, eps, activation):
     return x.new_empty(x.shape)

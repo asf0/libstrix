@@ -175,6 +175,13 @@ void gdn_decode_mtp_bf16(
     const torch::Tensor& output_gate, const torch::Tensor& norm_weight,
     torch::Tensor& out, double scale, double norm_eps,
     c10::string_view output_gate_activation);
+void gdn_recoverssm_verify_bf16(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& a_log,
+    const torch::Tensor& dt_bias, const torch::Tensor& state,
+    torch::Tensor& correction, torch::Tensor& keys, torch::Tensor& decays,
+    const torch::Tensor& cu_seqlens, const torch::Tensor& state_indices,
+    torch::Tensor& out, double scale, int64_t null_block);
 torch::Tensor w8a16_skinny_gemm(const at::Tensor& in_a, const at::Tensor& in_b,
                                 const at::Tensor& in_scale,
                                 const std::optional<at::Tensor>& in_bias,
@@ -358,6 +365,14 @@ TORCH_LIBRARY(strix, m) {
       "Tensor! state, Tensor output_gate, Tensor norm_weight, Tensor! out, "
       "float scale, float norm_eps=1e-5, "
       "str output_gate_activation='silu') -> ()");
+  // vLLM's gdn_recoverssm_verify (ReplaySSM speculation): records the window in
+  // correction / keys / decays, the checkpoint state is read only.
+  m.def(
+      "gdn_recoverssm_verify_bf16("
+      "Tensor q, Tensor k, Tensor v, Tensor a, Tensor b, Tensor A_log, "
+      "Tensor dt_bias, Tensor state, Tensor! correction, Tensor! keys, "
+      "Tensor! decays, Tensor cu_seqlens, Tensor state_indices, Tensor! out, "
+      "float scale, int null_block) -> ()");
   m.def("w8a8_wmma_gemm(Tensor in_w8, Tensor in_act, Tensor in_scale) -> Tensor");
   // Bench-only: the same GEMM on one of the fixed tile configs, for
   // bench/kernels/w8a8_gemm.py. M must be a multiple of 128.
@@ -408,6 +423,7 @@ TORCH_LIBRARY_IMPL(strix, CUDA, m) {
          &strix::gdn_chunk_fwd_k128_v128_c64_bf16);
   m.impl("attn_prefill_bf16", &strix::attn_prefill_bf16);
   m.impl("inkling_rel_attn_prefill", &strix::inkling_rel_attn_prefill);
+  m.impl("inkling_rel_attn_decode", &strix::inkling_rel_attn_decode);
   m.impl("inkling2_kv_conv", &strix::inkling2_kv_conv);
   m.impl("attn_prefill32_bf16", &strix::attn_prefill32_bf16);
   m.impl("w8a16_skinny_gemm", &strix::w8a16_skinny_gemm);
@@ -420,10 +436,10 @@ TORCH_LIBRARY_IMPL(strix, CUDA, m) {
   m.impl("w8a8_wmma_gemm", &strix::w8a8_wmma_gemm);
   m.impl("w8a8_wmma_gemm_cfg", &strix::w8a8_wmma_gemm_cfg);
   m.impl("gdn_decode_mtp_bf16", &strix::gdn_decode_mtp_bf16);
+  m.impl("gdn_recoverssm_verify_bf16", &strix::gdn_recoverssm_verify_bf16);
   m.impl("w4a16_wmma_gemm", &strix::w4a16_wmma_gemm);
   m.impl("attn_decode_bf16", &strix::attn_decode_bf16);
   m.impl("w4a8_wmma_gemm", &strix::w4a8_wmma_gemm);
-  m.impl("inkling_rel_attn_decode", &strix::inkling_rel_attn_decode);
   m.impl("mxfp4_wmma_gemm", &strix::mxfp4_wmma_gemm);
   m.impl("mxfp4_wmma_gemm_cfg", &strix::mxfp4_wmma_gemm_cfg);
   m.impl("mxfp4_gemv", &strix::mxfp4_gemv);
