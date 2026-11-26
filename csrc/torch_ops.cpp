@@ -61,6 +61,10 @@ void qsa_union_attn_bf16(torch::Tensor& out, const torch::Tensor& q,
                          const torch::Tensor& block_table, int64_t tokens,
                          const std::optional<torch::Tensor>& k_scale,
                          const std::optional<torch::Tensor>& v_scale);
+void qsa_rows_attn_bf16(torch::Tensor& out, const torch::Tensor& q,
+                        const torch::Tensor& key_cache, const torch::Tensor& value_cache,
+                        const torch::Tensor& indices, const torch::Tensor& block_table,
+                        const std::optional<torch::Tensor>& token_to_req);
 void moe_act_quant_i8(const torch::Tensor& x, torch::Tensor& q, torch::Tensor& sa);
 void moe_gemm_w4a8(torch::Tensor& c, const torch::Tensor& qa,
                    const torch::Tensor& sa, const torch::Tensor& w,
@@ -280,6 +284,11 @@ TORCH_LIBRARY(strix, m) {
       "qsa_union_attn_bf16(Tensor(a!) out, Tensor q, Tensor key_cache, "
       "Tensor value_cache, Tensor indices, Tensor block_table, int tokens=0, "
       "Tensor? k_scale=None, Tensor? v_scale=None) -> ()");
+  // The same attention one query row per wave pair (dense per-row math), any batch.
+  m.def(
+      "qsa_rows_attn_bf16(Tensor(a!) out, Tensor q, Tensor key_cache, "
+      "Tensor value_cache, Tensor indices, Tensor block_table, "
+      "Tensor? token_to_req=None) -> ()");
   // int8 activations per (row, 128-element group) for moe_gemm_w4a8.
   m.def("moe_act_quant_i8(Tensor x, Tensor(a!) q, Tensor(b!) sa) -> ()");
   m.def(
@@ -412,6 +421,7 @@ TORCH_LIBRARY_IMPL(strix, CUDA, m) {
   m.impl("nvfp4_moe_gemv", &strix::nvfp4_moe_gemv);
   m.impl("moe_act_quant_i8", &strix::moe_act_quant_i8);
   m.impl("qsa_union_attn_bf16", &strix::qsa_union_attn_bf16);
+  m.impl("qsa_rows_attn_bf16", &strix::qsa_rows_attn_bf16);
   m.impl("qsa_kv_to_f16", &strix::qsa_kv_to_f16);
   m.impl("qsa_indexer_bf16", &strix::qsa_indexer_bf16);
   m.impl("hc_up_gate_mix_bf16", &strix::hc_up_gate_mix_bf16);

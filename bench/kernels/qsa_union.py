@@ -73,6 +73,21 @@ def main() -> None:
         f"rows={rows} ctx={ctx}: triton per-row {t_ref:.1f} ms, strix union {t_new:.1f} ms "
         f"-> {t_ref / t_new:.2f}x; max|d|={d.max().item():.3g} mean|d|={d.mean().item():.2e}"
     )
+    if hasattr(torch.ops.strix, "qsa_rows_attn_bf16"):
+        out2 = torch.empty_like(q)
+
+        def rows_kernel():
+            torch.ops.strix.qsa_rows_attn_bf16(
+                out2, q, k_cache, v_cache, indices, bt2, token_to_req
+            )
+
+        t_rows = timed(rows_kernel)
+        d2 = (out2.float() - ref.float()).abs()
+        print(
+            f"rows={rows} ctx={ctx}: strix rows {t_rows:.1f} ms -> {t_ref / t_rows:.2f}x "
+            f"triton, {t_new / t_rows:.2f}x union; max|d|={d2.max().item():.3g} "
+            f"mean|d|={d2.mean().item():.2e}"
+        )
 
 
 if __name__ == "__main__":

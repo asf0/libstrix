@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: MIT
 """Qwen3.8-Flash-Next (qwen4_exp) prefill swaps.
 
-qsa_union: QSA sparse attention for a single-request prefill on
-strix::qsa_union_attn_bf16.
-
-Groups of 16 consecutive query rows attend over the union of their selected
-tokens (csrc/attn/qsa_union_bf16.hip): 1.51x the RDNA-tuned Triton per-row
-kernel on a 26k-token prompt's real selections, more as the context grows.
-An fp8 cache (--kv-cache-dtype=fp8) is cast to bf16 per request first:
-vLLM's kernel on fp8 K/V is 4-7.6x slower. Everything else (decode, several
-requests, other shapes, positions past the 128k union bitmap) keeps vLLM's
-Triton kernel.
+qsa_rows: QSA sparse attention for prefill. Two strix kernels:
+- qsa_union_attn_bf16 (csrc/attn/qsa_union_bf16.hip) for a single request of
+  at most _UNION_MAX_TOKENS tokens: 16 consecutive rows gather the union of
+  their selections once, cheap while neighbouring rows select nearly the same
+  tokens (early in a prompt);
+- qsa_rows_attn_bf16 (csrc/attn/qsa_rows_bf16.hip) for longer requests and
+  every batched prefill: one query row per wave pair, its 12 query heads (GQA
+  12) as the WMMA columns over its own selected tokens; 1.5x vLLM's
+  RDNA-tuned Triton kernel on real selections from 300 to 15k rows and 45k to
+  205k context, and no position limit.
+An fp8 cache is cast to a bf16 copy of the pages each request uses, an int8
+one dequantized (or read through the union kernel's compact fp16 copy); that
+pays off from _MIN_ROWS rows, and smaller fp8 / int8 batches (decode) keep
+vLLM's kernel.
 
 vLLM's AMD QSA module imports `qsa_sparse_paged_attention` from
 `vllm.models.qwen4_exp.amd.ops.qsa` at call time, so swapping the module
@@ -43,19 +47,27 @@ import torch
 
 from strix_vllm import disabled
 
-# STRIX_QSA_UNION_MIN_ROWS lowers the floor for accuracy runs on short prompts.
-_MIN_ROWS = int(os.environ.get("STRIX_QSA_UNION_MIN_ROWS", "1024"))
-_MAX_POSITIONS = 131072
+# Rows from which an fp8 / int8 cache is converted for the strix kernel (the
+# conversion reads every page a request uses). A bf16 cache takes the kernel
+# from _BF16_MIN_ROWS. STRIX_QSA_MIN_ROWS lowers the floor for accuracy runs.
+_MIN_ROWS = int(os.environ.get("STRIX_QSA_MIN_ROWS", "1024"))
+_BF16_MIN_ROWS = 128
+# A single-request chunk whose request is at most this long takes the union
+# kernel: early in a prompt neighbouring rows select nearly the same tokens and
+# a 16-row union is cheap (64k-token wikitext prefill, ms per QSA layer, union
+# against per-row: 69 / 102 at 0-16k, 105 / 113 at 16-32k, 108 / 114 at
+# 32-48k, 121 / 116 at 48-64k; one layer at 135k: 191 / 117).
+_UNION_MAX_TOKENS = int(os.environ.get("STRIX_QSA_UNION_MAX_TOKENS", "49152"))
 # vLLM's fp8 QSA cache (--kv-cache-dtype=fp8), viewed in the platform's flavor.
 _FP8 = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
 
-def _union_shape_ok(q, k_cache, v_cache, logical_indices, block_table) -> bool:
-    """A single-request prefill the union kernel takes, positions aside."""
+def _rows_shape_ok(q, k_cache, v_cache, logical_indices, block_table) -> bool:
+    """Shapes strix::qsa_rows_attn_bf16 takes (dtype of the cache aside)."""
     return (
-        q.shape[0] >= _MIN_ROWS
-        and block_table.dim() == 2
-        and block_table.shape[0] == 1
+        block_table.dim() == 2
+        and block_table.stride(1) == 1
+        and block_table.dtype == torch.int32
         and q.dtype == torch.bfloat16
         and k_cache.dtype == v_cache.dtype
         and k_cache.dtype in (torch.bfloat16, torch.int8, *_FP8)
@@ -71,31 +83,30 @@ def _union_shape_ok(q, k_cache, v_cache, logical_indices, block_table) -> bool:
     )
 
 
-def _dequant_pages(cache, scale, block_table, tokens):
-    """The request's first `tokens` positions of an int8_per_token_head cache
-    as a contiguous bf16 cache [pages, block, Hkv, 256], scaled in fp32."""
-    pages = block_table[0, : -(-tokens // cache.shape[1])].long()
-    return (cache[pages].float() * scale[pages][..., None]).to(torch.bfloat16)
-
-
-def _fp8_pages(cache, block_table, tokens):
-    """The request's first `tokens` positions of an fp8 cache as a contiguous
-    bf16 cache [pages, block, Hkv, 256]. vLLM's fp8 QSA cache has unit scales
-    (its layer refuses others), so e4m3 -> bf16 is an exact cast."""
-    pages = block_table[0, : -(-tokens // cache.shape[1])].long()
-    return cache[pages].to(torch.bfloat16)
+def _bf16_pages(cache, scale, block_table, tokens):
+    """Each request's first `tokens` positions as a contiguous bf16 cache
+    [reqs * pages, block, Hkv, 256] and its block table [reqs, pages]. fp8:
+    vLLM's fp8 QSA cache has unit scales (its layer refuses others), so
+    e4m3 -> bf16 is an exact cast; int8_per_token_head: scaled in fp32."""
+    npages = -(-tokens // cache.shape[1])
+    pages = block_table[:, :npages].reshape(-1).long()
+    x = cache[pages]
+    if scale is not None:
+        x = (x.float() * scale[pages][..., None]).to(torch.bfloat16)
+    else:
+        x = x.to(torch.bfloat16)
+    table = torch.arange(pages.numel(), device=cache.device, dtype=torch.int32)
+    return x, table.view(block_table.shape[0], npages)
 
 
 _HC_MIN_ROWS = 512
-_F16 = os.environ.get("STRIX_QSA_UNION_F16", "0") == "1"
-_UNION_ROWS = int(os.environ.get("STRIX_QSA_UNION_ROWS", "16"))
 
 
 _IDX_MIN_ROWS = 128
 
 
 def register() -> None:
-    _register_qsa_union()
+    _register_qsa_rows()
     _register_qsa_indexer()
     _register_hc_up_gate_mix()
     _register_hc_combine_norm()
@@ -360,8 +371,8 @@ def _install_hc_hook(hcm, hc) -> None:
     hcm.hc_gate_mix = hc_gate_mix
 
 
-def _register_qsa_union() -> None:
-    if disabled("qsa_union"):
+def _register_qsa_rows() -> None:
+    if disabled("qsa_rows"):
         return
     try:
         from vllm.models.qwen4_exp.amd.ops import qsa as ops
@@ -374,67 +385,54 @@ def _register_qsa_union() -> None:
         k_scale=None, v_scale=None,
     ):
         int8 = k_cache.dtype == torch.int8
+        converted = int8 or k_cache.dtype in _FP8
+        rows = q.shape[0]
         scales = {} if k_scale is None else {"k_scale": k_scale, "v_scale": v_scale}
-        if (int8 and k_scale is None) or not _union_shape_ok(
-            q, k_cache, v_cache, logical_indices, block_table
+        if (
+            (int8 and k_scale is None)
+            or rows < (_MIN_ROWS if converted else _BF16_MIN_ROWS)
+            or not _rows_shape_ok(q, k_cache, v_cache, logical_indices, block_table)
         ):
             return orig(
                 q, k_cache, v_cache, logical_indices, block_table, token_to_req, out,
                 **scales,
             )
-        # The union bitmap covers positions < 131072. A cache that cannot hold
-        # more needs no check; otherwise the request's own length decides
-        # (the largest selected position, one host sync), so a server with a
-        # longer --max-model-len still takes the union kernel up to 128k.
-        # An int8 cache and STRIX_QSA_UNION_F16 need that length anyway: the
-        # kernel gathers from a compact fp16 copy of the visible K/V.
+        single = block_table.shape[0] == 1
         capacity = block_table.shape[1] * k_cache.shape[1]
-        fp8 = k_cache.dtype in _FP8
+        union_ok = single and rows >= _MIN_ROWS
         tokens = 0
-        if int8 or fp8 or _F16 or capacity > _MAX_POSITIONS:
+        if converted or (union_ok and capacity > _UNION_MAX_TOKENS):
+            # The largest selected position (one host sync): the pages to
+            # convert and the kernel's choice. Nothing selected: vLLM's kernel
+            # writes the zeros.
             tokens = int(logical_indices.max()) + 1
-            if tokens <= 0:  # nothing selected: the Triton kernel writes zeros
+            if tokens <= 0:
                 return orig(
                     q, k_cache, v_cache, logical_indices, block_table, token_to_req,
                     out, **scales,
                 )
-        if fp8:
-            # vLLM's Triton kernel on fp8 K/V is 4-7.6x slower than the union
-            # kernel on bf16 (16k rows: 1891 vs 250 ms per layer at 16k context,
-            # 2068 vs 524 ms at 128k), so cast the request's pages to bf16
-            # once per layer and take the bf16 union path. Past the bitmap the
-            # bf16 copy goes to vLLM's kernel, which reads bf16 faster than fp8
-            # (261k-token prefill 1,267 vs 1,221 tok/s with the fp8 cache
-            # passed straight through).
-            k16 = _fp8_pages(k_cache, block_table, tokens)
-            v16 = _fp8_pages(v_cache, block_table, tokens)
-            pages = torch.arange(k16.shape[0], device=q.device, dtype=torch.int32)
-            if tokens > _MAX_POSITIONS:
-                return orig(q, k16, v16, logical_indices, pages[None], token_to_req, out)
-            if out is None:
-                out = torch.empty_like(q)
-            torch.ops.strix.qsa_union_attn_bf16(
-                out, q, k16, v16, logical_indices, pages, tokens if _F16 else 0,
-                None, None,
-            )
-            return out
-        if tokens > _MAX_POSITIONS or (int8 and _UNION_ROWS != 16):
-            if not int8:
-                return orig(
-                    q, k_cache, v_cache, logical_indices, block_table, token_to_req, out
-                )
-            # Past the union bitmap, int8: the Triton kernel reads bf16 K/V 2.3x
-            # faster than int8 (16k rows, 2k selected, 32k context: 227 vs
-            # 531 ms per layer), so dequantize the request's pages once.
-            k16 = _dequant_pages(k_cache, k_scale, block_table, tokens)
-            v16 = _dequant_pages(v_cache, v_scale, block_table, tokens)
-            pages = torch.arange(k16.shape[0], device=q.device, dtype=torch.int32)
-            return orig(q, k16, v16, logical_indices, pages[None], token_to_req, out)
         if out is None:
             out = torch.empty_like(q)
-        torch.ops.strix.qsa_union_attn_bf16(
-            out, q, k_cache, v_cache, logical_indices, block_table[0],
-            tokens if (int8 or _F16) else 0, k_scale, v_scale,
+        if union_ok and (tokens or capacity) <= _UNION_MAX_TOKENS:
+            if converted and not int8:  # fp8: a bf16 copy of the request's pages
+                k16, pages = _bf16_pages(k_cache, None, block_table, tokens)
+                v16, _ = _bf16_pages(v_cache, None, block_table, tokens)
+                torch.ops.strix.qsa_union_attn_bf16(
+                    out, q, k16, v16, logical_indices, pages[0], 0, None, None
+                )
+            else:  # bf16, or int8 through the kernel's compact fp16 copy
+                torch.ops.strix.qsa_union_attn_bf16(
+                    out, q, k_cache, v_cache, logical_indices, block_table[0],
+                    tokens if int8 else 0, k_scale, v_scale,
+                )
+            return out
+        if converted:
+            table = block_table
+            k_cache, block_table = _bf16_pages(k_cache, k_scale, table, tokens)
+            v_cache, _ = _bf16_pages(v_cache, v_scale, table, tokens)
+        torch.ops.strix.qsa_rows_attn_bf16(
+            out, q, k_cache, v_cache, logical_indices, block_table,
+            token_to_req.to(torch.int32) if block_table.shape[0] > 1 else None,
         )
         return out
 

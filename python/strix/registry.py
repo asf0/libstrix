@@ -1055,9 +1055,29 @@ KERNELS: list[Kernel] = [
         {"block_m": (64, 128), "block_n": (128, 256), "best": "64x256, 2x4 waves"},
     ),
     Kernel(
+        "qsa_rows_attn_bf16",
+        "qsa_rows",
+        "Qwen4Exp QSA sparse attention for prefill, any batch: one query row "
+        "per wave pair, its 12 query heads as the WMMA columns over its own "
+        "selected tokens (S^T = K Q^T, O^T = V^T P^T, two waves split "
+        "head_dim; K fragments straight from the cache, V^T through LDS, each "
+        "key's index and page loaded a step ahead). 1.5x the gfx1151 Triton "
+        "kernel on real selections, 300 to 15k rows, 45k to 205k context; "
+        "requests past 49152 tokens and batched prefill (shorter single "
+        "requests take qsa_union_attn_bf16)",
+        {
+            "head_dim": 256,
+            "gqa": 12,
+            **_BF16,
+            "rows_min": 128,
+        },
+        {"rows_per_block": 1, "kv_heads_per_block": (1, 2), "block_n": 16},
+    ),
+    Kernel(
         "qsa_union_attn_bf16",
         "qsa_union_attn_bf16",
-        "Qwen4Exp QSA sparse attention for a single-request prefill: 16 "
+        "Qwen4Exp QSA sparse attention for a single-request prefill of at "
+        "most 49152 tokens (qsa_rows_attn_bf16 takes longer ones): 16 "
         "consecutive query rows gather the union of their selected tokens "
         "once and mask each score by the row's membership bits (S^T = K Q^T, "
         "O^T = V^T P^T, two waves per head). 1.5x the gfx1151 Triton per-row "
@@ -1068,7 +1088,7 @@ KERNELS: list[Kernel] = [
             **_BF16,
             "requests": 1,
             "rows_min": 1024,
-            "max_position": Range(hi=131072),
+            "max_position": Range(hi=49152),
         },
         {"rows": (4, 8, 16), "block_n": (16, 32), "partials": "fp16"},
     ),

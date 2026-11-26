@@ -119,19 +119,19 @@ def test_compact_path_on_packed_cache(int8):
 def test_wrapper_fp8_cache():
     """libstrix's qsa_sparse_paged_attention swap on vLLM's fp8 QSA cache
     (--kv-cache-dtype=fp8, unit scales): the request's pages are cast to bf16
-    for the union kernel. Against the reference on the same values."""
+    for qsa_rows_attn_bf16. Against the reference on the same values."""
     ops = pytest.importorskip("vllm.models.qwen4_exp.amd.ops.qsa")
     from strix_vllm import qwen4_exp
     from vllm.platforms import current_platform
 
     orig = ops.qsa_sparse_paged_attention
     try:
-        qwen4_exp._register_qsa_union()
+        qwen4_exp._register_qsa_rows()
         swapped = ops.qsa_sparse_paged_attention
     finally:
         ops.qsa_sparse_paged_attention = orig
     if swapped is orig:
-        pytest.skip("qsa_union disabled")
+        pytest.skip("qsa_rows disabled")
     rows, ctx, block = 1024, 4096, 64
     pages = ctx // block
     fp8 = current_platform.fp8_dtype()
@@ -139,7 +139,9 @@ def test_wrapper_fp8_cache():
     v = torch.randn(pages + 3, block, HKV, D, device="cuda").to(fp8)
     block_table = torch.randperm(pages + 3, device="cuda")[:pages].int()[None].contiguous()
     q = torch.randn(rows, HKV * G, D, device="cuda", dtype=torch.bfloat16)
-    indices = torch.randint(0, ctx, (rows, 67), device="cuda", dtype=torch.int32)
+    # Distinct tokens per row, as the indexer selects (a repeated token counts
+    # once per occurrence in the per-row kernels and once in this reference).
+    indices = torch.rand(rows, ctx, device="cuda").argsort(dim=1)[:, :67].int().contiguous()
     indices[:, -7:] = -1
     token_to_req = torch.zeros(rows, device="cuda", dtype=torch.int32)
     out = swapped(q, k, v, indices, block_table, token_to_req)
