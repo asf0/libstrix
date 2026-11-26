@@ -31,6 +31,15 @@ ratios are the point.
 
 What differs per checkpoint, for every table below:
 
+- **Flint FP8, gemma-4-26B-A4B FP8, gemma-4-31B MXFP4** move far under a
+  change of attention kernel alone. On the same image, switching only the
+  prefill attention to vLLM's Triton kernel scores KLD 0.32 against the plugin's
+  own gemma-4-26B-A4B FP8 output at 2k, and Flint FP8 at 32k gives 0.036 to
+  0.057 against stock depending on which of three prefill kernels runs (0.049
+  on Triton). Their KLD rows reflect that spread, not one kernel's error; the
+  gemma-4 int8-KV rows are not listed because stock cannot load either
+  checkpoint without the plugin.
+
 - **LFM2.5-24B-A2B, LFM2.5-24B-A2B FP8, Muse-Glimmer-30B FP8** cap context at
   131,072; their deepest point is 130,048.
 - **LFM2.5-24B-A2B FP8, Muse-Glimmer-30B FP8** are compressed-tensors block
@@ -371,6 +380,24 @@ the same argmax. PPL deltas are only comparable within a row.
 | | 32k | 53.1% | 51.81 → 29.45 | 1.58 | 5.84 |
 | gemma-4-31B QAT W4A16 | 2k | 92.0% | 14.78 → 14.94 | 0.028 | 0.091 |
 | | 32k | 95.9% | 12.93 → 13.21 | 0.0062 | 0.020 |
+
+With int8 KV (`int8_per_token_head`, the recipes' cache), the same method;
+Inkling 2 Mini's reference is the plugin on bf16 KV (an int8 cache needs the
+plugin's kernels, so stock cannot run it):
+
+| model | depth | top-1 | PPL ref → strix | KLD mean | KLD p95 |
+| --- | ---: | ---: | --- | ---: | ---: |
+| Qwen3.6-35B-A3B FP8 | 2k | 96.4% | 3.638 → 3.618 | 0.0081 | 0.032 |
+| | 32k | 96.7% | 3.354 → 3.368 | 0.0059 | 0.020 |
+| Qwen3.8-27B FP8 | 2k | 97.7% | 3.814 → 3.805 | 0.0033 | 0.011 |
+| LFM2.5-24B-A2B FP8 | 2k | 88.4% | 6.436 → 6.678 | 0.074 | 0.27 |
+| | 32k | 91.8% | 5.638 → 5.746 | 0.089 | 0.19 |
+| Muse-Glimmer-30B FP8 | 2k | 98.3% | 3.888 → 3.882 | 0.0030 | 0.011 |
+| | 32k | 98.2% | 3.319 → 3.325 | 0.0024 | 0.0087 |
+| Flint FP8 | 2k | 91.9% | 5.527 → 5.540 | 0.057 | 0.16 |
+| | 32k | 93.8% | 5.054 → 5.156 | 0.057 | 0.095 |
+| Inkling 2 Mini | 2k | 97.4% | 3.804 → 3.804 | 0.0028 | 0.0094 |
+| | 32k | 98.2% | 3.585 → 3.595 | 0.0027 | 0.0097 |
 
 Reading it:
 
@@ -1041,34 +1068,49 @@ decode tok/s
 ### Inkling 2 Mini
 
 thinkingmachines/Inkling-2-Mini (NVFP4 experts, MXFP8 in layers 20-23,
-looped core) on the strix-vllm `v0.1.x` branch with libstrix, bf16 KV,
-8k prefill chunks, prefix caching off. No stock column: upstream vLLM does not
-run this model on gfx1151 without the fork.
+looped core) on the strix-vllm `v0.1.x` branch with libstrix, int8 KV
+(`int8_per_token_head`, the plugin's kernels), 2k prefill chunks, prefix
+caching off. No stock column: upstream vLLM does not run this model on
+gfx1151 without the fork.
+
+`MAX_BATCHED_TOKENS` sets the KV budget as much as `GPU_UTIL` does: the
+sliding-window managers size every request for `window - 1 + 2 *
+max_num_batched_tokens` tokens, and the conv state's window is 4, so an 8k
+chunk charges each request ~16k conv slots it cannot use (78 % of the pool).
+At 2048 the same 80 % of GPU memory holds 1,130,774 tokens, 8.6 full 131k
+requests against 3.6, and prefill pays 5-6.5 % of its tok/s at 2.7k-32k
+prompts (2,700: 2,424 against 2,584; 21,500: 2,386 against 2,525).
+
+int8 KV halves each attention page (135,168 B per 64 tokens against 262,144)
+but not that conv charge, so its token count matches bf16 at 8k chunks
+(468,674 against 468,729) and is 1.4x at 2k. Decode reads half the KV bytes:
+at 131k a step 35.8 ms against 46.7 bf16.
 
 prefill (one request)
 
 | prompt tokens | tok/s |
 | ---: | ---: |
-| 2,700 | 2,674 |
-| 10,800 | 2,688 |
-| 21,500 | 2,570 |
+| 2,700 | 2,424 |
+| 10,800 | 2,478 |
+| 21,500 | 2,386 |
 
 decode, 256 tokens a request, distinct prompts (offline)
 
 | requests | tok/s total | tok/s per request |
 | ---: | ---: | ---: |
-| 1 | 47.2 | 47.2 |
-| 4 | 94.3 | 23.6 |
-| 8 | 111.1 | 13.9 |
-| 16 | 155.4 | 9.7 |
+| 1 | 46.9 | 46.9 |
+| 4 | 111.5 | 27.9 |
+| 8 | 134.1 | 16.8 |
+| 16 | 230.1 | 14.4 |
 
 Decode streams the experts at DRAM bandwidth: a request touches 8 of 128
 experts per layer visit, four distinct requests about 29, so the step time
 grows with the batch and total throughput keeps rising past the recipe's
-`MAX_NUM_SEQS=4`. DSpark (2 drafts for a single request, the recipe default)
-serves one request at 55.7 tok/s and four at 92.6 (server, 512 tokens each).
-GSM8K 213-216 of 250 across these kernel changes (McNemar p >= 0.45 between
-any two).
+`MAX_NUM_SEQS=4`. DSpark (the recipe default, 2 drafts for one request)
+serves one request at 57.4 tok/s and four at 85.8, takes 2.18 tokens a step,
+and its caches take 39 % of the KV pool (1,130,774 tokens against 1,839,908
+without the draft). int8 KV against bf16 KV scores KLD 0.00295 at 32k of
+wikitext (97.98 % top-1, perplexity +0.16 %).
 
 ### gemma-4-26B-A4B
 

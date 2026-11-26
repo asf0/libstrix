@@ -30,7 +30,7 @@ request in this configuration.
 | `lfm2.5-24b-a2b-fp8-dspark` | LiquidAI/LFM2.5-24B-A2B-FP8 + LiquidAI/LFM2.5-24B-A2B-DSpark (4 draft tokens) | 24.1 GiB | 73.8 GiB | 4,837,780 | 36.9 | text model |
 | `muse-glimmer-30b-fp8-dflash2` | RedHatAI/Muse-Glimmer-30B-FP8-block + meta-models/Muse-Glimmer-30B-assistant (15 draft tokens) | 38.5 GiB | 56.4 GiB | 5,380,274 | 41.0 | ✓ |
 | `flint-fp8` | HawkBearPig/flint-FP8-BF16 + incoai/Flint-DFlash2 (3 draft tokens) | 42.9 GiB | 54.6 GiB | 2,667,556 | 20.4 | text model |
-| `inkling-2-mini` | thinkingmachines/Inkling-2-Mini + its DSpark draft (2 drafts for one request; `GPU_UTIL` 0.80; `bench-inkling-2-mini` is the 32k benchmark variant) | 20.4 GiB | 75.6 GiB | 468,701 | 3.6 | ✓ |
+| `inkling-2-mini` | thinkingmachines/Inkling-2-Mini + its DSpark draft (2 drafts for one request; `GPU_UTIL` 0.80; `MAX_BATCHED_TOKENS` 2048; `bench-inkling-2-mini` is the 32k benchmark variant) | 20.4 GiB | 76.9 GiB | 1,130,774 | 8.6 | ✓ |
 | `gemma-4-26b-a4b` | google/gemma-4-26B-A4B-it + z-lab/gemma-4-26B-A4B-it-DFlash (15 draft tokens) | 50.5 GiB | 52.7 GiB | 2,041,996 | 15.6 | ✓ |
 | `gemma-4-26b-a4b-awq-int4` | cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit + z-lab/gemma-4-26B-A4B-it-DFlash (15 draft tokens) | 16.6 GiB | 86.3 GiB | 3,340,475 | 25.5 | ✓ |
 | `gemma-4-26b-a4b-fp8` | RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic + z-lab/gemma-4-26B-A4B-it-DFlash (15 draft tokens) | 25.8 GiB | 77.2 GiB | 2,990,822 | 22.8 | ✓ |
