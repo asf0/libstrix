@@ -8,7 +8,8 @@
 // A block owns BM rows x BN columns of y and computes the matching BN columns
 // of all four streams: wave (wm, s) holds rows wm*TM.. of stream s, so A
 // fragments are shared by the four stream waves through LDS. K (the low rank,
-// 320) runs in 64-wide steps. The gate is rounded to bf16 before the sigmoid
+// 320) runs in 32-wide steps, which keeps the tile small enough for three
+// blocks per CU. The gate is rounded to bf16 before the sigmoid
 // like the unfused GEMM's output, and the four streams are added into an fp32
 // LDS tile in stream order 0..3, the order of hc_gate_mix's loop.
 #include <ATen/hip/HIPContext.h>
@@ -20,7 +21,7 @@ namespace strix {
 namespace {
 
 constexpr int kHC = 4;
-constexpr int kBK = 64;
+constexpr int kBK = 32;
 constexpr int kPitch = kBK + 8;
 
 template <int BM, int BN, int WAVES_M>
@@ -187,6 +188,8 @@ void hc_up_gate_mix_bf16(torch::Tensor& y, const torch::Tensor& x,
   if (rows == 0) return;
   // 128 x 32 (8 waves): 5.2 ms at 16k rows against 6.6 for 128 x 64, 6.6
   // for 64 x 32, 5.3 for 256 x 32 and 128 x 16; the unfused pair is 6.7.
+  // K steps of 32 (a 20 KB tile, three blocks per CU) instead of 64 (37 KB,
+  // one): 4.4-4.7 against 5.27 ms; 16 waves or 64-row tiles at K 32: 4.8-5.3.
   constexpr int BM = 128, BN = 32, WM = 2;
   hc_up_gate_mix_kernel<BM, BN, WM>
       <<<dim3((cols + BN - 1) / BN, (rows + BM - 1) / BM), WM * kHC * kWave, 0,
