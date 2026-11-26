@@ -124,6 +124,8 @@ void attn_prefill_bf16(torch::Tensor& out, const torch::Tensor& q,
 void inkling_rel_attn_prefill(torch::Tensor& out, const torch::Tensor& q,
                               const torch::Tensor& key_cache,
                               const torch::Tensor& value_cache,
+                              const std::optional<torch::Tensor>& k_scale,
+                              const std::optional<torch::Tensor>& v_scale,
                               const torch::Tensor& rel_logits,
                               const torch::Tensor& gate, const torch::Tensor& sinks,
                               const torch::Tensor& cu_seqlens_q,
@@ -133,6 +135,17 @@ void inkling_rel_attn_prefill(torch::Tensor& out, const torch::Tensor& q,
                               double scale, int64_t window_left, int64_t q_tiles,
                               int64_t block_n,
                               const std::optional<torch::Tensor>& rel_proj_t);
+void inkling_rel_attn_decode(torch::Tensor& out, const torch::Tensor& q,
+                             const torch::Tensor& key_cache,
+                             const torch::Tensor& value_cache,
+                             const std::optional<torch::Tensor>& k_scale,
+                             const std::optional<torch::Tensor>& v_scale,
+                             const torch::Tensor& rel_logits,
+                             const torch::Tensor& gate, const torch::Tensor& sinks,
+                             const torch::Tensor& cu_seqlens_q,
+                             const torch::Tensor& seq_lens,
+                             const torch::Tensor& block_table, double scale,
+                             int64_t num_splits, int64_t window_left, int64_t q_rows);
 void inkling2_kv_conv(const torch::Tensor& k, const torch::Tensor& v, const torch::Tensor& wk,
                       const torch::Tensor& wv, const std::optional<torch::Tensor>& k_dyn,
                       const std::optional<torch::Tensor>& v_dyn, const torch::Tensor& cache,
@@ -296,10 +309,17 @@ TORCH_LIBRARY(strix, m) {
       "int num_splits, int window_left=-1, Tensor? sinks=None) -> ()");
   m.def(
       "inkling_rel_attn_prefill(Tensor(a!) out, Tensor q, Tensor key_cache, "
-      "Tensor value_cache, Tensor rel_logits, Tensor gate, Tensor sinks, "
-      "Tensor cu_seqlens_q, Tensor seq_lens, Tensor block_table, "
-      "Tensor tile_offsets, int max_tiles, float scale, int window_left, "
-      "int q_tiles, int block_n, Tensor? rel_proj_t=None) -> ()");
+      "Tensor value_cache, Tensor? k_scale, Tensor? v_scale, Tensor rel_logits, "
+      "Tensor gate, Tensor sinks, Tensor cu_seqlens_q, Tensor seq_lens, "
+      "Tensor block_table, Tensor tile_offsets, int max_tiles, float scale, "
+      "int window_left, int q_tiles, int block_n, "
+      "Tensor? rel_proj_t=None) -> ()");
+  m.def(
+      "inkling_rel_attn_decode(Tensor(a!) out, Tensor q, Tensor key_cache, "
+      "Tensor value_cache, Tensor? k_scale, Tensor? v_scale, Tensor rel_logits, "
+      "Tensor gate, Tensor sinks, Tensor cu_seqlens_q, Tensor seq_lens, "
+      "Tensor block_table, float scale, int num_splits, "
+      "int window_left=-1, int q_rows=1) -> ()");
   m.def(
       "inkling2_kv_conv(Tensor k, Tensor v, Tensor wk, Tensor wv, Tensor? k_dyn, "
       "Tensor? v_dyn, Tensor(a!) cache, Tensor(b!) key_cache, Tensor(c!) value_cache, "
@@ -403,6 +423,7 @@ TORCH_LIBRARY_IMPL(strix, CUDA, m) {
   m.impl("w4a16_wmma_gemm", &strix::w4a16_wmma_gemm);
   m.impl("attn_decode_bf16", &strix::attn_decode_bf16);
   m.impl("w4a8_wmma_gemm", &strix::w4a8_wmma_gemm);
+  m.impl("inkling_rel_attn_decode", &strix::inkling_rel_attn_decode);
   m.impl("mxfp4_wmma_gemm", &strix::mxfp4_wmma_gemm);
   m.impl("mxfp4_wmma_gemm_cfg", &strix::mxfp4_wmma_gemm_cfg);
   m.impl("mxfp4_gemv", &strix::mxfp4_gemv);

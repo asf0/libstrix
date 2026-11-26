@@ -3,9 +3,21 @@
 
 Each phase is preceded by an idle gap so a kernel trace splits into one burst
 per phase; the phase labels are written to --labels for analyze_trace.py.
-Decode is measured as the difference of a 1-token and a (1 + --decode-steps)
-token run of the same batch, with prefix caching off, which cancels prefill.
 Every printed number is also recorded in the results DB (bench/results.py).
+
+DECODE lines come from the request timestamps (RequestOutput.metrics), with
+prefix caching off: the time from the first to the last token of the request
+that started decoding last, over its --decode-steps steps. In a batched point
+that is the request submitted last, and the others get enough extra tokens to
+outlive it, so the batch stays full while it is timed (PHASE seconds include
+their tail). ALIVE says how many requests decoded through the whole window; if
+it is not all of them, the line reads INVALID and no decode_ms is recorded. That
+is the guard against a batch that did not hold its size.
+
+Without --decode-long-only each decode point also runs the batch for 1 token
+(`:short`): analyze_trace.py subtracts its kernel times from the `:long` run's,
+which cancels prefill, and divides by --decode-steps. --labels runs therefore
+keep equal token counts, and most of their deep batched rows are INVALID.
 
     rocprofv3 --kernel-trace --output-format csv -d out -- \\
         python bench/model/profile_model.py --model ... --labels out/labels.json
@@ -26,6 +38,36 @@ from vllm.inputs import TokensPrompt
 # Upper bound on sampled token ids; lowered to the tokenizer's size for
 # models with smaller vocabularies (Qwen ids stay as before).
 VOCAB_HI = 150000
+# Decode steps of slack for requests that must outlive the timed one (they can
+# start while the rest are still being submitted).
+HOLD_MARGIN_STEPS = 16
+
+
+def hold_tokens(lens: list[int], steps: int, budget: int, per_step: int) -> int:
+    """max_tokens that keeps a request of the batch decoding through the timed
+    window, whichever request starts last.
+
+    The engine computes at most `budget` tokens a step, decode rows included,
+    so prefilling prompts of `lens` takes at most one step per started chunk;
+    a request that starts first decodes up to `per_step` tokens (1 + draft
+    tokens) in each of those steps and in each step of the window.
+    """
+    chunk = budget - len(lens) * per_step
+    if chunk <= 0:
+        raise ValueError(f"max_num_batched_tokens {budget} leaves no prefill chunk")
+    prefill_steps = sum(-(-n // chunk) for n in lens)
+    return 1 + per_step * (steps + prefill_steps + HOLD_MARGIN_STEPS)
+
+
+def alive_through_last(metrics: list) -> int:
+    """How many requests decoded from the first to the last token of the
+    request submitted last (metrics in submission order)."""
+    last = metrics[-1]
+    return sum(
+        m.first_token_ts <= last.first_token_ts
+        and m.last_token_ts >= last.last_token_ts
+        for m in metrics
+    )
 
 
 def prompts(n: int, length: int, rng: random.Random) -> list[TokensPrompt]:
@@ -228,17 +270,28 @@ def main() -> None:
     if args.torch_profile:
         llm.start_profile()
 
-    def phase(
-        label: str, batch: list[TokensPrompt], max_tokens: int, depth: int, bs: int = 1
-    ) -> None:
-        time.sleep(args.gap)
-        sp = SamplingParams(
+    def sampling(max_tokens: int) -> SamplingParams:
+        return SamplingParams(
             max_tokens=max_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
             ignore_eos=True,
         )
+
+    def phase(
+        label: str,
+        batch: list[TokensPrompt],
+        max_tokens: int,
+        depth: int,
+        bs: int = 1,
+        hold: int | None = None,
+    ) -> None:
+        """hold: max_tokens of every request but the one submitted last."""
+        time.sleep(args.gap)
+        sp = sampling(max_tokens)
+        if hold is not None:
+            sp = [sampling(hold) for _ in batch[1:]] + [sp]
         d0, a0 = spec_counts()
         t0 = time.perf_counter()
         outs = llm.generate(batch, sp, use_tqdm=False)
@@ -259,14 +312,38 @@ def main() -> None:
         done = [
             o for o in outs if o.metrics is not None and len(o.outputs[0].token_ids) > 1
         ]
-        if done:
+        if not done:
+            return
+        batched = len(batch) > 1
+        valid = True
+        if batched:
+            # vLLM admits and schedules requests in submission order, so the
+            # one submitted last starts last; the timestamps confirm it, and
+            # that the others were decoding (not preempted) until it finished.
+            o = outs[-1]
+            timed = len(done) == len(outs)
+            n_alive = alive_through_last([x.metrics for x in outs]) if timed else 0
+            preempted = sum(x.metrics.num_preemptions for x in done)
+            n_out = len(o.outputs[0].token_ids)
+            print(f"ALIVE {label}: {n_alive}/{len(batch)}", flush=True)
+            valid = n_alive == len(batch) and not preempted and n_out == max_tokens
+            if not valid:
+                print(
+                    f"INVALID {label}: {n_alive}/{len(batch)} requests decoding "
+                    f"through the timed window, {preempted} preemptions, "
+                    f"{n_out}/{max_tokens} tokens timed; decode_ms not recorded",
+                    flush=True,
+                )
+        else:
             o = max(done, key=lambda o: o.metrics.first_token_ts)
+        if valid:
             step = (o.metrics.last_token_ts - o.metrics.first_token_ts) / (
                 len(o.outputs[0].token_ids) - 1
             )
             print(f"DECODE {label}: {step * 1e3:.2f} ms/step", flush=True)
-            print(f"TTFT {label}: {o.metrics.first_token_latency:.3f} s", flush=True)
             rec("decode", "decode_ms", step * 1e3, label, depth, bs)
+        if o.metrics is not None:
+            print(f"TTFT {label}: {o.metrics.first_token_latency:.3f} s", flush=True)
             rec("prefill", "ttft_s", o.metrics.first_token_latency, label, depth, bs)
 
     if args.combined:
@@ -282,6 +359,42 @@ def main() -> None:
         write_labels()
         return
 
+    ctxs = [int(x) for x in str(args.decode_ctx).split(",")]
+    batch_sizes = [int(x) for x in args.decode_batches.split(",")]
+    cfg = llm.llm_engine.vllm_config
+    spec = cfg.speculative_config
+    # Tokens one request can emit per step.
+    per_step = 1 + (spec.num_speculative_tokens or 0 if spec else 0)
+
+    def hold_for(lens: list[int]) -> int | None:
+        if len(lens) == 1 or args.labels:
+            return None
+        hold = hold_tokens(
+            lens, args.decode_steps, args.max_num_batched_tokens, per_step
+        )
+        limit = cfg.model_config.max_model_len
+        if max(lens) + hold > limit:
+            raise SystemExit(
+                f"batch of {len(lens)} at {max(lens)} prompt tokens: the requests "
+                f"decoding while the rest prefill need {hold} output tokens, "
+                f"{max(lens) + hold} in all, but --max-model-len is {limit}; raise "
+                "it or lower --decode-steps"
+            )
+        return hold
+
+    def batch_lens(bs: int, ctx: int) -> list[int]:
+        if not chat_prompts:
+            return [ctx] * bs
+        return [
+            len(chat_prompts[i % len(chat_prompts)]["prompt_token_ids"])
+            for i in range(bs)
+        ]
+
+    # Every point must fit before the first one runs.
+    for bs in batch_sizes:
+        for ctx in ctxs:
+            hold_for(batch_lens(bs, ctx))
+
     for length in (int(x) for x in args.prefill.split(",") if x):
         # Two reps smooth the shallow depths; a 64k+ prefill is expensive
         # enough that one measured pass is the right trade.
@@ -289,8 +402,7 @@ def main() -> None:
         for rep in range(2 if length < 65536 else 1):
             batch = first if rep == 0 or args.prefill_same_prompt else prompts(1, length, rng)
             phase(f"prefill{length}#{rep}", batch, 1, length)
-    ctxs = [int(x) for x in str(args.decode_ctx).split(",")]
-    for bs in (int(x) for x in args.decode_batches.split(",")):
+    for bs in batch_sizes:
         for ctx in ctxs:
             batch = (
                 [chat_prompts[i % len(chat_prompts)] for i in range(bs)]
@@ -302,7 +414,14 @@ def main() -> None:
             tag = f"decode{bs}:c{ctx}" if len(ctxs) > 1 else f"decode{bs}"
             if not args.decode_long_only:
                 phase(f"{tag}:short", batch, 1, ctx, bs)
-            phase(f"{tag}:long", batch, 1 + args.decode_steps, ctx, bs)
+            phase(
+                f"{tag}:long",
+                batch,
+                1 + args.decode_steps,
+                ctx,
+                bs,
+                hold_for(batch_lens(bs, ctx)),
+            )
     time.sleep(args.gap)
     if args.torch_profile:
         llm.stop_profile()

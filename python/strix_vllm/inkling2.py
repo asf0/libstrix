@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: MIT
-"""Inkling2 (ROCm port) on gfx1151: the MoE on bf16 rows (`inkling2_moe`) and
-the attention projections on dense_w8's int8 copies.
+"""Inkling2 (ROCm port) on gfx1151: the MoE on bf16 rows (`inkling2_moe`),
+the attention projections on dense_w8's int8 copies, and the attention
+itself - prefill (`inkling_rel_attn_prefill`), decode/verify
+(`inkling_rel_attn_decode`) and the K/V conv write (`inkling2_kv_conv`) -
+on a bf16 or an int8 (`int8_per_token_head`) KV cache. The port's own kernels
+write and read bf16 only: with an int8 cache every batch runs here.
 
 The ROCm Inkling2 attention multiplies by its `qkvr` weight, by row slices of
 it (the query side, k and v of full layers and of loop passes after the
@@ -30,12 +34,38 @@ _W4_MAX_ROWS = 5
 
 def register() -> None:
     _register_attention()
+    _register_decode()
     _register_kv_conv()
     _register_moe()
     _register_loop()
     _register_linear()
     _register_head()
     _register_draft_head()
+
+
+def _kv_cache_ok(key_cache: torch.Tensor) -> bool:
+    return key_cache.shape[3] == 128 and key_cache.dtype in (torch.bfloat16, torch.int8)
+
+
+def _attention_ok(q, key_cache, gate, block_table) -> bool:
+    """Whether the prefill and decode attention kernels take the batch."""
+    return (
+        _kv_cache_ok(key_cache)
+        and q.dtype == torch.bfloat16
+        and q.shape[1] == 3 * key_cache.shape[2]
+        and gate.stride(0) % 8 == 0
+        and gate.data_ptr() % 16 == 0
+        and block_table.dtype == torch.int32
+    )
+
+
+def _check_fallback(key_cache: torch.Tensor, what: str) -> None:
+    """Before a batch goes to the port's kernel."""
+    if key_cache.dtype == torch.int8:
+        raise RuntimeError(
+            f"Inkling 2 int8 KV: no {what} kernel takes this batch (key cache "
+            f"{tuple(key_cache.shape)}), and the port's kernels are bf16 only"
+        )
 
 
 # Query tiles of 16 per block (GQA 3, 32-key steps): full layers 4, window
@@ -51,21 +81,20 @@ _REL_PROJ_T: dict[int, torch.Tensor] = {}
 
 def _rel_attention(
     q, key_cache, value_cache, rel, gate, sinks, result, block_table, cache_seqlens,
-    cu_seqlens_q, num_actual_tokens, softmax_scale, window, rel_proj_t=None,
+    cu_seqlens_q, num_actual_tokens, softmax_scale, window, rel_proj_t, k_scale,
+    v_scale,
 ) -> None:
     """strix::inkling_rel_attn_prefill over the requests' tokens (later rows
     of `result` are zeroed); `rel` is the sheared logits, or with
-    `rel_proj_t` the clipped r."""
+    `rel_proj_t` the clipped r; `k_scale` / `v_scale` for an int8 cache."""
     nt = num_actual_tokens
     q_tiles = _REL_Q_TILES_WINDOW if window >= 0 else _REL_Q_TILES_FULL
     tile = 16 * q_tiles
     cu = cu_seqlens_q.to(torch.int32)
-    offsets = torch.zeros_like(cu)
-    torch.cumsum((cu[1:] - cu[:-1] + tile - 1) // tile, 0, out=offsets[1:])
     max_tiles = (nt + tile - 1) // tile + cu.numel() - 1
     torch.ops.strix.inkling_rel_attn_prefill(
-        result, q, key_cache, value_cache, rel, gate, sinks, cu,
-        cache_seqlens.to(torch.int32), block_table, offsets, max_tiles,
+        result, q, key_cache, value_cache, k_scale, v_scale, rel, gate, sinks, cu,
+        cache_seqlens.to(torch.int32), block_table, cu, max_tiles,  # tile_offsets: unread
         softmax_scale, window, q_tiles, _REL_BLOCK_N, rel_proj_t,
     )
     result[nt:].zero_()
@@ -91,20 +120,12 @@ def _register_attention() -> None:
     def gated_rel_attention(
         q, key_cache, value_cache, sheared_bias, gate, sinks, result, *,
         block_table, cache_seqlens, cu_seqlens_q, max_seqlen_q,
-        num_actual_tokens, softmax_scale, window,
+        num_actual_tokens, softmax_scale, window, k_scale=None, v_scale=None,
     ) -> None:
-        num_heads, head_dim = q.shape[1:]
-        page = key_cache.shape[1]
-        if (
-            q.dtype != torch.bfloat16
-            or key_cache.dtype != torch.bfloat16
-            or head_dim != 128
-            or num_heads != 3 * key_cache.shape[2]
-            or page % _REL_BLOCK_N
-            or gate.stride(0) % 8
-            or gate.data_ptr() % 16
-            or block_table.dtype != torch.int32
+        if not _attention_ok(q, key_cache, gate, block_table) or (
+            key_cache.shape[1] % _REL_BLOCK_N
         ):
+            _check_fallback(key_cache, "prefill")
             return triton_attention(
                 q, key_cache, value_cache, sheared_bias, gate, sinks, result,
                 block_table=block_table, cache_seqlens=cache_seqlens,
@@ -115,6 +136,7 @@ def _register_attention() -> None:
         _rel_attention(
             q, key_cache, value_cache, sheared_bias, gate, sinks, result, block_table,
             cache_seqlens, cu_seqlens_q, num_actual_tokens, softmax_scale, window,
+            None, k_scale, v_scale,
         )
 
     attention.gated_rel_attention = gated_rel_attention
@@ -124,7 +146,7 @@ def _register_attention() -> None:
     def rel_attention_prefill(
         q, key_cache, value_cache, r, rel_proj, gate, sinks, result, *,
         block_table, cache_seqlens, cu_seqlens_q, max_seqlen_q,
-        num_actual_tokens, softmax_scale, window,
+        num_actual_tokens, softmax_scale, window, k_scale=None, v_scale=None,
     ) -> None:
         proj_t = _REL_PROJ_T.get(rel_proj.data_ptr())
         if proj_t is None:
@@ -133,7 +155,7 @@ def _register_attention() -> None:
         _rel_attention(
             q, key_cache, value_cache, r, gate, sinks, result, block_table,
             cache_seqlens, cu_seqlens_q, num_actual_tokens, softmax_scale, window,
-            proj_t,
+            proj_t, k_scale, v_scale,
         )
 
     def supports(num_heads, num_kv_heads, head_dim, block_size, extent, window) -> bool:
@@ -146,6 +168,66 @@ def _register_attention() -> None:
 
     rel_attention_prefill.supports = supports
     attention.rel_attention_prefill = rel_attention_prefill
+
+
+def _verify_plan(rows, reqs, key_cache, is_local) -> tuple[int, int]:
+    """Query tokens per block of strix::inkling_rel_attn_decode and key
+    segments per block of several (the port's split count is fitted to its own
+    program). The op takes any batch, so a CUDA graph may replay both."""
+    if rows <= 1:
+        return 1, 1
+    q_rows = 3 if rows <= 3 else 5
+    # One wave per segment: enough of them to stream at DRAM speed (int8 keys
+    # come twice as fast), and few enough for all to be resident at once.
+    waves = 192 if key_cache.dtype == torch.int8 else 96 if is_local else 160
+    blocks = key_cache.shape[2] * reqs * -(-rows // q_rows)
+    return q_rows, min(64, max(1, waves // blocks))
+
+
+def _register_decode() -> None:
+    """Decode and verify relative attention on the HIP kernels: the relative
+    logits from the sheared table, the output gate and the per-token sink."""
+    if disabled("inkling2_rel_decode"):
+        return
+    try:
+        from vllm.models.inkling2.amd import attention
+    except ImportError:
+        return
+    if not hasattr(attention, "rel_decode_attention"):
+        return
+    triton_decode = attention.rel_decode_attention
+
+    def rel_decode_attention(
+        q, key_cache, value_cache, rel_logits, gate, sinks, out, *,
+        block_table, cache_seqlens, cu_seqlens_q, max_query_len,
+        num_actual_tokens, softmax_scale, is_local, num_splits,
+        k_scale=None, v_scale=None,
+    ) -> None:
+        if not _attention_ok(q, key_cache, gate, block_table) or (
+            # More than one 5-token tile re-reads a deep bf16 KV (8 rows,
+            # 131k keys: 2.5 ms against the port's 2.3).
+            max_query_len > 5 and not is_local and key_cache.dtype == torch.bfloat16
+        ):
+            _check_fallback(key_cache, "decode")
+            return triton_decode(
+                q, key_cache, value_cache, rel_logits, gate, sinks, out,
+                block_table=block_table, cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q, max_query_len=max_query_len,
+                num_actual_tokens=num_actual_tokens, softmax_scale=softmax_scale,
+                is_local=is_local, num_splits=num_splits,
+            )
+        # The sheared table is 256 wider than the window of a local layer.
+        window = rel_logits.shape[2] - 257 if is_local else -1
+        q_rows, splits = _verify_plan(
+            max_query_len, cache_seqlens.shape[0], key_cache, is_local
+        )
+        torch.ops.strix.inkling_rel_attn_decode(
+            out, q, key_cache, value_cache, k_scale, v_scale, rel_logits, gate,
+            sinks, cu_seqlens_q.to(torch.int32), cache_seqlens.to(torch.int32),
+            block_table, softmax_scale, splits, window, q_rows,
+        )
+
+    attention.rel_decode_attention = rel_decode_attention
 
 
 _KV_CONV_TAPS: dict[tuple, torch.Tensor] = {}
@@ -165,8 +247,9 @@ def _kv_conv_taps(weight: torch.Tensor, dynamic: bool) -> torch.Tensor:
 
 
 def _register_kv_conv() -> None:
-    """The attention prologue's K/V convs for prefill batches on the HIP
-    kernel (5k tokens: 1.15-1.19 -> 0.78-0.85 ms a layer)."""
+    """The attention prologue's K/V convs on the HIP kernel: prefill batches
+    (5k tokens: 1.15-1.19 -> 0.78-0.85 ms a layer), every batch of an int8
+    cache (the kernel writes the scales inline)."""
     if disabled("inkling2_kv_conv"):
         return
     try:
@@ -185,23 +268,25 @@ def _register_kv_conv() -> None:
         block_table, query_start, *, scale, clip_threshold, clip_eps, norm_eps,
     ) -> bool:
         dynamic = k_dynamic is not None
+        int8 = key_cache.dtype == torch.int8
         page, n = key_cache.shape[1], cache.shape[2]
         if (
-            key_cache.shape[3] != 128
+            not _kv_cache_ok(key_cache)
             or k.dtype != torch.bfloat16
             or cache.dtype != torch.bfloat16
-            or key_cache.dtype != torch.bfloat16
             or (k_weight.shape[0] if dynamic else k_weight.shape[1]) != 4
             or page & (page - 1)
             or n & (n - 1)
             or k.stride(0) % 8
             or v.stride(0) % 8
             or any(st % 8 for st in cache.stride()[:3])
-            or not aligned(k, v, cache, key_cache, value_cache)
+            or not aligned(k, v, cache)
+            or (not int8 and not aligned(key_cache, value_cache))
             or (dynamic and (k_dynamic.dtype != torch.bfloat16
                              or k_dynamic.stride(0) % 4 or v_dynamic.stride(0) % 4
                              or k_dynamic.data_ptr() % 8 or v_dynamic.data_ptr() % 8))
         ):
+            _check_fallback(key_cache, "K/V conv")
             return False
         torch.ops.strix.inkling2_kv_conv(
             k, v, _kv_conv_taps(k_weight, dynamic), _kv_conv_taps(v_weight, dynamic),

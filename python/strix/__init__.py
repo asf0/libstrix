@@ -247,9 +247,18 @@ def gdn_chunk_fwd(
 
 @torch.library.register_fake("strix::inkling_rel_attn_prefill")
 def _(
-    out, q, key_cache, value_cache, rel_logits, gate, sinks, cu_seqlens_q,
-    seq_lens, block_table, tile_offsets, max_tiles, scale, window_left,
-    q_tiles, block_n, rel_proj_t=None,
+    out, q, key_cache, value_cache, k_scale, v_scale, rel_logits, gate, sinks,
+    cu_seqlens_q, seq_lens, block_table, tile_offsets, max_tiles, scale,
+    window_left, q_tiles, block_n, rel_proj_t=None,
+):
+    return None
+
+
+@torch.library.register_fake("strix::inkling_rel_attn_decode")
+def _(
+    out, q, key_cache, value_cache, k_scale, v_scale, rel_logits, gate, sinks,
+    cu_seqlens_q, seq_lens, block_table, scale, num_splits, window_left=-1,
+    q_rows=1,
 ):
     return None
 
@@ -302,24 +311,23 @@ def attn_prefill(
     """Causal paged attention for prefill (no host sync).
 
     window_left >= 0 is vLLM's sliding window (window - 1, 0): the query at
-    position p sees keys p - window_left .. p.
+    position p sees keys p - window_left .. p. Below -1 it is non-causal (DFlash
+    and DSpark draft blocks), where a query also sees every key after it: -2 has
+    no window, -3 - w a window of w keys before the query.
 
     num_splits > 1 splits each 16-query tile's keys (split-KV), for short
     queries (decode, speculative verify) over long contexts.
 
     sinks: optional fp32 [Hq] attention-sink logits (one extra, unscaled
-    logit per query head in every softmax, as in vLLM); num_splits must be 1.
+    logit per query head in every softmax, as in vLLM).
 
     q, out: [T, Hq, D]; caches: [blocks, block_size, Hkv, D] views, D = 64
-    (GQA 4), 128 (GQA 8), 256 (GQA 2 / 6 / 8) or 512 (GQA 8); the queries of sequence n are
-    the last q_len of its seq_lens[n] positions. The caches are bf16, or int8
+    (GQA 4), 128 (GQA 4 / 8 / 16), 256 (GQA 2 / 6 / 8) or 512 (GQA 8); the queries
+    of sequence n are the last q_len of its seq_lens[n] positions. The caches are bf16, or int8
     with k_scale/v_scale ([blocks, block_size, Hkv] fp32) as the dequant
     scales, one per (key, head) - vLLM's int8_per_token_head layout.
     """
     cu = cu_seqlens_q.to(torch.int32)
-    tiles = (cu[1:] - cu[:-1] + 15) // 16
-    offsets = torch.zeros_like(cu)
-    torch.cumsum(tiles, 0, out=offsets[1:])
     max_tiles = (q.size(0) + 15) // 16 + cu.numel() - 1
     torch.ops.strix.attn_prefill_bf16(
         out,
@@ -331,7 +339,7 @@ def attn_prefill(
         cu,
         seq_lens.to(torch.int32),
         block_table.to(torch.int32),
-        offsets,
+        cu,  # tile_offsets: the kernel derives the tiles from cu
         max_tiles,
         scale,
         num_splits,
@@ -430,8 +438,8 @@ def attn_decode(
     """Paged attention for one query token per sequence (decode), split-KV.
 
     q, out: [N, Hq, D]; caches: [blocks, block_size, Hkv, D] views; the query
-    is position seq_lens[n] - 1. Built for (D, GQA) = (128, 8), (256, 2),
-    (256, 6), (256, 8), (512, 8). sinks: optional fp32 [Hq] attention-sink
+    is position seq_lens[n] - 1. Built for (D, GQA) = (64, 4), (128, 8), (128, 16),
+    (256, 2), (256, 6), (256, 8), (512, 8). sinks: optional fp32 [Hq] attention-sink
     logits (one unscaled logit per query head, as in vLLM).
     The caches are bf16, or int8 with k_scale/v_scale
     ([blocks, block_size, Hkv] fp32) as the dequant scales, one per (key,

@@ -14,6 +14,7 @@ services:
       STRIX_INKLING2_W4_HEAD: ${STRIX_INKLING2_W4_HEAD:-0}
     command:
       - /models/Inkling-2-Mini
+      - --kv-cache-dtype=int8_per_token_head
       - --gpu-memory-utilization=${GPU_UTIL:-0.80}
       - --max-model-len=${MAX_MODEL_LEN:-32768}
       - --max-num-batched-tokens=${MAX_BATCHED_TOKENS:-8192}

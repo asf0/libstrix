@@ -44,30 +44,35 @@ def test_table_has_no_duplicate_names_per_geometry():
 def test_attention_geometry_comes_from_the_table():
     assert strix.geometries("attn_prefill", "head_dim", "gqa") == {
         (64, 4),
+        (128, 4),
         (128, 8),
+        (128, 16),
         (256, 2),
         (256, 6),
-        (256, 8),
-        (512, 8),
-    }
-    assert strix.geometries("attn_decode", "head_dim", "gqa") == {
-        (128, 8),
-        (256, 2),
         (256, 8),
         (512, 8),
     }
     # Every decode geometry takes bf16 and int8 KV.
     for kv in ("bf16", "int8"):
         assert strix.geometries("attn_decode", "head_dim", "gqa", kv_dtype=kv) == {
+            (64, 4),
             (128, 8),
+            (128, 16),
             (256, 2),
+            (256, 6),
             (256, 8),
             (512, 8),
         }
-    # Split-KV (speculative verify) is built for head 256 GQA 6 only.
-    assert strix.geometries("attn_prefill", "head_dim", "gqa", split_kv=True) == {
-        (256, 6)
-    }
+    # Split-KV (speculative verify) takes every geometry, but head 64 GQA 4
+    # on int8 KV only.
+    every = strix.geometries("attn_prefill", "head_dim", "gqa")
+    for kv, off in (("int8", set()), ("bf16", {(64, 4)})):
+        assert (
+            strix.geometries(
+                "attn_prefill", "head_dim", "gqa", split_kv=True, kv_dtype=kv
+            )
+            == every - off
+        )
 
 
 def test_select_prefers_the_first_matching_row():
@@ -100,14 +105,17 @@ def test_range_reason_names_the_bound():
 
 
 def test_missing_geometry_is_reported():
-    # 256 exists at GQA 2 and 8, so head_dim alone is ambiguous and the
-    # 512-only row still reports its constraint.
+    # 256 exists at GQA 2, 6 and 8, so head_dim alone is ambiguous and the
+    # other rows still report their constraint.
     assert strix.select("attn_decode", head_dim=256) is None
     reasons = [r["reason"] for r in strix.explain("attn_decode", head_dim=256)]
     assert reasons == [
         "gqa not given",
         "head_dim=256, needs == 512",
         "gqa not given",
+        "gqa not given",
+        "head_dim=256, needs == 64",
+        "head_dim=256, needs == 128",
         "head_dim=256, needs == 128",
     ]
 

@@ -370,11 +370,11 @@ KERNELS: list[Kernel] = [
         "attn_prefill",
         "causal paged prefill/verify attention; 16-query tiles, HPB heads per "
         "block. int8 KV is vLLM's int8_per_token_head layout: byte caches "
-        "plus one fp32 dequant scale per (key, head), widened to bf16 on the "
-        "way into LDS and scaled once per score instead of per element. "
-        "Split-KV (num_splits > 1) for short queries over long contexts is "
-        "built for head 256 GQA 6 only: 1.2x Triton at 16k on 27B, while "
-        "GQA 8 is slower than Triton there",
+        "plus one fp32 dequant scale per (key, head), scaled once per score "
+        "instead of per element. split_kv marks the rows whose verify batches "
+        "run the op with the keys split (num_splits > 1); those launches have "
+        "their own tiles, and small query counts pack (head, query) rows. "
+        "head 256 GQA 6 (Qwen3.8-27B)",
         {
             "head_dim": 256,
             "gqa": 6,
@@ -382,7 +382,7 @@ KERNELS: list[Kernel] = [
             "kv_dtype": ("bf16", "int8"),
             "split_kv": True,
             "window": (True, False),
-            "causal": True,
+            "causal": (True, False),
             "sinks": False,
         },
         {"hpb": 6, "bn": 32},
@@ -390,16 +390,16 @@ KERNELS: list[Kernel] = [
     Kernel(
         "attn_prefill_bf16",
         "attn_prefill",
-        "head 256 GQA 8 (Qwen3.8-27B full layers): 16-key steps, BN 16; "
-        "BN 32 needs > 256 VGPRs per 512-thread block and spills",
+        "head 256 GQA 8 (Qwen3.6-35B-A3B): 16-key steps; BN 32 needs > 256 "
+        "VGPRs per 512-thread block and spills",
         {
             "head_dim": 256,
             "gqa": 8,
             **_BF16,
             "kv_dtype": ("bf16", "int8"),
-            "split_kv": False,
+            "split_kv": True,
             "window": (True, False),
-            "causal": True,
+            "causal": (True, False),
             "sinks": False,
         },
         {"hpb": 8, "bn": 16},
@@ -407,50 +407,83 @@ KERNELS: list[Kernel] = [
     Kernel(
         "attn_prefill_bf16",
         "attn_prefill",
-        "head 256 GQA 2 (Gemma-4 sliding layers, 32 q / 16 kv heads)",
+        "head 256 GQA 2 (Gemma-4 sliding layers): four query tiles per block",
         {
             "head_dim": 256,
             "gqa": 2,
             **_BF16,
             "kv_dtype": ("bf16", "int8"),
-            "split_kv": False,
+            "split_kv": True,
             "window": (True, False),
-            "causal": True,
+            "causal": (True, False),
             "sinks": False,
         },
-        {"hpb": 2, "bn": 16, "xt": "fp16"},
+        {"hpb": 2, "bn": 16, "q_tiles": 4},
     ),
     Kernel(
         "attn_prefill_bf16",
         "attn_prefill",
         "head 512 GQA 8 (Gemma-4 full layers): four waves per head, all eight "
-        "heads of a KV head per block so each K/V tile is staged once; fp16 "
-        "score partials fit it in 58 KB at 192 VGPRs (21.7 -> 28.5 TF)",
+        "heads of a KV head per block so each K/V tile is staged once",
         {
             "head_dim": 512,
             "gqa": 8,
             **_BF16,
             "kv_dtype": ("bf16", "int8"),
-            "split_kv": False,
+            "split_kv": True,
             "window": (True, False),
-            "causal": True,
+            "causal": (True, False),
             "sinks": False,
         },
-        {"hpb": 8, "bn": 16, "xt": "fp16"},
+        {"hpb": 8, "bn": 16},
     ),
     Kernel(
         "attn_prefill_bf16",
         "attn_prefill",
         "head 64 GQA 4 (LFM2.5): one wave per head, all four heads of a KV "
-        "head per block; BN 32 (185 VGPRs) beat 64 by 12% at 8k",
+        "head per block, four query tiles per block",
         {
             "head_dim": 64,
             "gqa": 4,
             **_BF16,
-            "kv_dtype": ("bf16", "int8"),
+            "kv_dtype": ("int8",),
+            "split_kv": True,
+            "window": (True, False),
+            "causal": (True, False),
+            "sinks": False,
+        },
+        {"hpb": 4, "bn": 64, "q_tiles": 4},
+    ),
+    Kernel(
+        "attn_prefill_bf16",
+        "attn_prefill",
+        "head 64 GQA 4 on bf16 KV: verify batches stay on Triton, which is "
+        "faster at one sequence and 2k of context",
+        {
+            "head_dim": 64,
+            "gqa": 4,
+            **_BF16,
+            "kv_dtype": ("bf16",),
             "split_kv": False,
             "window": (True, False),
-            "causal": True,
+            "causal": (True, False),
+            "sinks": False,
+        },
+        {"hpb": 4, "bn": 64, "q_tiles": 4},
+    ),
+    Kernel(
+        "attn_prefill_bf16",
+        "attn_prefill",
+        "head 128 GQA 4 (DFlash drafts, 32 q / 8 kv heads, 2048-key sliding "
+        "window): one wave per head, four heads of a KV head per block",
+        {
+            "head_dim": 128,
+            "gqa": 4,
+            **_BF16,
+            "kv_dtype": ("bf16", "int8"),
+            "split_kv": True,
+            "window": (True, False),
+            "causal": (True, False),
             "sinks": False,
         },
         {"hpb": 4, "bn": 32},
@@ -460,18 +493,35 @@ KERNELS: list[Kernel] = [
         "attn_prefill",
         "head 128 GQA 8 (Flint, 32 q / 4 kv heads, 513-key sliding window on "
         "most layers): one wave per head, all eight heads of a KV head per "
-        "block, BN 32; attention sinks fold into the final max and sum",
+        "block; attention sinks fold into the final max and sum",
         {
             "head_dim": 128,
             "gqa": 8,
             **_BF16,
             "kv_dtype": ("bf16", "int8"),
-            "split_kv": False,
+            "split_kv": True,
             "window": (True, False),
-            "causal": True,
+            "causal": (True, False),
             "sinks": (True, False),
         },
         {"hpb": 8, "bn": 32},
+    ),
+    Kernel(
+        "attn_prefill_bf16",
+        "attn_prefill",
+        "head 128 GQA 16 (Muse-Glimmer, 32 q / 2 kv heads): one wave per "
+        "head, all sixteen heads of a KV head per block",
+        {
+            "head_dim": 128,
+            "gqa": 16,
+            **_BF16,
+            "kv_dtype": ("bf16", "int8"),
+            "split_kv": True,
+            "window": (True, False),
+            "causal": (True, False),
+            "sinks": False,
+        },
+        {"hpb": 16, "bn": 16},
     ),
     Kernel(
         "attn_prefill32_bf16",
@@ -479,8 +529,7 @@ KERNELS: list[Kernel] = [
         "NOT ROUTED: D=512 prefill with 32 query columns per K/V stage. Warps "
         "are 2 column tiles x 4 D-slices for the score phase, P^T and row "
         "stats go through LDS, and each warp owns DV/8 V dims for both tiles "
-        "in the PV phase. Was 1.06x production; after production's occupancy "
-        "and VALU fixes it is 0.95x (20 vs 21 TF), so Gemma-4 uses attn_prefill",
+        "in the PV phase. Gemma-4 uses attn_prefill",
         {
             "head_dim": 512,
             "gqa": 8,
@@ -496,9 +545,9 @@ KERNELS: list[Kernel] = [
     Kernel(
         "attn_decode_bf16",
         "attn_decode",
-        "one query per sequence, split-KV, key-tiled: Gemma-4 sliding layers, "
-        "where Triton decode reached about half the KV bandwidth. int8 KV "
-        "widens bytes in LDS and folds the per-key scale into score/P",
+        "one query per sequence, split-KV: head 256 GQA 2 (Gemma-4 sliding "
+        "layers). bf16 KV scores by bf16 dot2; int8 KV by fp16 dot2 at GQA 2 "
+        "and fp16 WMMA at every other geometry, the per-key scale in score and P",
         {
             "head_dim": 256,
             "gqa": 2,
@@ -506,14 +555,14 @@ KERNELS: list[Kernel] = [
             **_BF16,
             "kv_dtype": ("bf16", "int8"),
             "window": (True, False),
+            "sinks": False,
         },
-        {"block": 32},
+        {"block": {"bf16": 16, "int8": 16}},
     ),
     Kernel(
         "attn_decode_bf16",
         "attn_decode",
-        "one query per sequence, split-KV, key-tiled: Gemma-4 full layers "
-        "(head 512 GQA 8), bf16 or int8 KV",
+        "head 512 GQA 8 (Gemma-4 full layers)",
         {
             "head_dim": 512,
             "gqa": 8,
@@ -521,16 +570,14 @@ KERNELS: list[Kernel] = [
             **_BF16,
             "kv_dtype": ("bf16", "int8"),
             "window": (True, False),
+            "sinks": False,
         },
-        {"block": 16},
+        {"block": {"bf16": 16, "int8": 16}},
     ),
     Kernel(
         "attn_decode_bf16",
         "attn_decode",
-        "head 256 GQA 8 (Qwen3.6-35B-A3B), bf16 or int8 KV. With the parallel "
-        "softmax, 2.0x the vendored Triton decode at x1 from 64k on int8 "
-        "(176 vs 85 GB/s at 256k), 1.43x on bf16 at 128k with a large KV "
-        "pool; 0.88-0.90x at x4/x16, so attn.py takes it at <= 2 sequences",
+        "head 256 GQA 8 (Qwen3.6-35B-A3B)",
         {
             "head_dim": 256,
             "gqa": 8,
@@ -538,14 +585,45 @@ KERNELS: list[Kernel] = [
             **_BF16,
             "kv_dtype": ("bf16", "int8"),
             "window": (False,),
+            "sinks": False,
         },
-        {"block": 32},
+        {"block": {"bf16": 32, "int8": 32}},
     ),
     Kernel(
         "attn_decode_bf16",
         "attn_decode",
-        "head 128 GQA 8 (Flint), bf16 or int8 KV, 513-key sliding window or "
-        "full layers; attention sinks folded in after the segments combine",
+        "head 256 GQA 6 (Qwen3.8-27B)",
+        {
+            "head_dim": 256,
+            "gqa": 6,
+            "queries": 1,
+            **_BF16,
+            "kv_dtype": ("bf16", "int8"),
+            "window": (False,),
+            "sinks": False,
+        },
+        {"block": {"bf16": 16, "int8": 32}},
+    ),
+    Kernel(
+        "attn_decode_bf16",
+        "attn_decode",
+        "head 64 GQA 4 (LFM2.5)",
+        {
+            "head_dim": 64,
+            "gqa": 4,
+            "queries": 1,
+            **_BF16,
+            "kv_dtype": ("bf16", "int8"),
+            "window": (False,),
+            "sinks": False,
+        },
+        {"block": {"bf16": 32, "int8": 32}},
+    ),
+    Kernel(
+        "attn_decode_bf16",
+        "attn_decode",
+        "head 128 GQA 8 (Flint), 513-key sliding window or full layers; "
+        "attention sinks folded in after the segments combine",
         {
             "head_dim": 128,
             "gqa": 8,
@@ -555,7 +633,151 @@ KERNELS: list[Kernel] = [
             "window": (True, False),
             "sinks": (True, False),
         },
-        {"block": 32},
+        {"block": {"bf16": 32, "int8": 32}},
+    ),
+    Kernel(
+        "attn_decode_bf16",
+        "attn_decode",
+        "head 128 GQA 16 (Muse-Glimmer)",
+        {
+            "head_dim": 128,
+            "gqa": 16,
+            "queries": 1,
+            **_BF16,
+            "kv_dtype": ("bf16", "int8"),
+            "window": (True, False),
+            "sinks": False,
+        },
+        {"block": {"bf16": 16, "int8": 32}},
+    ),
+    # ---------------------------------------------------- Inkling 2 Mini
+    Kernel(
+        "inkling_rel_attn_prefill",
+        "inkling2_attention",
+        "Inkling 2 relative attention for prefill (attn_prefill's REL): the "
+        "sheared relative logits (or the clipped r and the relative "
+        "projection, computed in the kernel for window layers), the output "
+        "gate and the per-token sink in the epilogue. 16-query tiles per "
+        "wave (q_tiles of them per block), one block per (KV head, query "
+        "tile) over all three heads. page % block_n == 0",
+        {
+            "head_dim": 128,
+            "gqa": 3,
+            **_BF16,
+            "kv_dtype": ("bf16",),
+            "window": (True, False),
+            "causal": True,
+            "q_tiles": (2, 4),
+            "block_n": (16, 32),
+        },
+        {"also_built": "q_tiles 1 at block_n 16"},
+    ),
+    Kernel(
+        "inkling_rel_attn_prefill",
+        "inkling2_attention",
+        "the same on int8 KV (int8_per_token_head)",
+        {
+            "head_dim": 128,
+            "gqa": 3,
+            **_BF16,
+            "kv_dtype": ("int8",),
+            "window": (True, False),
+            "causal": True,
+            "q_tiles": (2, 4),
+            "block_n": 32,
+        },
+    ),
+    Kernel(
+        "inkling_rel_attn_decode",
+        "inkling2_rel_decode",
+        "Inkling 2 relative attention for decode and verify batches, the "
+        "relative logits from the sheared table, the output gate and the "
+        "per-token sink: q_rows 1 is one block of 16 waves per (token, KV "
+        "head), q_rows 3 and 5 one wave per (up to 3 or 5 tokens of a "
+        "request, KV head, key segment) with WMMA scores and a split-KV "
+        "reduce. Cache blocks of at least 16 tokens",
+        {
+            "head_dim": 128,
+            "gqa": 3,
+            "queries": Range(lo=1, hi=16),
+            **_BF16,
+            "kv_dtype": ("bf16", "int8"),
+            "window": (True, False),
+            "causal": True,
+        },
+        {"block": 16, "threads": 512},
+    ),
+    Kernel(
+        "inkling2_kv_conv",
+        "inkling2_kv_conv",
+        "Inkling 2 attention-prologue K / V short convolutions (W = 4 taps, "
+        "static or dynamic) over the port's paged conv-state cache, then the "
+        "K clip and V RMS norm per head and the KV-cache write; int8 KV gets "
+        "its fp32 scale inline after each head's 128 values. KV page and "
+        "conv-cache block sizes are powers of two",
+        {
+            "head_dim": 128,
+            "conv_width": 4,
+            **_BF16,
+            "kv_dtype": ("bf16", "int8"),
+        },
+        {"tokens": 8, "threads": 128},
+    ),
+    Kernel(
+        "nvfp4_moe_wmma",
+        "inkling2_moe",
+        "expert GEMM over NVFP4 experts in the pre-tiled layout: uint8 "
+        "[E, N, K/2] e2m1 pairs with one e4m3 scale per 16 columns "
+        "[E, N, K/16], decoded to fp16 in LDS; amax / denominator on the fp32 "
+        "sums. `gammas` fuses the softcapped SwiGLU (w13, [rows, N / 2] out), "
+        "`row_token` reads token rows directly. tile_rows is 64 or a multiple "
+        "of 128. n % 128 == 0, k % 64 == 0",
+        {
+            **_BF16,
+            "weight_dtype": "uint8",
+            "weight_bits": 4,
+            "quant": "nvfp4",
+            "group_size": (16,),
+            "swiglu": (True, False),
+            "tile_rows": Range(lo=64),
+        },
+        {"block_m": (64, 128), "block_n": 128, "block_k": 64},
+    ),
+    Kernel(
+        "nvfp4_moe_gemv",
+        "inkling2_moe",
+        "expert GEMV over the same NVFP4 layout for routing tiles of at most "
+        "16 rows (decode, verify and small batches): a block streams 128 "
+        "weight rows of one expert once for all of the tile's rows. Same "
+        "`gammas` and `row_token` options. n % 128 == 0, k % 64 == 0",
+        {
+            **_BF16,
+            "weight_dtype": "uint8",
+            "weight_bits": 4,
+            "quant": "nvfp4",
+            "group_size": (16,),
+            "swiglu": (True, False),
+            "tile_rows": Range(hi=16),
+        },
+        {"threads": 256},
+    ),
+    Kernel(
+        "mxfp8_moe_wmma",
+        "inkling2_moe",
+        "nvfp4_moe_wmma on MXFP8 experts (layers 20-23) in their native "
+        "layout: e4m3 [E, N, K] with e8m0 scales [E, N, K/32]. Exact while "
+        "every scale byte is in 105..134 (the caller checks). tile_rows is 64 "
+        "or a multiple of 128. n % 128 == 0, k % 64 == 0",
+        {
+            **_BF16,
+            "weight_dtype": "fp8_e4m3",
+            "weight_bits": 8,
+            "quant": "mxfp8",
+            "group_size": (32,),
+            "swiglu": (True, False),
+            "tile_rows": Range(lo=64),
+        },
+        {"block_m": (64, 128), "block_n": 128, "block_k": 64},
     ),
     # ----------------------------------------------------- quantized dense
     Kernel(

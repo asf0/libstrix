@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
-// Inkling 2 attention-prologue K / V short convolutions for prefill (W = 4
+// Inkling 2 attention-prologue K / V short convolutions (W = 4
 // taps, static or dynamic) over the port's paged conv-state cache ([blocks,
 // H, N, Dpack], one slot per absolute position): K is then L2-clipped and V
-// RMS-normalized per head and both go to the paged KV cache; each token's
-// input goes to its conv-cache slot.
+// RMS-normalized per head and both go to the paged KV cache (bf16 or int8);
+// each token's input goes to its conv-cache slot.
 //
 // One wave owns a KV head (K in lanes 0-15, V in 16-31, 8 channels a lane)
 // for a run of kBT tokens and loads the run's input rows (and the three
@@ -112,8 +112,12 @@ __device__ __forceinline__ void run_taps(const ConvMeta& m, const RunMeta& r, in
 
 // K / V convs of the prologue: wave = KV head (lanes 0-15 K, 16-31 V),
 // block = 4 waves. Static taps w[c][k] (oldest first, bf16-rounded); dynamic
-// taps (w[c][lag] + dyn[t][head][lag], newest first).
-template <bool DYN>
+// taps (w[c][lag] + dyn[t][head][lag], newest first). Q8: the KV cache is
+// vLLM's int8_per_token_head layout - each (head, slot) content half is the
+// 128 int8 values plus one fp32 scale at the end (amax / 127, floored at
+// 1e-6, round half away from zero, clamped to [-128, 127], as vLLM's
+// per-token-head quant kernel).
+template <bool DYN, bool Q8>
 __global__ __launch_bounds__(128) void kv_conv_kernel(
     const uint16_t* __restrict__ k, const uint16_t* __restrict__ v, int64_t sk, int64_t sv,
     const float* __restrict__ wk, const float* __restrict__ wv,
@@ -193,10 +197,36 @@ __global__ __launch_bounds__(128) void kv_conv_kernel(
     if (slot >= 0)
       *reinterpret_cast<uint4*>(m.cache + (slot >> m.n_shift) * m.c_blk +
                                 (slot & ((1 << m.n_shift) - 1)) * m.c_n + ccol) = cur;
-    if (ks[i] >= 0)
-      *reinterpret_cast<uint4*>(kvc + (ks[i] >> page_shift) * kv_blk +
-                                (ks[i] & ((1 << page_shift) - 1)) * kv_n + head * kv_h + d) =
-          f32_to_bf16x8(y);
+    if (ks[i] >= 0) {
+      const int64_t dst = (ks[i] >> page_shift) * kv_blk +
+                          (ks[i] & ((1 << page_shift) - 1)) * kv_n + head * kv_h;
+      if constexpr (Q8) {
+        // The 16 lanes of this half-wave hold the head's 128 values: reduce
+        // the amax like the sum of squares above.
+        float am = 0.f;
+#pragma unroll
+        for (int c = 0; c < kNV; ++c) am = fmaxf(am, fabsf(y[c]));
+#pragma unroll
+        for (int s = 8; s >= 1; s >>= 1) am = fmaxf(am, xor_shuffle_f32(am, s));
+        const float qscale = fmaxf(am / 127.f, 1e-6f);
+        const float inv = 1.f / qscale;
+        // The V rows are only 4-byte aligned (132 bytes after K's): two words.
+        uint32_t qw[2] = {0, 0};
+#pragma unroll
+        for (int c = 0; c < kNV; ++c) {
+          float z = y[c] * inv;
+          z = z >= 0.f ? floorf(z + 0.5f) : ceilf(z - 0.5f);
+          const int qi = static_cast<int>(fmaxf(-128.f, fminf(127.f, z)));
+          qw[c >> 2] |= static_cast<uint32_t>(static_cast<uint8_t>(qi)) << (8 * (c & 3));
+        }
+        int8_t* kvc8 = reinterpret_cast<int8_t*>(kvc);
+        *reinterpret_cast<uint32_t*>(kvc8 + dst + d) = qw[0];
+        *reinterpret_cast<uint32_t*>(kvc8 + dst + d + 4) = qw[1];
+        if (d == 0) *reinterpret_cast<float*>(kvc8 + dst + 128) = qscale;
+      } else {
+        *reinterpret_cast<uint4*>(kvc + dst + d) = f32_to_bf16x8(y);
+      }
+    }
   }
 }
 
@@ -234,7 +264,8 @@ ConvMeta make_meta(const torch::Tensor& cache, const torch::Tensor& positions,
 // k, v: bf16 [T, H * 128] (row-strided); wk, wv: fp32 [H * 128, 4] taps (static:
 // oldest first, bf16-rounded; dynamic: the static part, newest first) with
 // k_dyn / v_dyn bf16 [T, H * 4] per-token deltas (row-strided) when dynamic.
-// key_cache / value_cache: bf16 [blocks, page, H, 128] views with equal strides.
+// key_cache / value_cache: bf16 or int8 [blocks, page, H, 128] views with
+// equal strides; after each int8 row the kernel writes its fp32 scale.
 void inkling2_kv_conv(const torch::Tensor& k, const torch::Tensor& v, const torch::Tensor& wk,
                       const torch::Tensor& wv, const std::optional<torch::Tensor>& k_dyn,
                       const std::optional<torch::Tensor>& v_dyn, const torch::Tensor& cache,
@@ -245,9 +276,14 @@ void inkling2_kv_conv(const torch::Tensor& k, const torch::Tensor& v, const torc
                       double scale, double clip_threshold, double clip_eps, double norm_eps) {
   const int64_t T = kv_slot_mapping.size(0);
   const int heads = int(key_cache.size(2));
+  const bool q8 = key_cache.scalar_type() != at::kBFloat16;
+  const auto cache_dtype = q8 ? at::kChar : at::kBFloat16;
   TORCH_CHECK(key_cache.size(3) == 128 && key_cache.strides() == value_cache.strides() &&
-                  key_cache.stride(3) == 1 && key_cache.scalar_type() == at::kBFloat16,
-              "KV caches: bf16 [blocks, page, H, 128] with equal strides");
+                  key_cache.stride(3) == 1 && key_cache.scalar_type() == cache_dtype &&
+                  value_cache.scalar_type() == cache_dtype,
+              "KV caches: bf16 or int8 [blocks, page, H, 128] with equal strides");
+  if (q8)
+    TORCH_CHECK(key_cache.stride(2) % 4 == 0, "int8 cache: 4-byte aligned head rows");
   for (const auto* t : {&k, &v})
     TORCH_CHECK(t->scalar_type() == at::kBFloat16 && t->stride(1) == 1 && t->size(0) >= T &&
                     t->size(1) == heads * 128 && t->stride(0) % 8 == 0,
@@ -266,8 +302,12 @@ void inkling2_kv_conv(const torch::Tensor& k, const torch::Tensor& v, const torc
   TORCH_CHECK(kv_slot_mapping.scalar_type() == at::kLong, "kv_slot_mapping: int64");
   const int64_t page = key_cache.size(1);
   TORCH_CHECK(page > 0 && (page & (page - 1)) == 0, "KV page: a power of two");
-  for (const torch::Tensor* t : {&k, &v, &cache, &key_cache, &value_cache})
+  for (const torch::Tensor* t : {&k, &v, &cache})
     TORCH_CHECK(reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0, "16-byte aligned data");
+  // Int8 stores are 4-byte words (the V rows start 132 bytes after K's).
+  for (const torch::Tensor* t : {&key_cache, &value_cache})
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(t->data_ptr()) % (q8 ? 4 : 16) == 0,
+                "aligned cache data");
   if (dyn)
     for (const torch::Tensor* t : {&*k_dyn, &*v_dyn})
       TORCH_CHECK(reinterpret_cast<uintptr_t>(t->data_ptr()) % 8 == 0, "8-byte aligned deltas");
@@ -282,7 +322,8 @@ void inkling2_kv_conv(const torch::Tensor& k, const torch::Tensor& v, const torc
   const uint16_t* dkp = dyn ? u16(*k_dyn) : nullptr;
   const uint16_t* dvp = dyn ? u16(*v_dyn) : nullptr;
   const int64_t sdk = dyn ? k_dyn->stride(0) : 0, sdv = dyn ? v_dyn->stride(0) : 0;
-  auto kernel = dyn ? kv_conv_kernel<true> : kv_conv_kernel<false>;
+  auto kernel = q8 ? (dyn ? kv_conv_kernel<true, true> : kv_conv_kernel<false, true>)
+                   : (dyn ? kv_conv_kernel<true, false> : kv_conv_kernel<false, false>);
   hipLaunchKernelGGL(kernel, grid, dim3(128), 0, stream, u16(k), u16(v), k.stride(0),
                      v.stride(0), wk.data_ptr<float>(), wv.data_ptr<float>(), dkp, dvp, sdk,
                      sdv, m, cache.stride(1),

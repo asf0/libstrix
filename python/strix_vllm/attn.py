@@ -1,83 +1,180 @@
 # SPDX-License-Identifier: MIT
-"""Prefill and decode attention (bf16 or int8 KV) inside TRITON_ATTN.
+"""Prefill, decode and verify attention (bf16 or int8 KV) inside TRITON_ATTN.
 
-The plugin overrides the TRITON_ATTN backend with a subclass whose impl runs
-strix.attn_prefill (prefill-heavy and speculative-verify batches, the latter
-split-KV) or strix.attn_decode (one query per sequence on the Gemma-4 heads,
-where Triton decode reached about half the KV bandwidth), and the parent's
-Triton kernel for everything else (verify batches on windowed layers, other
-heads), so no --attention-backend change is needed. The (head_dim, GQA) pairs
-each kernel takes are read from the kernel table, not repeated here.
+The plugin overrides the TRITON_ATTN backend with a subclass, so no
+--attention-backend change is needed. `route` picks the kernel of a batch:
 
-int8 KV (vLLM's int8_per_token_head, the served teacher-corpus config) runs
-the prefill kernel on the byte cache: the parent's
-`_pth_key_value_caches`/`_k_scale_cache` views are handed straight to the
-op, which widens the bytes to bf16 in the load stage and folds the per-key
-scale into the score (K) and the P fragment (V).
+  prefill  strix.attn_prefill, 16-query tiles
+  verify   strix.attn_prefill split-KV, for speculative-verify batches
+  decode   strix.attn_decode, one query per sequence, split-KV
+  triton   the parent's kernel, for every other batch
+
+The (head_dim, GQA, sinks, window, KV dtype) each kernel takes come from the
+kernel table (python/strix/registry.py) and are not repeated here, so the gate
+cannot drift from the geometries the HIP dispatch accepts.
+
+On int8 KV (vLLM's int8_per_token_head) both ops read the byte cache: the
+parent's `_pth_key_value_caches`/`_k_scale_cache` views are handed straight to
+the op, which folds the per-key scales into the scores (K) and the softmax
+weights (V).
 """
+
+from typing import NamedTuple
 
 import torch
 
 from strix_vllm import disabled
 
-# Which (head_dim, GQA) pairs each kernel takes comes from the registry table
-# (python/strix/registry.py), so the gate here cannot drift from the geometry
-# the HIP dispatch accepts. Resolved once, on first use.
-#   prefill: head 64 G4 (LFM2.5), 128 G8 (Flint, with sinks), 256 GQA 2/6/8,
-#            512 G8
-#   decode:  head 256 GQA 2 (Gemma-4 sliding), 256 G8 (35B, <= 2 sequences),
-#            512 G8 (Gemma-4 full layers)
-#   verify:  the split-KV prefill variant, head 256 GQA 6 only
-_CFGS: dict[str, frozenset[tuple[int, int]]] = {}
-
-# Batches with max_query_len >= PREFILL_MIN_QUERY run the prefill kernel.
-# Speculative-verify batches (2..VERIFY_MAX_QUERY query tokens per sequence)
-# run it split-KV, but only for GQA 6: 1.2x Triton at 16k context on 27B
-# shapes, while the G=8 variant (16-key steps) is slower than Triton there.
-# Single-token decode stays on Triton, which is already at bandwidth.
+# Batches with max_query_len >= PREFILL_MIN_QUERY run the prefill kernel,
+# batches with 2..VERIFY_MAX_QUERY queries (speculative verify: one 16-query
+# tile per sequence) the split-KV variant where the table has a split_kv row.
 PREFILL_MIN_QUERY = 64
 VERIFY_MAX_QUERY = 16
-# Decode geometries that win only at one or two sequences: head 256 GQA 8
-# (the 35B) is 2.0x the vendored Triton kernel at x1 from 64k on int8 KV and
-# 1.43x at 128k on bf16, but 0.88-0.90x at x4/x16, so larger
-# decode batches on it stay on Triton, whatever the KV dtype.
-DECODE_MAX_SEQS = {(256, 8): 2}
+
+# Split-KV grids. Blocks of one launch read equal shares of the keys, so a
+# count just past what the GPU holds at once leaves a short tail round: the
+# grid (sequences x KV heads x splits) is sized to fit, per geometry.
+#
+# Decode: the grid's blocks, by (head_dim, GQA, KV dtype); 80 elsewhere.
+DECODE_BLOCKS = {
+    (256, 8, "bf16"): 40,
+    (256, 8, "int8"): 40,
+    (256, 6, "int8"): 40,
+    (512, 8, "bf16"): 40,
+    (512, 8, "int8"): 40,
+    (128, 16, "bf16"): 100,
+    (64, 4, "int8"): 160,
+}
+DECODE_MAX_SPLITS = 30
+# Fewer than DECODE_MAX_SPLITS where more measured slower (int8 head 64).
+DECODE_SPLIT_CAP = {(64, 4, "int8"): 10}
+DECODE_SPLIT_KEYS = 96  # keys per split at least
+
+# Verify: the splits at up to so many sequences x KV heads, by (head_dim, GQA,
+# window); None is every larger batch. A geometry not listed uses `num_splits`.
+VERIFY_SPLITS = {
+    (64, 4, False): ((8, 15), (32, 20), (64, 15), (None, 5)),
+    (128, 4, True): ((8, 7), (16, 5), (None, 3)),
+    (128, 8, False): ((4, 20), (16, 15), (None, 10)),
+    (128, 8, True): ((16, 7), (None, 5)),
+    (128, 16, False): ((2, 15), (None, 5)),
+    (128, 16, True): ((2, 15), (8, 5), (None, 2)),
+    (256, 2, True): ((8, 5), (16, 3), (None, 2)),
+    (256, 8, False): ((2, 30), (8, 15), (None, 7)),
+    (512, 8, False): ((4, 10), (16, 5), (None, 3)),
+}
+VERIFY_SPLIT_KEYS = 64  # keys per split at least
 
 
-def _cfgs(kind: str) -> frozenset[tuple[int, int]]:
-    """(head_dim, GQA) pairs for `kind`, from the kernel table."""
-    if kind not in _CFGS:
-        import strix
+class Kernels(NamedTuple):
+    """The strix kernels one attention layer may run."""
 
-        op = "attn_decode" if kind.startswith("decode") else "attn_prefill"
-        where = {
-            "verify": {"split_kv": True},
-            "decode_bf16": {"kv_dtype": "bf16"},
-            "decode_int8": {"kv_dtype": "int8"},
-            "prefill_sinks": {"sinks": True},
-            "decode_sinks": {"sinks": True},
-        }.get(kind, {})
-        _CFGS[kind] = frozenset(strix.geometries(op, "head_dim", "gqa", **where))
-    return _CFGS[kind]
+    head_dim: int
+    gqa: int
+    window: bool
+    prefill: bool
+    verify: frozenset[str]  # KV dtypes ("bf16", "int8")
+    decode: frozenset[str]
 
 
-def decode_splits(keys: int, blocks: int) -> int:
-    """About one split-KV segment per 256 visible keys, capped so the grid
-    (`blocks` = sequences x KV heads, times the splits) stays near 480
-    blocks, at most 60.
+def layer_kernels(head_dim: int, gqa: int, sinks: bool, window: bool) -> Kernels:
+    """The kernel table rows a layer of this geometry matches."""
+    import strix
 
-    Decode CUDA graphs are captured with max_seq_len = max_model_len, so
-    in practice this is the cap. The old fixed cap of 16 was a power of two,
-    and power-of-two splits of power-of-two contexts measured ~25 % slower
-    on gfx1151 (D=512, 128k: 16 splits 145 GB/s, 28/44/60 ~198 GB/s);
-    480 // blocks gives 60/30/15/7 at 8/16/32/64 blocks.
+    def built(op: str, **where) -> bool:
+        return (head_dim, gqa) in strix.geometries(
+            op, "head_dim", "gqa", sinks=sinks, window=window, **where
+        )
+
+    # STRIX_DISABLE=attn_decode keeps the vendored Triton kernel out and must
+    # keep this one off with it.
+    kvs = ("bf16", "int8")
+    decode = () if disabled("attn_decode") else kvs
+    return Kernels(
+        head_dim=head_dim,
+        gqa=gqa,
+        window=window,
+        prefill=built("attn_prefill"),
+        verify=frozenset(
+            kv for kv in kvs if built("attn_prefill", split_kv=True, kv_dtype=kv)
+        ),
+        decode=frozenset(kv for kv in decode if built("attn_decode", kv_dtype=kv)),
+    )
+
+
+def route(
+    kernels: Kernels,
+    max_query_len: int,
+    num_seqs: int,
+    kv_dtype: str,
+    max_seq_len: int,
+    window_left: int,
+    num_kv_heads: int,
+    causal: bool = True,
+) -> tuple[str, int]:
+    """The kernel a batch runs ("decode", "prefill", "verify" or "triton")
+    and its split-KV count (0 for Triton, which picks its own)."""
+    blocks = num_seqs * num_kv_heads
+    if not causal:
+        # Draft blocks (DFlash / DSpark): the verify kernel with the keys after
+        # the query visible too; no single-query decode kernel.
+        if 2 <= max_query_len <= VERIFY_MAX_QUERY and kv_dtype in kernels.verify:
+            return "verify", verify_splits(
+                kernels, visible_keys(max_seq_len, window_left, max_query_len), blocks, max_seq_len
+            )
+        return "triton", 0
+    keys = visible_keys(max_seq_len, window_left, max(1, max_query_len))
+    if max_query_len == 1 and kv_dtype in kernels.decode:
+        return "decode", decode_splits(kernels, kv_dtype, keys, blocks)
+    if max_query_len >= PREFILL_MIN_QUERY and kernels.prefill:
+        return "prefill", 1
+    if 2 <= max_query_len <= VERIFY_MAX_QUERY and kv_dtype in kernels.verify:
+        return "verify", verify_splits(kernels, keys, blocks, max_seq_len)
+    return "triton", 0
+
+
+def visible_keys(max_seq_len: int, window_left: int, queries: int = 1) -> int:
+    """Keys that `queries` consecutive query tokens see between them."""
+    if window_left < 0:
+        return max_seq_len
+    return min(max_seq_len, window_left + queries)
+
+
+def non_causal_window(window_left: int) -> int:
+    """attn_prefill's window argument of a non-causal (draft) batch."""
+    return -2 if window_left < 0 else -3 - window_left
+
+
+def decode_splits(kernels: Kernels, kv_dtype: str, keys: int, blocks: int) -> int:
+    """Split count of a decode batch of `blocks` = sequences x KV heads.
+
+    Decode CUDA graphs are captured with max_seq_len = max_model_len, so in
+    practice `keys` matters on windowed layers only.
     """
-    return max(1, min(60, 480 // max(1, blocks), (keys + 255) // 256))
+    key = (kernels.head_dim, kernels.gqa, kv_dtype)
+    splits = min(
+        DECODE_SPLIT_CAP.get(key, DECODE_MAX_SPLITS),
+        DECODE_BLOCKS.get(key, 80) // max(1, blocks),
+    )
+    if kv_dtype == "int8" and kernels.head_dim >= 128 and not kernels.window and splits < 3:
+        # Too many blocks for the grid: many short segments measured faster
+        # than one or two long ones.
+        splits = 7 if kernels.head_dim >= 256 else 10
+    return max(1, min(splits, -(-keys // DECODE_SPLIT_KEYS)))
 
 
 def num_splits(max_seq_len: int) -> int:
     """About one split-KV segment per 1k keys, at most 32."""
     return max(1, min(32, (max_seq_len + 1023) // 1024))
+
+
+def verify_splits(kernels: Kernels, keys: int, blocks: int, max_seq_len: int) -> int:
+    """Split count of a verify batch of `blocks` = sequences x KV heads."""
+    steps = VERIFY_SPLITS.get((kernels.head_dim, kernels.gqa, kernels.window))
+    if steps is None:
+        return num_splits(max_seq_len)
+    splits = next(n for most, n in steps if most is None or blocks <= most)
+    return max(1, min(splits, -(-keys // VERIFY_SPLIT_KEYS)))
 
 
 def _extensible_kv_cache_off() -> None:
@@ -118,9 +215,9 @@ def register() -> None:
     )
 
     if not disabled("attn_decode"):
-        # Batches the strix kernels do not take (decode, quantized KV, ...)
-        # run the fork's gfx1151-tuned Triton kernel; TRITON_ATTN looks the
-        # function up in its module at call time.
+        # Batches the strix kernels do not take run the fork's gfx1151-tuned
+        # Triton kernel; TRITON_ATTN looks the function up in its module at
+        # call time.
         from vllm.v1.attention.backends import triton_attn
 
         from strix_vllm import triton_unified_attention
@@ -148,30 +245,19 @@ def _classes():
     class StrixTritonAttentionImpl(TritonAttentionImpl):
         def __init__(self, *args, **kwargs) -> None:
             super().__init__(*args, **kwargs)
-            cfg = (self.head_size, self.num_queries_per_kv)
-            # Which kernel a batch gets depends on max_query_len, so both
-            # halves of the gate are resolved per (head_dim, GQA) here.
-            # Sinks (Flint): only the prefill and decode rows built for them;
-            # the split-KV verify does not apply sinks, so verify batches stay
-            # on vLLM's kernel.
-            sinks = self.sinks is not None
-            self._prefill_ok = cfg in _cfgs("prefill_sinks" if sinks else "prefill")
-            # STRIX_DISABLE=attn_decode keeps the vendored Triton kernel and
-            # must keep this one switched off with it.
-            self._decode_ok = not disabled("attn_decode") and cfg in _cfgs(
-                "decode_sinks" if sinks else "decode"
+            # Which kernel a batch gets depends on the batch (`route`); what
+            # this layer's geometry allows is resolved once.
+            self._kernels = layer_kernels(
+                self.head_size,
+                self.num_queries_per_kv,
+                sinks=self.sinks is not None,
+                window=self.sliding_window[0] >= 0,
             )
-            self._decode_bf16 = cfg in _cfgs("decode_bf16")
-            self._decode_int8 = cfg in _cfgs("decode_int8")
-            self._decode_max_seqs = DECODE_MAX_SEQS.get(cfg)
-            self._verify_ok = not sinks and cfg in _cfgs("verify")
-            # int8_per_token_head KV (the served teacher-corpus config) runs
-            # the prefill kernel on the byte cache and its inline scales.
-            self._kv_int8_ok = self._kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
             self._strix_ok = (
                 self.attn_type == AttentionType.DECODER
-                and (self._kv_quant_mode == KVQuantMode.NONE or self._kv_int8_ok)
-                and (self._prefill_ok or self._decode_ok)
+                and self._kv_quant_mode
+                in (KVQuantMode.NONE, KVQuantMode.INT8_PER_TOKEN_HEAD)
+                and (self._kernels.prefill or bool(self._kernels.decode))
                 and self.alibi_slopes is None
                 # No window, or vLLM's decoder window (window - 1, 0).
                 and (
@@ -214,83 +300,30 @@ def _classes():
             output_scale=None,
             output_block_scale=None,
         ):
-            if (
-                not self._strix_ok
-                or attn_metadata is None
-                or output_scale is not None
-                or output_block_scale is not None
-                or attn_metadata.causal is not True
-                or attn_metadata.mm_prefix_range_tensor is not None
-                or attn_metadata.rswa_prefix_lens is not None
-                or query.dtype != torch.bfloat16
-                or kv_cache.dtype not in (torch.bfloat16, torch.int8)
-            ):
-                return super().forward(
-                    layer,
-                    query,
-                    key,
-                    value,
-                    kv_cache,
-                    attn_metadata,
-                    output,
-                    output_scale,
-                    output_block_scale,
-                )
-            max_q = attn_metadata.max_query_len
+            kernel, splits = "triton", 0
             window_left = self.sliding_window[0]
-            # Decode on int8 KV too: at long context decode is KV-bound, and
-            # the packed cache's byte and scale views already exist.
             if (
-                max_q == 1
-                and self._decode_ok
-                and (
-                    (kv_cache.dtype == torch.bfloat16 and self._decode_bf16)
-                    or (kv_cache.dtype == torch.int8 and self._decode_int8)
-                )
-                and (
-                    self._decode_max_seqs is None
-                    or attn_metadata.num_actual_tokens <= self._decode_max_seqs
-                )
+                self._strix_ok
+                and attn_metadata is not None
+                and output_scale is None
+                and output_block_scale is None
+                and isinstance(attn_metadata.causal, bool)
+                and attn_metadata.mm_prefix_range_tensor is None
+                and attn_metadata.rswa_prefix_lens is None
+                and query.dtype == torch.bfloat16
+                and kv_cache.dtype in (torch.bfloat16, torch.int8)
             ):
-                import strix
-
-                n = attn_metadata.num_actual_tokens
-                if kv_cache.dtype == torch.bfloat16:
-                    key_cache, value_cache = kv_cache.transpose(1, 2).split(
-                        self.head_size, dim=-1
-                    )
-                    k_scale = v_scale = None
-                else:
-                    key_cache, value_cache, k_scale, v_scale = self._int8_kv_views(
-                        kv_cache
-                    )
-                seen = attn_metadata.max_seq_len
-                if window_left >= 0:
-                    seen = min(seen, window_left + 1)
-                strix.attn_decode(
-                    output[:n].view(n, self.num_heads, self.head_size),
-                    query[:n],
-                    key_cache,
-                    value_cache,
-                    attn_metadata.seq_lens[:n],
-                    attn_metadata.block_table[:n],
-                    self.scale,
-                    decode_splits(seen, n * self.num_kv_heads),
+                kernel, splits = route(
+                    self._kernels,
+                    attn_metadata.max_query_len,
+                    attn_metadata.query_start_loc.shape[0] - 1,
+                    "bf16" if kv_cache.dtype == torch.bfloat16 else "int8",
+                    attn_metadata.max_seq_len,
                     window_left,
-                    k_scale,
-                    v_scale,
-                    self.sinks,
+                    self.num_kv_heads,
+                    causal=attn_metadata.causal,
                 )
-                return output
-            # Windowed layers (Gemma-4 sliding, head 256 GQA 2) prefill here
-            # too since the (256, 2, 2, 16, fp16) tile: ~20 TF, 1.3-1.4x the
-            # vendored Triton kernel at window 1024. Verify batches on them
-            # stay on Triton (the split-KV verify row is GQA 6 only).
-            if max_q >= PREFILL_MIN_QUERY:
-                splits = 1
-            elif 2 <= max_q <= VERIFY_MAX_QUERY and self._verify_ok:
-                splits = num_splits(attn_metadata.max_seq_len)
-            else:
+            if kernel == "triton":
                 return super().forward(
                     layer,
                     query,
@@ -316,21 +349,38 @@ def _classes():
                 # the parent already carves the byte and fp32 scale views for
                 # its own kernel (it also writes them on cache update).
                 key_cache, value_cache, k_scale, v_scale = self._int8_kv_views(kv_cache)
-            strix.attn_prefill(
-                output[:n].view(n, self.num_heads, self.head_size),
-                query[:n],
-                key_cache,
-                value_cache,
-                attn_metadata.query_start_loc,
-                attn_metadata.seq_lens,
-                attn_metadata.block_table,
-                self.scale,
-                splits,
-                window_left,
-                k_scale,
-                v_scale,
-                self.sinks,
-            )
+            out = output[:n].view(n, self.num_heads, self.head_size)
+            if kernel == "decode":
+                strix.attn_decode(
+                    out,
+                    query[:n],
+                    key_cache,
+                    value_cache,
+                    attn_metadata.seq_lens[:n],
+                    attn_metadata.block_table[:n],
+                    self.scale,
+                    splits,
+                    window_left,
+                    k_scale,
+                    v_scale,
+                    self.sinks,
+                )
+            else:
+                strix.attn_prefill(
+                    out,
+                    query[:n],
+                    key_cache,
+                    value_cache,
+                    attn_metadata.query_start_loc,
+                    attn_metadata.seq_lens,
+                    attn_metadata.block_table,
+                    self.scale,
+                    splits,
+                    window_left if attn_metadata.causal else non_causal_window(window_left),
+                    k_scale,
+                    v_scale,
+                    self.sinks,
+                )
             return output
 
     class StrixTritonAttentionMetadataBuilder(TritonAttentionMetadataBuilder):
