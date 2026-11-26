@@ -190,3 +190,47 @@ def test_channel_every_cfg(cfg, raw):
         ref = x.float() @ (w_q.float() * s[:, None]).t()
         scale = ref.abs().amax()
         torch.testing.assert_close(out.float() / scale, ref / scale, rtol=0, atol=8e-3)
+
+
+def _channel_kernel():
+    """strix_vllm's StrixFp8ChannelMMKernel, registered once."""
+    pytest.importorskip("vllm")
+    import vllm.model_executor.kernels.linear as linear_kernels
+    from vllm.platforms import PlatformEnum
+
+    from strix_vllm import fp8 as strix_fp8
+
+    kernels = linear_kernels._POSSIBLE_FP8_KERNELS[PlatformEnum.ROCM]
+    found = [c for c in kernels if c.__name__ == "StrixFp8ChannelMMKernel"]
+    if not found:
+        strix_fp8.register()
+        found = [c for c in kernels if c.__name__ == "StrixFp8ChannelMMKernel"]
+    return found[0]
+
+
+# vLLM hands per-channel weights over as a transposed (K, N) view. A square
+# weight has the same sizes either way: it was once used transposed (an online
+# FP8 draft's 2048 x 2048 o_proj then proposed garbage). The layer's own output
+# is checked, against a copy of the weight: vLLM's replace_parameter copies in
+# place when the shapes match, so the handed-over storage itself is rewritten.
+@pytest.mark.parametrize("n,k", [(256, 256), (512, 256), (256, 512)])
+@pytest.mark.parametrize("m", [1, 8])
+def test_channel_layer_square_and_not(n, k, m):
+    from types import SimpleNamespace
+
+    cls = _channel_kernel()
+    kernel = cls.__new__(cls)
+    kernel.config = SimpleNamespace(weight_shape=(n, k))
+    kernel.layer_param_names = ("weight", "weight_scale", "input_scale", "input_scale_ub")
+    w_q, _ = make(n, k)
+    scale = torch.rand(n, 1, device="cuda") + 0.5
+    ref_w = w_q.float() * scale
+    layer = torch.nn.Module()
+    # (N, K) storage handed over as its (K, N) view, as process_fp8_weight_channel_strategy does.
+    layer.weight = torch.nn.Parameter(w_q.clone().t(), requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(scale.clone(), requires_grad=False)
+    kernel.process_weights_after_loading(layer)
+    x = torch.randn(m, k, device="cuda").bfloat16()
+    out = kernel.apply_weights(layer, x)
+    ref = x.float() @ ref_w.t()
+    torch.testing.assert_close(out.float(), ref, atol=0.05 * ref.abs().max().item(), rtol=0.02)

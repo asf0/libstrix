@@ -17,7 +17,7 @@ services:
       HF_REPO: RedHatAI/Muse-Glimmer-30B-FP8-block
     command:
       - /models/Muse-Glimmer-30B-FP8-block
-      - '--speculative-config={"method": "dflash", "model": "/models/Muse-Glimmer-30B-assistant", "num_speculative_tokens": ${SPEC_TOKENS:-15}}'
+      - '--speculative-config={"method": "dflash", "model": "/models/Muse-Glimmer-30B-assistant", "num_speculative_tokens": ${SPEC_TOKENS:-15}, "quantization": "fp8_per_channel"}'
       - --mm-encoder-attn-backend=TRITON_ATTN
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head

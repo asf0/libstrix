@@ -18,7 +18,7 @@ services:
       HF_REPO: amd/gemma-4-31B-it-MXFP4
     command:
       - /models/gemma-4-31B-it-MXFP4
-      - '--speculative-config={"method": "dflash", "model": "/models/gemma-4-31B-it-DFlash", "num_speculative_tokens": ${SPEC_TOKENS:-15}}'
+      - '--speculative-config={"method": "dflash", "model": "/models/gemma-4-31B-it-DFlash", "num_speculative_tokens": ${SPEC_TOKENS:-15}, "quantization": "fp8_per_channel"}'
       - --language-model-only
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head

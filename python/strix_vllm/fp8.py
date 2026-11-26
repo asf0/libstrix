@@ -228,8 +228,11 @@ def register() -> None:
             w, s = getattr(layer, w_name), getattr(layer, s_name)
             if w.dtype != torch.float8_e4m3fn:
                 raise RuntimeError(f"strix FP8 takes float8_e4m3fn, got {w.dtype}")
-            # The channel helper hands the weight over as a (K, N) view.
-            if w.size(0) != self.config.weight_shape[0]:
+            # The channel helper hands the weight over as a (K, N) view. The
+            # sizes alone cannot tell for a square weight; a transposed view's
+            # first stride is 1.
+            square = w.size(0) == w.size(1) == self.config.weight_shape[0]
+            if w.size(0) != self.config.weight_shape[0] or (square and w.stride(0) == 1):
                 w = w.t()
             n, k = w.shape
             buf_k = k + _STRIDE_PAD_BYTES if k % _WEIGHT_CLIFF_BYTES == 0 else k

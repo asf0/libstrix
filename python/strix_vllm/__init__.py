@@ -174,6 +174,7 @@ def register() -> None:
     from strix_vllm import (
         attn,
         dense_w8,
+        draft_head,
         fp8,
         gdn,
         gemm,
@@ -197,6 +198,7 @@ def register() -> None:
     attn.register()
     qwen4_exp.register()
     dense_w8.register()
+    draft_head.register()
     inkling2.register()
     # Opt-in (STRIX_ENABLE=npu): needs the XDNA2 NPU and libstrix_npu.so.
     from strix_vllm import qwen3_5_npu, qwen4_exp_npu

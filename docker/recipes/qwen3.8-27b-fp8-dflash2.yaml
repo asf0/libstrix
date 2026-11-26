@@ -17,7 +17,7 @@ services:
       HF_REPO: Qwen/Qwen3.8-27B-FP8
     command:
       - /models/Qwen3.8-27B-FP8
-      - '--speculative-config={"method": "dflash", "model": "/models/Qwen3.8-27B-DFlash2", "num_speculative_tokens": ${SPEC_TOKENS:-7}}'
+      - '--speculative-config={"method": "dflash", "model": "/models/Qwen3.8-27B-DFlash2", "num_speculative_tokens": ${SPEC_TOKENS:-7}, "quantization": "fp8_per_channel"}'
       - --mm-encoder-attn-backend=TRITON_ATTN
       - --attention-backend=TRITON_ATTN
       - --kv-cache-dtype=int8_per_token_head
