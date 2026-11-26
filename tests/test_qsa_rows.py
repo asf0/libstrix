@@ -126,3 +126,53 @@ def test_hook_converts_and_matches_vllm(dtype, reqs, union_max, monkeypatch):
         ops.qsa_sparse_paged_attention = orig
     assert calls == [expect], calls
     torch.testing.assert_close(got.float(), want.float(), rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.parametrize("rows,reqs", [(1, 1), (5, 1), (16, 2), (37, 3)])
+def test_decode_fp8_matches_reference(rows, reqs):
+    """qsa_decode_fp8 (decode / verify batches on the fp8 cache) against the
+    reference on the same e4m3 values."""
+    if not hasattr(torch.ops.strix, "qsa_decode_fp8"):
+        pytest.skip("no qsa_decode_fp8")
+    from vllm.platforms import current_platform
+
+    fp8 = current_platform.fp8_dtype()
+    q, k16, v16, indices, block_table, t2r = setup(rows, 4000, 2051, reqs, block=256)
+    k = (k16.float() * 0.5).to(fp8)
+    v = (v16.float() * 0.5).to(fp8)
+    out = torch.full_like(q, float("nan"))
+    torch.ops.strix.qsa_decode_fp8(
+        out, q, k, v, indices, block_table, t2r if reqs > 1 else None
+    )
+    ref = reference(q, k.bfloat16(), v.bfloat16(), indices, block_table, t2r)
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
+
+
+def test_hook_takes_decode_kernel_for_small_fp8_batches(monkeypatch):
+    ops = pytest.importorskip("vllm.models.qwen4_exp.amd.ops.qsa")
+    from strix_vllm import qwen4_exp
+
+    rows = 5
+    q, k16, v16, indices, block_table, t2r = setup(rows, 3000, 257, 1, block=256)
+    fp8 = qwen4_exp._FP8[0]
+    k, v = (k16 * 0.25).to(fp8), (v16 * 0.25).to(fp8)
+    orig = ops.qsa_sparse_paged_attention
+    want = orig(q, k, v, indices, block_table, t2r, None)
+    calls = []
+    strix_ops = torch.ops.strix
+
+    class Ops:
+        def __getattr__(self, name):
+            real = getattr(strix_ops, name)
+            if name.startswith("qsa_"):
+                return lambda *a: (calls.append(name), real(*a))[1]
+            return real
+
+    monkeypatch.setattr(qwen4_exp.torch.ops, "strix", Ops(), raising=False)
+    try:
+        qwen4_exp._register_qsa_rows()
+        got = ops.qsa_sparse_paged_attention(q, k, v, indices, block_table, t2r, None)
+    finally:
+        ops.qsa_sparse_paged_attention = orig
+    assert calls == ["qsa_decode_fp8"], calls
+    torch.testing.assert_close(got.float(), want.float(), rtol=3e-2, atol=3e-2)

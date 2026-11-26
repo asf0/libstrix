@@ -13,8 +13,11 @@ qsa_rows: QSA sparse attention for prefill. Two strix kernels:
   205k context, and no position limit.
 An fp8 cache is cast to a bf16 copy of the pages each request uses, an int8
 one dequantized (or read through the union kernel's compact fp16 copy); that
-pays off from _MIN_ROWS rows, and smaller fp8 / int8 batches (decode) keep
-vLLM's kernel.
+pays off from _MIN_ROWS rows. Smaller fp8 batches (decode, verify, the last
+chunk of a prompt) take qsa_decode_fp8 (csrc/attn/qsa_decode_fp8.hip): the
+per-row WMMA form reading the fp8 cache directly, each row's selection split
+over blocks (2.3-4.8x vLLM's kernel at 1-16 rows; STRIX_DISABLE=qsa_decode).
+Smaller int8 batches keep vLLM's kernel.
 
 vLLM's AMD QSA module imports `qsa_sparse_paged_attention` from
 `vllm.models.qwen4_exp.amd.ops.qsa` at call time, so swapping the module
@@ -59,6 +62,8 @@ _BF16_MIN_ROWS = 128
 # against per-row: 69 / 102 at 0-16k, 105 / 113 at 16-32k, 108 / 114 at
 # 32-48k, 121 / 116 at 48-64k; one layer at 135k: 191 / 117).
 _UNION_MAX_TOKENS = int(os.environ.get("STRIX_QSA_UNION_MAX_TOKENS", "49152"))
+# fp8 batches below _MIN_ROWS (decode, verify) on strix::qsa_decode_fp8.
+_decode_ok = False
 # vLLM's fp8 QSA cache (--kv-cache-dtype=fp8), viewed in the platform's flavor.
 _FP8 = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
@@ -375,6 +380,8 @@ def _install_hc_hook(hcm, hc) -> None:
 def _register_qsa_rows() -> None:
     if disabled("qsa_rows"):
         return
+    global _decode_ok
+    _decode_ok = not disabled("qsa_decode") and hasattr(torch.ops.strix, "qsa_decode_fp8")
     try:
         from vllm.models.qwen4_exp.amd.ops import qsa as ops
     except ImportError:
@@ -389,6 +396,23 @@ def _register_qsa_rows() -> None:
         converted = int8 or k_cache.dtype in _FP8
         rows = q.shape[0]
         scales = {} if k_scale is None else {"k_scale": k_scale, "v_scale": v_scale}
+        if (
+            k_cache.dtype in _FP8
+            and rows < _MIN_ROWS
+            and _decode_ok
+            and _rows_shape_ok(q, k_cache, v_cache, logical_indices, block_table)
+            and k_cache.shape[2] == 2
+            and all(x.stride(i) % 16 == 0 for x in (k_cache, v_cache) for i in range(3))
+        ):
+            # Decode / verify (and small prefill chunks): the WMMA kernel
+            # reads the fp8 cache directly, the selection split over blocks.
+            if out is None:
+                out = torch.empty_like(q)
+            torch.ops.strix.qsa_decode_fp8(
+                out, q, k_cache, v_cache, logical_indices, block_table,
+                token_to_req.to(torch.int32) if block_table.shape[0] > 1 else None,
+            )
+            return out
         if (
             (int8 and k_scale is None)
             or rows < (_MIN_ROWS if converted else _BF16_MIN_ROWS)

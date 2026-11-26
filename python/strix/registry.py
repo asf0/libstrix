@@ -1074,6 +1074,17 @@ KERNELS: list[Kernel] = [
         {"rows_per_block": 1, "kv_heads_per_block": (1, 2), "block_n": 16},
     ),
     Kernel(
+        "qsa_decode_fp8",
+        "qsa_decode",
+        "Qwen4Exp QSA sparse attention at decode / verify batch sizes on the "
+        "fp8 (e4m3, unit scale) cache: the per-row WMMA form of "
+        "qsa_rows_attn_bf16 reading fp8 directly (widened with integer ops), "
+        "each row's selection split over blocks, a merge of the partial "
+        "softmaxes. 2.3-4.8x vLLM's Triton kernel on fp8 at 1-16 rows",
+        {"head_dim": 256, "gqa": 12, "kv_heads": 2, "kv_dtype": "fp8_e4m3", "rows_max": 1023},
+        {"block_n": 16, "kv_heads_per_block": 2},
+    ),
+    Kernel(
         "qsa_union_attn_bf16",
         "qsa_union_attn_bf16",
         "Qwen4Exp QSA sparse attention for a single-request prefill of at "
