@@ -124,7 +124,7 @@ def test_loop_controllers_match_bmm(tokens, streams):
 @pytest.mark.parametrize("streams,broadcast", [(1, False), (3, True), (3, False)])
 def test_blend_up_matches_blend_rms_norm(tokens, streams, broadcast):
     from strix_vllm.inkling2_loop import blend_up
-    from vllm.models.inkling2.amd.ops.loop import blend_rms_norm
+    from strix_vllm.inkling2_loop_triton import blend_rms_norm
 
     torch.manual_seed(0)
     dev = torch.device("cuda")

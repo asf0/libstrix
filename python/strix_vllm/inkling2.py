@@ -338,15 +338,18 @@ def _register_draft_head() -> None:
 
 
 def _register_loop() -> None:
-    if disabled("inkling2_loop"):
-        return
+    """The loop controllers' blend. The strix-vllm fork's own blend raises
+    (its Triton norms moved here), so with the kernels off the port's unfused
+    blend is installed instead."""
     try:
         from vllm.models.inkling2.amd import loop
 
         from strix_vllm import inkling2_loop
     except ImportError:
         return
-    loop.Inkling2LoopDecoderLayer.blend = inkling2_loop.blend
+    loop.Inkling2LoopDecoderLayer.blend = (
+        inkling2_loop.blend_unfused if disabled("inkling2_loop") else inkling2_loop.blend
+    )
 
 
 def _register_moe() -> None:

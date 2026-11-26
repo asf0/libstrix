@@ -16,7 +16,7 @@ token block at a time from rank-64 `hidden` inside the blend and RMSNorm.
 from __future__ import annotations
 
 import torch
-from vllm.models.inkling2.amd.ops.loop import blend_rms_norm, pair_rms_norm
+from strix_vllm.inkling2_loop_triton import blend_rms_norm, pair_rms_norm
 from vllm.triton_utils import tl, tldevice, triton
 
 # Batches up to this many tokens take the kernels (one 16-row dot tile).
@@ -262,5 +262,17 @@ def blend(self, streams, dest, message, norm_weight, norm_eps):
     hidden = torch.bmm(pair, down.transpose(1, 2))
     if blend_up_usable(dest, message, hidden, up, norm_weight):
         return blend_up(dest, message, hidden, up, norm_weight, norm_eps)
+    gain_forget = torch.bmm(hidden, up.transpose(1, 2), out_dtype=torch.float32)
+    return blend_rms_norm(dest, message, gain_forget, norm_weight, norm_eps)
+
+
+def blend_unfused(self, streams, dest, message, norm_weight, norm_eps):
+    """`Inkling2LoopDecoderLayer.blend` as the ROCm port wrote it (Triton
+    norms, two bmm), for STRIX_DISABLE=inkling2_loop: the fork no longer has
+    a blend of its own."""
+    pair = pair_rms_norm(dest, message)
+    down = self.controller_down[streams]
+    up = self.controller_gain_forget[streams]
+    hidden = torch.bmm(pair, down.transpose(1, 2))
     gain_forget = torch.bmm(hidden, up.transpose(1, 2), out_dtype=torch.float32)
     return blend_rms_norm(dest, message, gain_forget, norm_weight, norm_eps)
