@@ -27,7 +27,7 @@ if [ -n "${STRIX_VLLM_LOCAL:-}" ]; then
   IMAGE=${IMAGE:-strix-vllm}
   latest=local
 else
-  VLLM_REF=${STRIX_VLLM_REF:-gfx1151}
+  VLLM_REF=${STRIX_VLLM_REF:-dev}
   vllm_sha=$(git ls-remote https://github.com/asf0/strix-vllm.git "refs/heads/$VLLM_REF" | cut -c1-10)
   vllm_sha=${vllm_sha:-$(echo "$VLLM_REF" | cut -c1-10)}
   IMAGE=${IMAGE:-ghcr.io/asf0/strix-vllm}

@@ -80,7 +80,7 @@ RUN pip install --no-deps --ignore-requires-python -r /tmp/constraints.txt \
 
 FROM ${TOOLCHAIN} AS builder
 ARG STRIX_VLLM_REPO=https://github.com/asf0/strix-vllm.git
-ARG STRIX_VLLM_REF=gfx1151
+ARG STRIX_VLLM_REF=dev
 ARG MAX_JOBS=8
 RUN --mount=type=bind,from=strix-vllm-local,target=/mnt/strix-vllm \
     if git -C /mnt/strix-vllm rev-parse --git-dir >/dev/null 2>&1; then \
