@@ -33,6 +33,10 @@ permissions:
 env:
   IMAGE: ghcr.io/asf0/strix-vllm
   TOOLCHAIN_IMAGE: ghcr.io/asf0/strix-vllm-toolchain
+  # BuildKit cache of the image job's layers (the vLLM compile, the runtime
+  # libraries): a build whose fork commit did not change reuses them, and the
+  # published layers keep their digests.
+  CACHE_IMAGE: ghcr.io/asf0/strix-vllm-buildcache
 jobs:
   toolchain:
     runs-on: ubuntu-latest
@@ -41,7 +45,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: key
-        run: echo "tag=${{ hashFiles('docker/Dockerfile', 'docker/constraints.txt') }}" >> "$GITHUB_OUTPUT"
+        # Only the toolchain block of the Dockerfile (between its >>> and <<<
+        # toolchain markers, plus the Ubuntu pin) and the pins: other edits to
+        # the Dockerfile keep the prebuilt toolchain.
+        run: |
+          tag=$({ grep '^ARG UBUNTU=' docker/Dockerfile
+                  sed -n '/^# >>> toolchain/,/^# <<< toolchain/p' docker/Dockerfile
+                  cat docker/constraints.txt; } | sha256sum | cut -c1-64)
+          grep -q '^# <<< toolchain' docker/Dockerfile || { echo "toolchain markers missing" >&2; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -99,8 +111,11 @@ jobs:
           docker buildx build -f docker/Dockerfile --push "${tags[@]}" \
             --build-arg TOOLCHAIN="$TOOLCHAIN_IMAGE:${{ needs.toolchain.outputs.tag }}" \
             --build-arg STRIX_VLLM_REF="$fork" \
+            --build-arg LIBSTRIX_REF="$GITHUB_SHA" \
             --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --build-arg MAX_JOBS=4 .
+            --build-arg MAX_JOBS=4 \
+            --cache-from "type=registry,ref=$CACHE_IMAGE" \
+            --cache-to "type=registry,ref=$CACHE_IMAGE,mode=max,image-manifest=true,oci-mediatypes=true" .
           echo "pushed $IMAGE:$tag"
       - name: Release with the CHANGELOG.md entry
         if: github.ref_type == 'tag'

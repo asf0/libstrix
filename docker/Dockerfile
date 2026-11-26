@@ -11,6 +11,12 @@
 # clone with STRIX_VLLM_LOCAL=/path/to/strix-vllm):
 #
 #   docker build --build-context strix-vllm-local=/tmp/strix-vllm.git ...
+#
+# Layers, least to most often changed, so an update re-downloads only what
+# changed: ROCm, torch, Triton and the pinned packages (all from the toolchain
+# stage: they change only with the pins), the NPU shim, vLLM, libstrix, then
+# the commit stamps. vLLM and libstrix compile through ccache in a BuildKit
+# cache mount, so a local rebuild recompiles only the files that changed.
 
 ARG UBUNTU=ubuntu:26.04
 # The builder stage starts from this: the local `toolchain` stage by default,
@@ -32,6 +38,9 @@ COPY npu /src/libstrix/npu
 RUN cd /src/libstrix/npu && cargo build --release \
     && install -D target/release/libstrix_npu.so /stage/libstrix_npu.so
 
+# >>> toolchain: .github/workflows/image.yml keys the prebuilt toolchain image
+# on the text from here to "<<< toolchain" plus docker/constraints.txt, so
+# edits elsewhere in this file do not rebuild it.
 FROM ${UBUNTU} AS base
 ENV DEBIAN_FRONTEND=noninteractive \
     VIRTUAL_ENV=/opt/venv \
@@ -77,30 +86,9 @@ COPY docker/constraints.txt /tmp/constraints.txt
 # --ignore-requires-python: amd-quark's py3 wheel is capped below 3.14 but runs.
 RUN pip install --no-deps --ignore-requires-python -r /tmp/constraints.txt \
     && python -c "import torch; assert torch.version.hip, torch.__version__"
+# <<< toolchain
 
-FROM ${TOOLCHAIN} AS builder
-ARG STRIX_VLLM_REPO=https://github.com/asf0/strix-vllm.git
-ARG STRIX_VLLM_REF=dev
-ARG MAX_JOBS=8
-RUN --mount=type=bind,from=strix-vllm-local,target=/mnt/strix-vllm \
-    if git -C /mnt/strix-vllm rev-parse --git-dir >/dev/null 2>&1; then \
-        git -c safe.directory='*' clone /mnt/strix-vllm /src/strix-vllm; \
-    else \
-        git clone --filter=blob:none "$STRIX_VLLM_REPO" /src/strix-vllm; \
-    fi \
-    && git -C /src/strix-vllm checkout "$STRIX_VLLM_REF" \
-    && git -C /src/strix-vllm rev-parse HEAD > /src/strix-vllm.ref
-# The fork clone has no upstream release tags; stamp the next release (the fork
-# follows upstream main) plus the fork commit instead of setuptools-scm's 0.1.devN
-# fallback.
-ARG VLLM_BASE_VERSION=0.35.0.dev0
-RUN cd /src/strix-vllm \
-    && VLLM_VERSION_OVERRIDE="$VLLM_BASE_VERSION+strix.g$(cut -c1-10 /src/strix-vllm.ref)" \
-       MAX_JOBS=$MAX_JOBS pip install --no-build-isolation --no-deps .
-COPY . /src/libstrix
-RUN cd /src/libstrix && MAX_JOBS=$MAX_JOBS ./build.sh \
-    && pip install --no-build-isolation --no-deps . \
-    && (git -c safe.directory='*' -C /src/libstrix rev-parse HEAD || echo unknown) > /src/libstrix.ref
+FROM ${TOOLCHAIN} AS runtime-libs
 # The runtime needs only _rocm_sdk_core and _rocm_sdk_libraries: no recipe
 # loads a file from _rocm_sdk_devel, and nothing compiles with hipcc at
 # runtime (Triton has its own LLVM and builds its launcher with gcc; the image
@@ -109,9 +97,10 @@ RUN cd /src/libstrix && MAX_JOBS=$MAX_JOBS ./build.sh \
 # tools, headers and MLIR (comgr links only libLLVM and libclang-cpp; the clang
 # resource headers and device bitcode stay for hiprtc), hipify, rocgdb and its
 # per-Python bindings for versions other than 3.14.
-# The big, rarely-changing trees move to /stage so the runtime stage copies
-# each as its own layer: an update to vLLM or libstrix then re-downloads only
-# the last layer, and no layer approaches the registry's 10 GB limit.
+# This stage depends only on the toolchain, so its layers keep their digests
+# from one build to the next until the pins change. The big trees move to
+# /stage so the runtime stage copies each as its own layer (no layer near the
+# registry's 10 GB limit); what stays in /opt/venv is the pinned packages.
 RUN mkdir -p /stage/rocm \
     && mv "$SP"/_rocm_sdk_core "$SP"/_rocm_sdk_libraries /stage/rocm/ \
     && rm -rf "$SP"/_rocm_sdk_devel \
@@ -126,12 +115,67 @@ RUN mkdir -p /stage/rocm \
         _rocm_sdk_core/lib/python3.1[0-3] \
     && mv "$SP/torch" "$SP/triton" /stage/
 
+FROM ${TOOLCHAIN} AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends ccache \
+    && rm -rf /var/lib/apt/lists/*
+# ccache in a BuildKit cache mount (kept across local builds, not in the image).
+# vLLM's setup.py uses ccache when it is installed; libstrix's CMake reads the
+# launcher variables. BASEDIR/NOHASHDIR keep hits across source directories.
+ENV CCACHE_DIR=/root/.cache/ccache \
+    CCACHE_BASEDIR=/src \
+    CCACHE_NOHASHDIR=true \
+    CCACHE_MAXSIZE=20G \
+    CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    CMAKE_HIP_COMPILER_LAUNCHER=ccache
+ARG STRIX_VLLM_REPO=https://github.com/asf0/strix-vllm.git
+ARG STRIX_VLLM_REF=dev
+RUN --mount=type=bind,from=strix-vllm-local,target=/mnt/strix-vllm \
+    if git -C /mnt/strix-vllm rev-parse --git-dir >/dev/null 2>&1; then \
+        git -c safe.directory='*' clone /mnt/strix-vllm /src/strix-vllm; \
+    else \
+        git clone --filter=blob:none "$STRIX_VLLM_REPO" /src/strix-vllm; \
+    fi \
+    && git -C /src/strix-vllm checkout "$STRIX_VLLM_REF" \
+    && git -C /src/strix-vllm rev-parse HEAD > /src/strix-vllm.ref
+# The fork clone has no upstream release tags; stamp the next release (the fork
+# follows upstream main) plus the fork commit instead of setuptools-scm's 0.1.devN
+# fallback.
+ARG VLLM_BASE_VERSION=0.35.0.dev0
+ARG MAX_JOBS=8
+RUN --mount=type=cache,target=/root/.cache/ccache,id=strix-ccache \
+    cd /src/strix-vllm \
+    && VLLM_VERSION_OVERRIDE="$VLLM_BASE_VERSION+strix.g$(cut -c1-10 /src/strix-vllm.ref)" \
+       MAX_JOBS=$MAX_JOBS pip install --no-build-isolation --no-deps . \
+    && ccache --show-stats | grep -E "Hits|Misses" || true
+# Kernels first, from only the files they compile from: an edit to the docs,
+# recipes, tests or Python does not recompile them.
+COPY CMakeLists.txt build.sh /src/libstrix/
+COPY csrc /src/libstrix/csrc
+RUN --mount=type=cache,target=/root/.cache/ccache,id=strix-ccache \
+    cd /src/libstrix && MAX_JOBS=$MAX_JOBS ./build.sh
+COPY pyproject.toml LICENSE NOTICE /src/libstrix/
+COPY LICENSES /src/libstrix/LICENSES
+COPY python /src/libstrix/python
+ARG LIBSTRIX_REF=unknown
+RUN cd /src/libstrix && pip install --no-build-isolation --no-deps . \
+    && echo "$LIBSTRIX_REF" > /src/libstrix.ref
+# vLLM's and libstrix's installed files (their RECORD), each staged as a tree
+# the runtime stage copies over / as its own layer.
+RUN python - <<'EOF'
+import importlib.metadata as md, os, shutil
+sp = os.environ["SP"]
+for dist, dest in (("vllm", "/stage/vllm"), ("libstrix", "/stage/libstrix")):
+    n = 0
+    for f in md.distribution(dist).files:
+        src = os.path.normpath(os.path.join(sp, str(f)))
+        if os.path.isfile(src):
+            os.makedirs(os.path.dirname(dest + src), exist_ok=True)
+            shutil.copy2(src, dest + src)
+            n += 1
+    print(dist, n, "files")
+EOF
+
 FROM base AS runtime
-ARG BUILD_DATE
-LABEL org.opencontainers.image.source=https://github.com/asf0/libstrix \
-      org.opencontainers.image.description="vLLM (asf0/strix-vllm) with the libstrix plugin for AMD Strix Halo (gfx1151)" \
-      org.opencontainers.image.licenses="Apache-2.0 AND MIT" \
-      org.opencontainers.image.created=${BUILD_DATE}
 RUN apt-get update && apt-get install -y --no-install-recommends tini \
     && rm -rf /var/lib/apt/lists/*
 # Without the devel tree the ROCm root is _rocm_sdk_core.
@@ -139,21 +183,29 @@ ENV ROCM_PATH=${SP}/_rocm_sdk_core \
     ROCM_HOME=${SP}/_rocm_sdk_core \
     HIP_PATH=${SP}/_rocm_sdk_core \
     LD_LIBRARY_PATH=${SP}/torch/lib:${SP}/_rocm_sdk_core/lib:${SP}/_rocm_sdk_libraries/lib
-# Layers from least to most often changed (see the /stage step above).
-# Both _rocm_sdk_* trees in one layer.
-COPY --from=builder /stage/rocm/ ${SP}/
-COPY --from=builder /stage/torch ${SP}/torch
-COPY --from=builder /stage/triton ${SP}/triton
-COPY --from=builder /opt/venv /opt/venv
-COPY --from=builder /src/strix-vllm.ref /src/libstrix.ref /opt/strix/
+# Layers from least to most often changed (see the header). Both _rocm_sdk_*
+# trees in one layer.
+COPY --from=runtime-libs /stage/rocm/ ${SP}/
+COPY --from=runtime-libs /stage/torch ${SP}/torch
+COPY --from=runtime-libs /stage/triton ${SP}/triton
+COPY --from=runtime-libs /opt/venv /opt/venv
 COPY --from=npu /stage/libstrix_npu.so /opt/strix/lib/libstrix_npu.so
 COPY docker/entrypoint.sh /opt/strix/entrypoint.sh
+COPY --from=builder /stage/vllm/ /
+COPY --from=builder /stage/libstrix/ /
+COPY --from=builder /src/strix-vllm.ref /src/libstrix.ref /opt/strix/
 # Compile, Triton and HF caches go to /cache; the recipes mount a persistent
 # host directory there by default, or a tmpfs for local test runs.
 ENV XDG_CACHE_HOME=/cache \
     VLLM_CACHE_ROOT=/cache/vllm \
     TRITON_CACHE_DIR=/cache/triton \
     HF_HOME=/cache/huggingface
-RUN cd /tmp && python -c "import vllm, strix, strix_vllm; print('vllm', vllm.__version__, '| strix kernels', len(strix.kernels()))"
+# A check, not a layer of files: no bytecode written.
+RUN cd /tmp && PYTHONDONTWRITEBYTECODE=1 python -c "import vllm, strix, strix_vllm; print('vllm', vllm.__version__, '| strix kernels', len(strix.kernels()))"
+ARG BUILD_DATE
+LABEL org.opencontainers.image.source=https://github.com/asf0/libstrix \
+      org.opencontainers.image.description="vLLM (asf0/strix-vllm) with the libstrix plugin for AMD Strix Halo (gfx1151)" \
+      org.opencontainers.image.licenses="Apache-2.0 AND MIT" \
+      org.opencontainers.image.created=${BUILD_DATE}
 EXPOSE 8000
 ENTRYPOINT ["/usr/bin/tini", "--", "/opt/strix/entrypoint.sh"]

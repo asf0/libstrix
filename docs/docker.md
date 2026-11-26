@@ -167,8 +167,26 @@ the 117 GiB cap.
 
 ## Building the image
 
-About 40 minutes, mostly vLLM's C++: `docker/build-and-push.sh`, or
-`docker build -f docker/Dockerfile .` from the repo root.
+`docker/build-and-push.sh`, or `docker build -f docker/Dockerfile .` from
+the repo root. From a prebuilt toolchain a cold build takes about 15 minutes
+on the Strix Halo (vLLM's C++ about 6 of them, 8 jobs); a rebuild after a
+libstrix change about 10 seconds. The script tags
+`ghcr.io/asf0/strix-vllm:<libstrix>-<fork>`, and `:latest` only with
+`PUSH=1`, so a local build does not replace the image the recipes run.
+
+**Layers and caches.** The image is layered from least to most often changed:
+ROCm, torch, Triton and the pinned Python packages (they change only with
+`docker/constraints.txt` or the toolchain block of the Dockerfile), the NPU
+shim, vLLM, libstrix, then the commit stamps. An update re-downloads only the
+layers after the first one that changed. vLLM and libstrix compile through
+ccache in a BuildKit cache mount, so a local rebuild recompiles only the
+files that changed, and libstrix's kernels compile from `csrc/`,
+`CMakeLists.txt` and `build.sh` alone: an edit elsewhere does not recompile
+them. `TOOLCHAIN=<image> docker/build-and-push.sh` starts from a prebuilt
+toolchain stage (`docker buildx build --target toolchain`) instead of
+building it. In CI the toolchain image is rebuilt only when its block or the
+pins change, and the image job keeps its BuildKit cache in
+`ghcr.io/asf0/strix-vllm-buildcache`.
 
 **Releases.** GitHub Actions builds the published image (`.github/workflows/image.yml`,
 no GPU needed). Pushing a tag `vX.Y.Z` builds the strix-vllm commit pinned in
@@ -194,7 +212,7 @@ flydsl and aiter. No recipe needs them.
 - To serve them with tilelang, build an image that keeps the compiler and
   installs tilelang: keep `_rocm_sdk_core/lib/llvm/bin`,
   `_rocm_sdk_core/lib/llvm/include` and clang's `libclang_rt` builtins in the
-  `/stage` step of `docker/Dockerfile`, link `_rocm_sdk_core/amdgcn` to
+  `runtime-libs` stage of `docker/Dockerfile`, link `_rocm_sdk_core/amdgcn` to
   `lib/llvm/amdgcn` (where clang looks for the device libraries), add the
   unversioned `lib*.so` names `hipcc` links against, and `pip install
   tilelang==0.1.15 z3-solver==4.15.4.0`.
