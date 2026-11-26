@@ -1,5 +1,5 @@
-"""bmm_nvfp4 (vllm/models/inkling2/amd/ops/triton_bmm.py) against a torch
-reference that decodes the same NVFP4 bytes. Run inside the image:
+"""libstrix's Inkling 2 expert GEMMs (NVFP4 and MXFP8) against a torch
+reference that decodes the same bytes, and the MXFP8 port's bmm. Run inside the image:
 
     python -m pytest -q bench/container/test_inkling2_nvfp4_bmm.py
 """
@@ -7,7 +7,7 @@ reference that decodes the same NVFP4 bytes. Run inside the image:
 import pytest
 import torch
 from strix_vllm.inkling2_moe import gemm_mxfp8, gemm_nvfp4, pretile_nvfp4
-from vllm.models.inkling2.amd.ops.triton_bmm import ExpertPlan, bmm, bmm_nvfp4
+from vllm.models.inkling2.amd.ops.triton_bmm import ExpertPlan, bmm
 
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 
@@ -20,7 +20,6 @@ def decode(weight, scale, amax, denominator):
     return values * blocks * (amax / denominator)[:, None, None]
 
 
-@pytest.mark.parametrize("bf16_act", [False, True])
 @pytest.mark.parametrize(
     "tile,rows",
     [
@@ -36,7 +35,7 @@ def decode(weight, scale, amax, denominator):
         (512, 400),
     ],
 )
-def test_bmm_nvfp4_matches_reference(tile, rows, bf16_act):
+def test_gemm_nvfp4_matches_reference(tile, rows):
     torch.manual_seed(0)
     num_experts, n, k = 3, 256, 384
     weight = torch.randint(0, 256, (num_experts, n, k // 2), dtype=torch.uint8)
@@ -53,16 +52,11 @@ def test_bmm_nvfp4_matches_reference(tile, rows, bf16_act):
         tiles[max_ctas + t] = t * tile + rows
     tiles[2 * max_ctas] = max_ctas
     act = (torch.randn(plan.rows, k) * 2).to(torch.float8_e4m3fn)
-    act_scale = torch.full((plan.rows * k // 32,), 127, dtype=torch.uint8)
 
     dev = torch.device("cuda")
     gpu = [t.to(dev) for t in (weight, scale, amax, denominator, tiles)]
-    if bf16_act:  # libstrix's gfx1151 kernels
-        gpu[0], gpu[1] = pretile_nvfp4(gpu[0], gpu[1])
-        out = gemm_nvfp4(act.to(torch.bfloat16).to(dev), *gpu, plan)
-    else:  # the port's portable path
-        out = bmm_nvfp4(act.to(dev), act_scale.to(dev), *gpu, plan)
-    out = out.float().cpu()
+    gpu[0], gpu[1] = pretile_nvfp4(gpu[0], gpu[1])
+    out = gemm_nvfp4(act.to(torch.bfloat16).to(dev), *gpu, plan).float().cpu()
 
     w = decode(weight, scale, amax, denominator)
     for t, e in enumerate(experts):

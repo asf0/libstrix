@@ -139,6 +139,38 @@ def _cache_factor(active: bool) -> str:
     return h.hexdigest()[:16]
 
 
+class _GdnRecoverSSM:
+    """The Triton kernels of GDN RecoverSSM (strix_vllm.gdn_recoverssm), for
+    the strix-vllm fork's seam. Imported on first use: the plugin loads before
+    vLLM has finished importing."""
+
+    @staticmethod
+    def verify(*args, **kwargs):
+        from strix_vllm.gdn_recoverssm import gdn_recoverssm_verify
+
+        return gdn_recoverssm_verify(*args, **kwargs)
+
+    @staticmethod
+    def create_commit_context(layers, *, spec_query_len, max_num_reqs):
+        from strix_vllm.gdn_recoverssm import GDNRecoverSSMCommitContext
+
+        return GDNRecoverSSMCommitContext.create(
+            layers, spec_query_len=spec_query_len, max_num_reqs=max_num_reqs
+        )
+
+
+def _register_gdn_recoverssm() -> None:
+    """--use-replayssm on Qwen GDN needs these kernels, so they register
+    whatever STRIX_DISABLE says. A fork without the seam carries them itself."""
+    try:
+        from vllm.model_executor.layers.mamba.ops import gdn_recoverssm as seam
+    except ImportError:
+        return
+    register_provider = getattr(seam, "register_gdn_recoverssm", None)
+    if register_provider is not None:
+        register_provider(_GdnRecoverSSM())
+
+
 def register() -> None:
     global _registered
     if _registered:
@@ -158,6 +190,13 @@ def register() -> None:
     envs.environment_variables.setdefault(CACHE_FACTOR, lambda: key)
 
     logger = init_logger(f"vllm.{__name__}")
+    # What a model needs to load or run at all (a checkpoint format, the
+    # RecoverSSM kernels): registered whatever STRIX_DISABLE says, so stock
+    # runs it too.
+    from strix_vllm import quantization
+
+    quantization.register()
+    _register_gdn_recoverssm()
     if not current_platform.is_rocm():
         return
     if not gfx1151:

@@ -9,6 +9,9 @@ From vLLM (https://github.com/vllm-project/vllm), Copyright contributors to
 the vLLM project, including gfx1151 changes from the asf0/strix-vllm fork:
 
   python/strix_vllm/triton_unified_attention.py   vendored
+  python/strix_vllm/quantization.py               dgpp_mixed config, moved
+  python/strix_vllm/gdn_recoverssm.py             GDN RecoverSSM Triton kernels, moved
+  python/strix_vllm/qwen4_exp_triton.py           Qwen4Exp HC combine-norm kernel, moved
   csrc/gemm/w8a16_skinny_gemm.hip                 derived from csrc/rocm/skinny_gemms.cu
   csrc/gemm/w8a8_wmma_gemm.hip                    derived from csrc/rocm/skinny_gemms.cu
 

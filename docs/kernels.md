@@ -5,7 +5,14 @@
 Installing the package registers the `vllm.general_plugins` entry point
 `strix`. It activates only on ROCm + gfx1151 and logs a single line when it
 does. `STRIX_DISABLE=all`, or a comma-separated list of the names below, keeps
-vLLM's own kernels for A/B runs.
+vLLM's own kernels for A/B runs. Two things register whatever `STRIX_DISABLE`
+says, because a model cannot load or run without them: the `dgpp_mixed`
+quantization config (Flint FP8's checkpoint format) and the Triton kernels of
+GDN RecoverSSM (`--use-replayssm`, `python/strix_vllm/gdn_recoverssm.py`),
+which the strix-vllm fork calls through its `register_gdn_recoverssm` seam.
+Inkling 2 Mini's NVFP4 experts have no kernel outside the plugin:
+`STRIX_DISABLE=all` (or `inkling2_moe`) stops that checkpoint at startup, so
+its references are the plugin with the kernel under test turned off.
 
 `dense_w8` and `moe_w4a8` change numerics or memory, so they turn on only for
 the architectures they were measured on (`dense_w8`: Qwen3.8-Flash-Next,
@@ -87,6 +94,7 @@ projection shape turns it off the same way.
 | `qsa_union` | `qsa_union_attn_bf16` | Qwen4Exp QSA sparse attention (`qsa_sparse_paged_attention`) for a single-request prefill of >= 1024 rows: 16 consecutive rows share one union of their selected tokens (1.5x the gfx1151 Triton kernel, more as the context grows) | head_dim 256, GQA 12, bf16, int8_per_token_head or fp8 cache, one request of at most 131072 positions (its own length, whatever `--max-model-len` is; past that an int8 or fp8 cache is converted to a bf16 copy for vLLM's kernel); an int8 cache is dequantized into a compact fp16 K/V copy that the gather reads (one pass per layer, a host sync for the length), as `STRIX_QSA_UNION_F16=1` does for bf16; an fp8 cache (unit scales) is cast to a bf16 copy of the request's pages (the same speed as bf16: 250 vs 251 ms per layer at 16k rows and 16k context, where vLLM's fp8 kernel takes 1894 ms) |
 | `qsa_indexer` | `qsa_indexer_bf16` | the QSA indexer's paged scores (`qsa_mqa_paged`) for a single-request prefill of >= 128 rows (1.7-1.9x the tl.dot kernel) | 4 indexer heads, head_dim 128, one KV head, bf16, one request |
 | `hc_up_gate_mix` | `hc_up_gate_mix_bf16` | Qwen4Exp hyper-connection up projection fused with `hc_gate_mix` (6.7 -> 5.2 ms per site at 16k rows, no gate in memory) | hc_count 4, bf16, K % 64 == 0, batch >= 512 rows |
+| `hc_combine_norm` | Triton, moved from the fork (`strix_vllm/qwen4_exp_triton.py`) | Qwen4Exp `hc_combine_norm` with one program per row (9.2 -> 5.2 ms at 16k rows) | batch >= 512 rows |
 | `dense_w8` | `w8a16_skinny_gemm` on int8 copies | **decode** copies of unquantized bf16 linears and the LM head: the bf16 weight stays for prefill, batches of <= 5 rows read an int8 copy, and 6-8 rows (a DFlash 2 verify step) on weights of 8M elements or more (Qwen3.8-Flash-Next decode 51 -> 37 ms/step; GSM8K 93 vs 92; LM head at 7 rows 3.3 ms against 5.5 ms bf16) | bf16 2-D weights, K % 16 == 0; each copy is checked against bf16 at load |
 | `draft_head` | strix FP8 linear on vLLM's `quantized_lm_head_copy` | a DFlash or DSpark draft that shares the target's LM head gets a private FP8 copy of it when its speculative config asks for an FP8 draft (`"quantization": "fp8_per_channel"`); the target keeps its bf16 head | bf16 LM head without bias |
 | `inkling2_moe` | `nvfp4_moe_wmma`, `mxfp8_moe_wmma` (prefill, fp16 WMMA with the e2m1 / e4m3 decode at the LDS commit), `nvfp4_moe_gemv` (decode-sized tiles of <= 16 rows) | the ROCm Inkling2 port's MoE forward (`Inkling2MoE.forward`): bf16 rows instead of MXFP8 activations, the experts rewritten in place to a pre-tiled layout, the port's softcapped SwiGLU and the routing weights in the w13 epilogue (hardware exp2 / rcp), w13 reading token rows directly | NVFP4 experts with e4m3 block scales and MXFP8 experts (layers 20-23 of Inkling 2 Mini, scale bytes in the fp16 range), K % 64 == 0, N % 128 == 0 |
@@ -130,7 +138,8 @@ instead, which the Docker image ships:
 - streaming Qwen3.8-Flash-Next's n-gram table from disk
   ([docker.md](docker.md#recipes));
 - `--use-replayssm` on Qwen GDN models (upstream rejects the flag for Qwen3.5
-  layers);
+  layers): the fork has the scheduler and cache-layout side and a seam, the
+  plugin supplies the kernels;
 - the KV cache layout for draft models: a draft's layers get their own cache
   pool at their own page size instead of padding every page of the target up
   to theirs (with ReplaySSM, the 35B with DFlash 2 goes from 1.45M to 3.92M

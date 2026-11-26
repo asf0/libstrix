@@ -4,7 +4,12 @@ import sys
 import torch
 sys.path.insert(0, "/work/bench/kernels")
 from nvfp4_bmm_v2 import bmm_nvfp4_gemv_v6  # noqa: E402
-from vllm.models.inkling2.amd.ops.triton_bmm import ExpertPlan, bmm_nvfp4  # noqa: E402
+from vllm.models.inkling2.amd.ops.triton_bmm import ExpertPlan  # noqa: E402
+
+try:  # the port's NVFP4 BMM; removed from the strix-vllm fork
+    from vllm.models.inkling2.amd.ops.triton_bmm import bmm_nvfp4  # noqa: E402
+except ImportError:
+    bmm_nvfp4 = None
 
 dev = torch.device("cuda")
 for name, n, k in (("w13", 2304, 2304), ("w2", 2304, 1152)):
@@ -23,8 +28,12 @@ for name, n, k in (("w13", 2304, 2304), ("w2", 2304, 1152)):
         t[16] = 8
         tile_sets.append(t.to(dev))
     act = torch.randn(plan.rows, k, device=dev).to(torch.bfloat16)
-    ref = bmm_nvfp4(act, None, weight, scale, amax, den, tile_sets[0], plan)
-    variants = [("current", lambda t: bmm_nvfp4(act, None, weight, scale, amax, den, t, plan))]
+    if bmm_nvfp4 is not None:
+        ref = bmm_nvfp4(act, None, weight, scale, amax, den, tile_sets[0], plan)
+        variants = [("current", lambda t: bmm_nvfp4(act, None, weight, scale, amax, den, t, plan))]
+    else:  # reference: the first v6 variant
+        ref = bmm_nvfp4_gemv_v6(act, weight, scale, amax, den, tile_sets[0], plan)
+        variants = []
     for bn in (16, 32, 64):
         for bk in (256, 512, 1024):
             for nw in (2, 4, 8):

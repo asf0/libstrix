@@ -11,7 +11,12 @@ import torch
 sys.path.insert(0, "/work/bench/kernels")
 from nvfp4_bmm_v2 import bmm_nvfp4_dequant, bmm_nvfp4_v4  # noqa: E402
 
-from vllm.models.inkling2.amd.ops.triton_bmm import ExpertPlan, bmm_nvfp4  # noqa: E402
+from vllm.models.inkling2.amd.ops.triton_bmm import ExpertPlan  # noqa: E402
+
+try:  # the port's NVFP4 BMM; removed from the strix-vllm fork
+    from vllm.models.inkling2.amd.ops.triton_bmm import bmm_nvfp4  # noqa: E402
+except ImportError:
+    bmm_nvfp4 = None
 
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 dev = torch.device("cuda")
@@ -65,7 +70,7 @@ else:
           w = decode(weight, scale, amax, denominator)
           ref = torch.cat([act[t * tile : t * tile + rows].float() @ w[e].T for t, e in enumerate(experts)])
           for label, fn in (
-              ("v1", lambda: bmm_nvfp4(*args, plan)),
+              *([("v1", lambda: bmm_nvfp4(*args, plan))] if bmm_nvfp4 else []),
               ("v4 64x64 w4", lambda: bmm_nvfp4_v4(*args, plan, bm=64, bn=64, num_warps=4)),
               *[
                   (f"deq {bm}x{bn} w{nw}", (lambda bm=bm, bn=bn, nw=nw: bmm_nvfp4_dequant(*args, plan, bm=bm, bn=bn, num_warps=nw)))

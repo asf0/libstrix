@@ -98,7 +98,7 @@ def test_matches_reference(h, hv, lens, state_dtype):
 @pytest.mark.parametrize("h,hv", CASES)
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 def test_matches_triton(h, hv, state_dtype):
-    gdn = pytest.importorskip("vllm.model_executor.layers.mamba.ops.gdn_recoverssm")
+    gdn = pytest.importorskip("strix_vllm.gdn_recoverssm")  # the Triton kernel
     lens = [4, 8, 2]
     q, k, v, a, b, a_log, dt, state, cu, idx = inputs(h, hv, lens, state_dtype, 1)
     s = 8
@@ -146,3 +146,24 @@ def test_wrapper_routes_and_falls_back():
     verify(q, k, v, a, b, a_log, dt, state, corr, keys, decays,
            cu.to(torch.int32), idx, 7)
     assert len(calls) == 2
+
+
+def test_seam_gets_the_triton_kernels(monkeypatch):
+    """A fork with the RecoverSSM seam gets libstrix's kernels from register;
+    an older fork (kernels in vLLM, no seam) is left alone."""
+    import strix_vllm
+
+    seam = pytest.importorskip("vllm.model_executor.layers.mamba.ops.gdn_recoverssm")
+    if not hasattr(seam, "register_gdn_recoverssm"):
+        strix_vllm._register_gdn_recoverssm()  # no-op
+        pytest.skip("this vLLM carries the RecoverSSM kernels itself")
+    from strix_vllm import gdn_recoverssm as kernels
+
+    monkeypatch.setattr(seam, "_provider", None)
+    with pytest.raises(RuntimeError, match="libstrix"):
+        seam.get_gdn_recoverssm_provider()
+    strix_vllm._register_gdn_recoverssm()
+    seen = []
+    monkeypatch.setattr(kernels, "gdn_recoverssm_verify", lambda *a, **k: seen.append(a))
+    seam.gdn_recoverssm_verify(1, 2)
+    assert seen == [(1, 2)]
