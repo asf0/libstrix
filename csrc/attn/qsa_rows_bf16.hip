@@ -25,7 +25,8 @@ namespace {
 // RB rows x HB KV heads per block, one wave pair each. One row with both of
 // its KV heads (a token's K / V for the two heads are neighbours) and the
 // 16-key V^T pitch measured best: 117 ms per layer on a real 15k-row chunk at
-// 135k context, against 124 (pitch 24), 130 (2 rows) and 174 (1 row, 1 head).
+// 135k context, against 124 (pitch 24), 130 (2 rows) and 157 (1 row, 1 head
+// per block at pitch 16: a token's K / V lines are no longer shared).
 template <int D, int G, int RB, int HB, int PV = 16>
 __global__ __launch_bounds__(RB * HB * (D / 128) * kWave)
 __attribute__((amdgpu_waves_per_eu(4))) void qsa_rows_attn_kernel(

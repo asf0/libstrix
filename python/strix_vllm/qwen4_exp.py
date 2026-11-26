@@ -21,7 +21,8 @@ vLLM's AMD QSA module imports `qsa_sparse_paged_attention` from
 attribute is enough.
 
 qsa_indexer: the QSA indexer's paged scores for a single-request prefill on
-strix::qsa_indexer_bf16 (1.7-1.9x vLLM's tl.dot kernel, 4k to 128k context);
+strix::qsa_indexer_bf16 (1.1-1.7x vLLM's Triton kernel at 16k rows over 16k
+to 128k context);
 vLLM's qsa_select_paged_tokens calls `qsa_mqa_paged` from its module globals.
 
 hc_up_gate_mix: the hyper-connection up projection fused with the gated mix

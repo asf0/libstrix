@@ -11,6 +11,7 @@ over two requests at `--split` so one tile straddles a request boundary;
 
 import argparse
 
+import strix  # noqa: F401
 import torch
 import triton
 
@@ -78,6 +79,22 @@ def main() -> None:
         f"visible equal={bool((vis == ref_vis).all())} mask equal={same_mask} "
         f"max|d|={err:.3g} (|ref| max {ref_logits[finite].abs().max().item():.3g})"
     )
+    if a.split == 0 and hasattr(torch.ops.strix, "qsa_indexer_bf16"):
+        out = torch.empty_like(ref_logits)
+        vis2 = torch.empty_like(ref_vis)
+
+        def strix_idx():
+            torch.ops.strix.qsa_indexer_bf16(
+                out, vis2, q, k_cache, page_table[0], positions, seq_lens, a.ratio,
+                float(a.head_dim) ** 0.5,
+            )
+
+        t_strix = timed(strix_idx)
+        cols = torch.arange(out.shape[1], device=dev)[None, :]
+        ok = cols < ref_vis[:, None]  # entries past a row's visible keys are undefined in vLLM's
+        err2 = (out[ok] - ref_logits[ok]).abs().max().item()
+        err2 = max(err2, float(not bool((vis2 == ref_vis).all())))
+        print(f"  strix qsa_indexer_bf16 {t_strix:.2f} ms ({t_old / t_strix:.1f}x old); max|d|={err2:.3g}")
 
 
 if __name__ == "__main__":

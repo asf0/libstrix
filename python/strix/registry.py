@@ -1107,8 +1107,9 @@ KERNELS: list[Kernel] = [
         "qsa_indexer_bf16",
         "Qwen4Exp QSA indexer scores over the paged compressed-key cache: "
         "64 x 64 WMMA tiles, the key tile in LDS shared by the four heads, "
-        "relu per head, -inf past each row's visible keys. 1.7-1.9x the "
-        "tl.dot kernel from 4k to 128k context",
+        "relu per head, the grid walking key tiles fastest (blocks in flight "
+        "share Q rows in L2); entries past a row's visible keys unwritten. "
+        "1.1-1.7x vLLM's Triton kernel at 16k rows, 16k to 128k context",
         {
             "indexer_heads": 4,
             "indexer_head_dim": 128,

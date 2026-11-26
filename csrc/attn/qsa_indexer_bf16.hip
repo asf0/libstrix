@@ -2,14 +2,14 @@
 // Qwen3.8-Flash-Next QSA indexer scores for a single-request prefill:
 //   logits[r, c] = sum_h relu(q[r, h] . k[c]) / divisor   for c < visible[r]
 //   visible[r]   = min((pos[r] + 1) / ratio, seq_len / ratio)
-// and -inf past it, over the paged compressed-key cache (one KV head,
-// head_dim 128). The work is quadratic in the context (at 96k tokens ~2.4
+// (entries past it are undefined and not written), over the paged
+// compressed-key cache (one KV head, head_dim 128). The work is quadratic in the context (at 96k tokens ~2.4
 // TFLOP per 16k-row chunk), where vLLM's Triton tl.dot version runs ~5 TF.
 //
 // A block owns 64 rows x 64 keys; the key tile is staged in LDS once and
 // serves all heads, Q fragments are read from global (reused across key
-// tiles through L2). 1.7x vLLM's Triton tl.dot kernel from 4k to 128k. Tiles past the last row's
-// visible keys store -inf only.
+// tiles through L2: the grid walks key tiles fastest). Tiles past the last
+// row's visible keys return at once.
 #include <ATen/hip/HIPContext.h>
 #include <torch/all.h>
 
@@ -34,27 +34,26 @@ __global__ __launch_bounds__(WM* WN* kWave) void qsa_indexer_kernel(
   constexpr int kLoads = (kChunks + kThreads - 1) / kThreads;
   __shared__ __attribute__((aligned(16))) uint16_t s_k[BN * kPitch];
 
-  const int r0 = blockIdx.x * BM, c0 = blockIdx.y * BN;
+  // Consecutive blocks walk the key tiles of one row block, so the blocks in
+  // flight share their Q rows in L2.
+  const int r0 = blockIdx.y * BM, c0 = blockIdx.x * BN;
+  const bool first_col = blockIdx.x == 0;
   const int tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
   const int wm = wave % WM, wn = wave / WM;
   const int seq_vis = *seq_len_ptr / ratio;
   auto visible_of = [&](int r) -> int {
     return int(min<int64_t>((pos[r] + 1) / ratio, seq_vis));
   };
-  if (blockIdx.y == 0)
+  if (first_col)
     for (int i = tid; i < BM; i += kThreads)
       if (r0 + i < rows) visible_out[r0 + i] = visible_of(r0 + i);
   const int last = min(rows, r0 + BM) - 1;
   // Positions grow with the row within a request: the last row sees most.
   int max_vis = 0;
   for (int i = r0; i <= last; ++i) max_vis = max(max_vis, visible_of(i));
-  if (c0 >= max_vis) {
-    for (int i = tid; i < BM * BN; i += kThreads) {
-      const int r = r0 + i / BN, c = c0 + i % BN;
-      if (r < rows && c < columns) logits[int64_t(r) * ld_logits + c] = -INFINITY;
-    }
-    return;
-  }
+  // Entries at or past a row's visible keys are undefined (vLLM's contract
+  // for qsa_mqa_paged; its top-k kernels take visible_blocks): not written.
+  if (c0 >= max_vis) return;
 
 #pragma unroll
   for (int i = 0; i < kLoads; ++i) {
@@ -122,8 +121,7 @@ __global__ __launch_bounds__(WM* WN* kWave) void qsa_indexer_kernel(
 #pragma unroll
       for (int j = 0; j < FN; ++j) {
         const int c = c0 + wn * TN + j * 16 + acc_col(lane);
-        if (c < columns)
-          logits[int64_t(r) * ld_logits + c] = c < vis ? score[i][j][e] * inv_div : -INFINITY;
+        if (c < vis) logits[int64_t(r) * ld_logits + c] = score[i][j][e] * inv_div;
       }
     }
 }
@@ -156,9 +154,12 @@ void qsa_indexer_bf16(torch::Tensor& logits, torch::Tensor& visible,
   const int rows = int(q.size(0)), columns = int(logits.size(1));
   if (rows == 0 || columns == 0) return;
   // 64 x 64, 4 waves: larger tiles (64 x 128, 128 x 64, 32 x 128) were slower.
+  // Key tiles fastest in the grid (consecutive blocks share their Q rows in L2):
+  // 143 -> 47 ms at 16k rows over 64k context (64 x 128 / 128 x 128 / 128 x 64
+  // that way: 47 / 58 / 55 ms).
   constexpr int BM = 64, BN = 64, WM = 2, WN = 2;
   qsa_indexer_kernel<BM, BN, WM, WN, 4>
-      <<<dim3((rows + BM - 1) / BM, (columns + BN - 1) / BN), WM * WN * kWave, 0,
+      <<<dim3((columns + BN - 1) / BN, (rows + BM - 1) / BM), WM * WN * kWave, 0,
          at::hip::getCurrentHIPStream()>>>(
           logits.data_ptr<float>(), visible.data_ptr<int32_t>(),
           reinterpret_cast<const uint16_t*>(q.data_ptr()),
