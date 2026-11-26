@@ -120,10 +120,15 @@ def _wrap_post_conv(orig):
         head_v_dim,
         apply_l2norm=True,
         output_g_exp=False,
+        **extra,
     ):
+        # extra: arguments newer vLLM adds (beta_scale, 2.0 for models with
+        # linear_allow_neg_eigval); the strix kernel computes beta_scale 1.
         supported = (
             apply_l2norm
             and not output_g_exp
+            and set(extra) <= {"beta_scale"}
+            and extra.get("beta_scale", 1.0) == 1.0
             and head_k_dim == 128
             and head_v_dim == 128
             and _aligned_rows(conv_output)
@@ -138,7 +143,8 @@ def _wrap_post_conv(orig):
             "strix"
             if supported
             else f"vLLM (conv {tuple(conv_output.shape)} {conv_output.stride()}, "
-            f"a {a.dtype} {a.stride()}, l2norm {apply_l2norm}, g_exp {output_g_exp})",
+            f"a {a.dtype} {a.stride()}, l2norm {apply_l2norm}, g_exp {output_g_exp}, "
+            f"{extra})",
         )
         if not supported:
             return orig(
@@ -152,6 +158,7 @@ def _wrap_post_conv(orig):
                 head_v_dim,
                 apply_l2norm,
                 output_g_exp,
+                **extra,
             )
         import strix
 

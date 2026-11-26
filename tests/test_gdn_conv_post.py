@@ -113,3 +113,29 @@ def test_post_conv_matches_vllm(hk, hv, t):
     for name, r, o in zip("qkvgb", ref, got):
         assert o.shape == r.shape and o.dtype == r.dtype, name
         torch.testing.assert_close(o.float(), r.float(), atol=1e-2, rtol=1e-2)
+
+
+def test_post_conv_wrapper_routes_beta_scale():
+    """beta_scale (newer vLLM: 2.0 with linear_allow_neg_eigval) stays on
+    vLLM's kernel; 1.0, or a vLLM that does not pass it, takes strix's."""
+    from strix_vllm.gdn import _wrap_post_conv
+
+    calls = []
+
+    def orig(*args, **kwargs):
+        calls.append(kwargs)
+        return "vllm"
+
+    wrapped = _wrap_post_conv(orig)
+    hk, hv, t = 16, 48, 8
+    conv = torch.randn(t, (2 * hk + hv) * 128, device="cuda").bfloat16()
+    ab = torch.randn(t, 2 * hv, device="cuda").bfloat16()
+    a, b = ab[:, :hv], ab[:, hv:]
+    a_log = torch.rand(hv, device="cuda")
+    dt_bias = torch.randn(hv, device="cuda").bfloat16()
+    args = (conv, a, b, a_log, dt_bias, hk, 128, 128)
+    assert wrapped(*args, beta_scale=2.0) == "vllm"
+    assert calls == [{"beta_scale": 2.0}]
+    assert wrapped(*args, beta_scale=1.0) != "vllm"
+    assert wrapped(*args) != "vllm"
+    assert len(calls) == 1
