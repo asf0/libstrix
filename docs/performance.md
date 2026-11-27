@@ -21,8 +21,7 @@ ratios are the point.
   2.094 / 2.095 s and 21.71 / 21.69 ms at 8k.
 - Batched: N sequences decode together after a 2k or 8k context, 64 steps.
 - Qwen3.8-27B FP8: its int8-KV depths 2k-128k and its 256k point are
-  separate runs; a first int8-KV pass measured 7-15% slow on one session and
-  was repeated.
+  separate runs.
 - Stock is measured to 64k on every model and at 128k and 256k on a
   subset: a single stock request at those depths takes 30 minutes to 4
   hours.
@@ -237,7 +236,9 @@ single-stream decode gain (1.5-1.7×).
 
 Qwen3.8-27B INT8 W8A16 with MTP k=2, int8 KV, 131k context, 40 concurrent
 sequences, gmu 0.7, driven by `vllm bench serve` with 80 requests of 2,048
-tokens in / 1,024 out.
+tokens in / 1,024 out. Every column uses the checkpoint's own MTP head
+(`MTP=2`), not the recipes' default draft model (DFlash 2); see
+[Speculative decoding](#speculative-decoding) for the two side by side.
 
 | metric | 27B INT8 W8A16 + MTP | 27B FP8 + MTP | 35B-A3B FP8 + MTP | Sage-A1.5 FP8 + MTP |
 | --- | ---: | ---: | ---: | ---: |
@@ -283,6 +284,16 @@ the draft model's own cache comes out of the same memory):
 | Muse-Glimmer-30B | 7,046,883 | – | – | 5,380,274 (15 tokens) | – |
 | Flint | 2,981,019 | – | – | 2,678,872 (3 tokens) | – |
 
+- **FP8 drafts:** the table's DFlash 2 drafts are bf16. The Qwen3.6-35B-A3B
+  FP8, Qwen3.8-27B FP8, Muse-Glimmer-30B FP8, gemma-4-26B-A4B FP8 and
+  gemma-4-31B MXFP4 recipes run the draft's layers in FP8
+  (`"quantization": "fp8_per_channel"` in the speculative config) with an FP8
+  copy of the target's LM head for the draft. Served (`spec_equiv.py`, one
+  request, same image, `GPU_UTIL=0.60`), bf16 against FP8 draft: 35B 81.0 ->
+  89.0 tok/s, Muse 23.1 -> 26.2, gemma-4-26B-A4B 55.6 -> 60.1, 27B 27.5 ->
+  29.7, gemma-4-31B 24.3 -> 26.0, with the same acceptance; 8 requests at once
+  are level. Flint gains nothing (FP8 74.9 / 78.9 against bf16 78.4 / 77.9
+  tok/s over two runs) and keeps its bf16 draft.
 - **Draft tokens:** 7 beats 3 on the Qwen models (35B 75.4 / 187.4, 27B 20.4
   / 106.9). Muse is fastest at 15 for one request and at 7 for several
   (`SPEC_TOKENS=7`). LFM2.5 is fastest at 4 for one request and at 6 for
@@ -327,8 +338,8 @@ the draft model's own cache comes out of the same memory):
   4 tokens is the recipe default. Each token checked reads up to 10 more of
   the 512 experts, so longer drafts stop paying past 4-5 although they
   accept more. MTP 2 and DFlash 7 diverge from the no-draft output at one
-  confident position (baseline margin 2.6, same prompt and token); MTP 2 on
-  the previous image (v0.32) does the same, so it is not the draft.
+  confident position (baseline margin 2.6, same prompt and token): two
+  different drafts at the same place, so it is not either draft.
 
 ## Accuracy
 
@@ -817,148 +828,53 @@ Reading it:
   against 1,526 with bf16. fp8 holds about twice the tokens (2,088,315 against
   1,110,621 at 0.85 without MTP) and decodes 3 % slower at 128k (25.5 against
   26.4 tok/s).
-- **MTP 2** (the recipe default) decodes at 40-43 tok/s on real text (the vLLM
-  docs as prompts); the random-token prompts here would accept fewer drafts.
+- **With a draft**, decode is faster on real text than in these
+  random-token runs: MTP 2 decodes at 40-43 tok/s on the vLLM docs as prompts,
+  and the recipe's DFlash 2 (4 tokens) at 48.8 on the prompts of
+  [Speculative decoding](#speculative-decoding).
 
 #### NPU prefill
 
-`STRIX_ENABLE=npu` (see [kernels.md](kernels.md#turning-kernels-on-and-off)),
-kernel 7.4.0-rc1, int8 KV, n-gram table from disk.
+On wherever the host has the XDNA2 NPU and `GPU_UTIL` is at most 0.82
+([docker.md](docker.md#npu-prefill)); how it works is in
+[kernels.md](kernels.md#turning-kernels-on-and-off). Served, the recipe as it
+ships (DFlash 2, prefix caching on, int8 KV for the 27B, fp8 for Flash-Next) at
+`GPU_UTIL=0.80`, the same image with `STRIX_DISABLE=npu` as the baseline; TTFT
+of the second send of each length (NPU off: two server runs, within 0.1 s of
+each other; NPU on: one run); kernel 7.4.0-rc1.
 
-Served (DFlash 2 recipe, a full image build, `GPU_UTIL=0.82` for both, TTFT
-of the second send of each prompt, n-gram rows cached; plugin 4 server runs,
-NPU 3, alternated):
+| model | prompt | NPU off | NPU on |
+| --- | ---: | ---: | ---: |
+| Qwen3.8-Flash-Next AWQ | 17,668 tokens | 11.2 s (1,572 tok/s) | 10.4 s (1,697 tok/s, **+8 %**) |
+| | 35,356 tokens | 23.5 s (1,505 tok/s) | 21.7 s (1,632 tok/s, **+8 %**) |
+| Qwen3.8-27B bf16 | 17,668 tokens | 26.6 s (664 tok/s) | 24.6 s (718 tok/s, **+8 %**) |
+| | 35,356 tokens | 57.2 s (618 tok/s) | 52.3 s (676 tok/s, **+9 %**) |
 
-| prompt | plugin | NPU |
-| --- | ---: | ---: |
-| ~16k tokens (three prompts) | 7.65-7.79 s, mean 7.70 | 7.08-7.20 s, mean 7.14 (-7.3 %) |
-| ~30k tokens (two prompts) | 14.50-14.55 s, mean 14.53 | 13.45-13.47 s, mean 13.46 (-7.4 %) |
-| an image + ~8k tokens of text | 4.41-4.82 s, "Red." | 4.61-4.94 s, "The color of the square is red." |
+Accuracy, NPU on against off on the same image:
 
-Other lengths, three server runs each (TTFT of the second send; prefill
-rate = prompt tokens / TTFT):
-
-| prompt | plugin | NPU |
-| --- | ---: | ---: |
-| 7,643 tokens | 4.16 / 4.16 / 4.15 s (1,839 tok/s) | 4.02 / 4.01 / 4.13 s (1,886 tok/s, -2.5 %) |
-| 57,053 tokens | 32.51 / 32.30 / 32.64 s (1,757 tok/s) | 30.02 / 30.00 / 30.06 s (1,900 tok/s, -7.6 %) |
-| 85,032 tokens | 49.75 / 49.57 / 49.86 s (1,710 tok/s) | 45.66 / 45.64 / 45.75 s (1,861 tok/s, -8.1 %) |
-| an image + ~30k tokens of text | 15.34 / 15.44 / 15.22 s | 14.29 / 14.31 / 14.34 s (-6.7 %), the same answer |
-| two ~16k prompts at once (time to both answers) | 28.57, 23.26, 23.25 s | 22.94, 22.82, 22.75 s, the same answers |
-
-Two requests in one step take the GPU path, so the concurrent case barely
-moves (the first plugin run was slower).
-
-Offline (host venv, 16,384-token chunks, `--gpu-memory-utilization 0.80`,
-prefill time of the second pass over the same prompt):
-
-| depth | plugin (three runs) | plugin, eager | NPU |
-| ---: | ---: | ---: | ---: |
-| 8,192 | 4.195 / 4.203 / 4.217 s | 4.157 s | 3.871 s (-7.6 %) |
-| 16,384 | 9.260 / 9.003 / 9.008 s | 8.942 s | 7.784 s (-14.2 %) |
-| 32,768 | 18.175 / 18.158 / 18.164 s | 18.057 s | 16.271 s (-10.3 %) |
+| model | KLD at 16k (mean / p95) | top-1 | perplexity | DFlash acceptance, six ~7.5k-token prompts |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen3.8-Flash-Next AWQ | 0.0136 / 0.056 | 96.3 % | +0.10 % | 2.71 -> 2.70 tokens per step |
+| Qwen3.8-27B bf16 | 0.00197 / 0.0068 | 98.2 % | +0.21 % | 3.28 -> 3.51 tokens per step |
 
 Reading it:
 
-- **Accuracy** (KLD at 16k against the plugin, 2,048 scored positions): NPU
-  0.0115 mean (p95 0.046), top-1 95.8 %, perplexity +0.47 %; the plugin
-  against itself 0.0090 (p95 0.036), 96.7 %, +0.23 %. The difference is the
-  W8A8 projections, about what the int8 KV cache costs.
+- **Only prefill moves.** Steps below 4,096 tokens, steps carrying draft rows
+  and graph capture keep the GPU path, so decode and short prompts do not
+  change; the six long prompts with their 256-token answers take 78 / 79 s
+  (Flash-Next) and 180 / 191 s (27B) with the NPU on / off.
+- **Accuracy** is the W8A8 projections: the 27B sits at the plugin's own
+  run-to-run floor; Flash-Next at about its floor (0.009 plugin against itself)
+  and below what its fp8 / int8 KV cache costs (0.020-0.023).
 - **The NPU is slower per row but hidden.** A GDN projection of 8,192 rows
   takes 44.2 ms on the NPU (15.6 TOPS) against 15.8 ms on the GPU; with two
   banks it runs while the GPU does the other bank's layer.
-- **Memory.** The NPU pins ~3 GB (weight panels and two banks of arenas),
-  opened during vLLM's memory profile: 412,699 KV tokens at `GPU_UTIL=0.82`
-  against 471,150 without the NPU. At 0.85 host MemAvailable falls to
-  9 GiB, the memory guard's limit; 32k prefill chunks do not fit with the NPU
-  (1.33 GiB of KV cache left at 0.80).
-- **Which steps.** Steps below 4,096 tokens, steps carrying draft rows and
-  graph capture keep the GPU path, so decode and short prompts do not change;
-  steps of several requests take the NPU path (the banks are token ranges, and
-  a request straddling the boundary appears in both).
-
-2026-11-04, same offline protocol (warm rep), with the `STRIX_NPU_STATS`
-instrumentation: the GPU never waits at a chain (0.01 ms mean at every depth;
-at 16k a chain is busy 44-60 ms inside an 80-89 ms window), so the pipeline is
-GPU-bound and capping the NPU rows at 7,168 *costs* 4.2 % at 16k. The QSA
-indexer's `index_qk_proj` now rides the QsaIn panels after `qkv_proj` (the
-last panel already ran; `STRIX_NPU_INDEXER=0` keeps it on the GPU): 16k
-7,902 -> 7,814 ms (-1.1 %), 8k 3,888 -> 3,832 (-1.4 %), and KLD against the
-GPU indexer at 16k is 0.0093 mean (the plugin-vs-itself floor), PPL +0.37 %.
-Against the GPU path the NPU step is -9.1 % / -10.8 % / -10.8 % at 8k/16k/32k.
-`STRIX_NPU_VIEWS=1` (opt-in) reads the GDN banks' projections straight from
-the NPU's C arena (the conv and gated-norm kernels take row pitches): another
-0.5-0.7 % of a 16k step. It stays opt-in because the path carries a
-run-to-run jitter - identical prefill steps land in a handful of discrete
-numeric states (teacher-forced logprobs differ by mean 0.01-0.15 between
-executions, reproducible per script layout) - that is the same size as the
-change, so the end-to-end numerics gate cannot resolve it; the kernels are
-bit-exact on strided inputs and the KLD sits at the null-pair floor.
-GSM8K paired for the indexer (n = 250, `STRIX_NPU_INDEXER=0` vs on, greedy,
-DFlash 2 recipe): 240 vs 242, 1 / 3 discordant, McNemar p = 0.63.
-
-Qwen3.8-27B bf16 (`STRIX_ENABLE=npu`, two K halves, 47 GDN layers; prefill of
-an 8,192-token prompt, second pass, three runs each, alternating):
-
-| configuration | prefill | tok/s |
-| --- | --- | ---: |
-| plugin, compiled | 11.29 / 10.88 / 11.35 s (mean 11.17) | 733 |
-| plugin, eager | 12.19 / 12.25 s | 670 |
-| NPU + GPU, eager loop | 11.44 s | 717 |
-| NPU + GPU, compiled loop | 10.20 / 10.35 / 10.50 s (mean 10.35, **-7.3 %**) | 792 |
-
-Depth (same method, one run each):
-
-| depth | plugin, compiled | NPU + GPU, compiled loop |
-| ---: | ---: | ---: |
-| 8,192 | 11.21 s | 10.46 s (-6.7 %) |
-| 16,384 | 23.60 s | 22.02 s (-6.7 %) |
-| 32,768 | 49.81 s | 49.07 s (-1.5 %) |
-
-Served (the [npu overlay](docker.md#npu-prefill) over the recipe,
-`GPU_UTIL=0.82` for both, MTP 2, alternated; request time of a fresh prompt,
-`max_tokens` 1 - the first request at a bank shape pays the dense regions'
-one-time compile, so the steady runs are the later ones at each length):
-
-| prompt | plugin | NPU |
-| --- | ---: | ---: |
-| ~8.2k tokens | 11.48 / 11.52 s | 10.68 s (**-7.3 %**) |
-| ~16.4k tokens | 23.76 / 23.80 s | 22.07 / 22.13 s (**-7.1 %**) |
-| ~24.6k tokens | 37.15 s | 34.33 s (**-7.6 %**) |
-
-Reading it:
-
-- **Accuracy.** KLD at 8k 0.0106 (p95 0.0147), top-1 97.3 %, perplexity
-  +0.74 % against the plugin; at 9,216, a split of 3,072 + 6,144 rows,
-  0.00268 (p95 0.0053), 98.5 %, -0.05 %. One activation scale over both
-  K halves instead of one per half is worse: KLD 0.0140, +2.14 %.
-- **The NPU is slower per row but hidden.** On a 4,096-row bank the two
-  chains take 51.7 ms (13.4 TOPS) against 15.5 ms for the GPU's own GEMM;
-  each chain runs while the GPU does the other bank's layer.
-- **The split follows the served chunks.** The engine chunks an 8.2k
-  prompt at 8,080 tokens and a 16.4k one at 16,160, sizes that do not
-  halve cleanly, so the step splits at the boundary that covers the most
-  NPU rows (`STRIX_NPU_SIZES`, default 2,048-8,192): 8,080 gives banks of
-  4,096 + 3,984 rows (89 % covered), 16,160 gives 8,192 + 7,968 (95 %). A
-  plain half-split won 2.2 % served (11.23 against 11.48 s at 8.2k).
-  16,384 tokens is the last depth a single step covers fully; at 32,768
-  the NPU takes each bank's first 8,192 rows and the rest runs on the
-  GPU, and the win shrinks to 1.5 %.
-- **Which steps.** Steps below 4,096 tokens, batches of several requests,
-  graph capture and non-first pipeline ranks keep the GPU path, so decode
-  and short prompts do not change. The loop's dense regions are
-  torch.compiled (`STRIX_NPU_COMPILE=0` keeps the whole loop eager - the
-  11.44 s row in the table).
-- **Memory.** The panels (~10.5 GiB) pin during vLLM's memory profile, so
-  they are counted before the KV cache is sized: 826,647 KV tokens at
-  `GPU_UTIL=0.82` against 1,121,559 without, host `MemAvailable` 18.4 GiB
-  with the NPU resident (the guard stops vLLM at 9 GiB). At 0.85 the
-  guard stopped the served engine at startup.
-- **Scope.** The panels are built for K = 5,120 bf16 projections;
-  quantized checkpoints and any other shape turn the path off (both
-  quantized ones were tried with dequantized panels and measured
-  break-even). The other bf16 recipes gain nothing: Qwen3.6-35B-A3B turns
-  off by shape, LFM2.5-24B-A2B and gemma-4-26B-A4B are not hooked.
+- **Memory.** The weight panels and arenas are pinned when the NPU opens in
+  vLLM's startup profile run, so the KV cache is sized after them. Above
+  `GPU_UTIL=0.82` the path stays off (`STRIX_NPU_MAX_UTIL`).
+- **Scope.** Flash-Next's GDN and QSA input projections, and the 27B bf16's
+  GDN projections (K = 5,120 as two chunks); the quantized 27B checkpoints and
+  every other model run the GPU path.
 
 ### LFM2.5-24B-A2B
 

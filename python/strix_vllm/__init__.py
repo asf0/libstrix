@@ -239,9 +239,10 @@ def register() -> None:
     dense_w8.register()
     draft_head.register()
     inkling2.register()
-    # Opt-in (STRIX_ENABLE=npu): needs the XDNA2 NPU and libstrix_npu.so.
-    from strix_vllm import qwen3_5_npu, qwen4_exp_npu
+    # On where the XDNA2 NPU is usable (npu.unavailable()); STRIX_DISABLE=npu turns it off.
+    from strix_vllm import gemma4_npu, qwen3_5_npu, qwen4_exp_npu
 
     qwen4_exp_npu.register()
     qwen3_5_npu.register()
+    gemma4_npu.register()
     logger.info("libstrix: plugin registered")

@@ -5,6 +5,15 @@ services:
     devices:
       - /dev/kfd:/dev/kfd
       - ${STRIX_DRI:-/dev/dri}:${STRIX_DRI:-/dev/dri}
+    # The XDNA2 NPU (/dev/accel, character major 261) when the host has one:
+    # a bind mount rather than `devices`, so hosts without it still start
+    # (Docker then creates an empty /dev/accel there). libstrix uses it on
+    # Qwen3.8-Flash-Next and Qwen3.8-27B bf16 when it is usable
+    # (docs/docker.md#npu-prefill); its panels need unlimited memlock.
+    device_cgroup_rules:
+      - "c 261:* rmw"
+    ulimits:
+      memlock: -1
     ipc: host
     security_opt:
       - seccomp=unconfined
@@ -16,6 +25,7 @@ services:
       # (local testing without SSD writes), point CACHE at a tmpfs path:
       #   CACHE=/dev/shm/strix-cache docker compose ... up -d
       - ${CACHE:-./cache}:/cache
+      - /dev/accel:/dev/accel
     environment:
       MTP: ${MTP:-0}
       SERVED_MODEL_NAME: ${SERVED_MODEL_NAME:-}

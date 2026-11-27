@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: MIT
-"""XDNA2 NPU input projections for Qwen3.8-Flash-Next prefill.
+"""XDNA2 NPU input projections for Qwen3.8-Flash-Next and Qwen3.8-27B prefill.
+
+On by default where the NPU is usable (`unavailable()` is None): the device
+node passed into the container, libstrix_npu.so and an unlimited memlock limit,
+with `--gpu-memory-utilization` at most STRIX_NPU_MAX_UTIL (0.82).
+STRIX_DISABLE=npu turns it off; STRIX_ENABLE=npu forces it past both checks.
 
 The NPU runs W8A8 GEMMs with a BF16 epilogue (hipfire's G80 program and trunk
 transport, through the `strix-npu` shim in npu/): the GDN in_proj_qkvz +
@@ -45,6 +50,58 @@ def _lib_path() -> str:
         if cand.exists():
             return str(cand)
     raise FileNotFoundError("libstrix_npu.so not found (set STRIX_NPU_LIB)")
+
+
+DEVICE = "/dev/accel/accel0"
+# Above this GPU_UTIL the NPU's pinned memory (~3 GB on Flash-Next, ~10.5 GiB
+# on the 27B) leaves the host under the memory guard (docs/docker.md#npu-prefill).
+MAX_UTIL = float(os.environ.get("STRIX_NPU_MAX_UTIL", "0.82"))
+
+
+def forced() -> bool:
+    """STRIX_ENABLE=npu: on whatever the detection and GPU_UTIL say."""
+    names = {s.strip() for s in os.environ.get("STRIX_ENABLE", "").split(",")}
+    return "npu" in names
+
+
+def unavailable() -> str | None:
+    """Why the NPU cannot be used in this process, or None when it can: the
+    device node, the shim and an unlimited memlock limit (the weight panels and
+    arenas are pinned). The driver itself is checked when the runtime opens."""
+    if not os.path.exists(DEVICE):
+        return f"no {DEVICE}"
+    if not os.access(DEVICE, os.R_OK | os.W_OK):
+        return f"{DEVICE} is not readable and writable"
+    try:
+        _lib_path()
+    except FileNotFoundError as e:
+        return str(e)
+    import resource
+
+    soft, _ = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    if soft != resource.RLIM_INFINITY and soft < 16 << 30:
+        return f"memlock limit {soft >> 20} MiB (needs unlimited: ulimits memlock -1)"
+    return None
+
+
+def util_blocks() -> str | None:
+    """Why this engine's GPU_UTIL leaves no room for the NPU, or None. Skipped
+    under STRIX_ENABLE=npu or when no vLLM config is current."""
+    if forced():
+        return None
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+
+        cfg = get_current_vllm_config_or_none()
+    except ImportError:
+        return None
+    util = getattr(getattr(cfg, "cache_config", None), "gpu_memory_utilization", None)
+    if util is None or util <= MAX_UTIL:
+        return None
+    return (
+        f"--gpu-memory-utilization {util:g} leaves too little host memory for its "
+        f"pinned memory (<= {MAX_UTIL:g}, or STRIX_ENABLE=npu to force it)"
+    )
 
 
 def lib() -> ctypes.CDLL:

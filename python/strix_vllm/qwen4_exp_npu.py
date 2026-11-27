@@ -47,7 +47,7 @@ import time
 import torch
 from torch import nn
 
-from strix_vllm import disabled, _env_names
+from strix_vllm import disabled
 
 _MIN_TOKENS = int(os.environ.get("STRIX_NPU_MIN_TOKENS") or "4096")
 # NPU row counts: the largest is the full program, the others the four
@@ -79,7 +79,11 @@ _VIEWS = os.environ.get("STRIX_NPU_VIEWS", "") == "1"
 
 
 def enabled() -> bool:
-    return "npu" in _env_names("STRIX_ENABLE") and not disabled("npu")
+    """On where the NPU is usable (npu.unavailable() is None) or forced with
+    STRIX_ENABLE=npu; STRIX_DISABLE=npu turns it off."""
+    from strix_vllm import npu
+
+    return not disabled("npu") and (npu.forced() or npu.unavailable() is None)
 
 
 class _Given(nn.Module):
@@ -171,6 +175,9 @@ def _runtime(model):
 
     log = _logger()
     try:
+        why = npu.util_blocks()
+        if why:
+            raise RuntimeError(why)
         entries = []
         for idx, layer in enumerate(model.layers):
             if idx < 2 or layer.ple is not None:
@@ -219,6 +226,8 @@ def _warm(rt) -> None:
 
 def _npu_rows(m: int) -> int:
     """Rows of an m-row bank the NPU projects (the rest go to the GPU)."""
+    if os.environ.get("STRIX_NPU_GPU_ONLY", "0") != "0":  # debug: banks without NPU rows
+        return 0
     return max((r for r in _SIZES if r <= m), default=0)
 
 
@@ -363,15 +372,61 @@ def _bank_contexts(a: int, n: int):
     slices, _ = maybe_create_ubatch_slices(
         True, ib.num_scheduled_tokens, n, r, 2, split_point=[a],
     )
+    # With prefix caching the GDN state slot of a request is the cache block of
+    # its last token (MambaHybridModelState.prepare_attn ->
+    # compute_aligned_state_indices(seq_lens)). A bank's truncated seq_lens would
+    # give bank A the block of token a-1 and bank B the block of token n-1, so
+    # bank B would start from a state bank A never wrote. Both banks take the
+    # whole step's slots instead: bank A writes where bank B reads, as the
+    # unsplit step does (prefix caching keeps only a step's last block anyway).
+    # The builders without aligned slots (ReplaySSM) pick the same block from
+    # seq_lens in mamba_get_block_table_tensor: they get the step's seq_lens too.
+    prefix_caching = getattr(ms, "prefix_caching", False)
+    mamba_ctx = getattr(ms, "_mamba_ctx", None) if prefix_caching else None
+    full_slots = None
+    if mamba_ctx is not None and getattr(mamba_ctx, "aligned_state_indices", None) is not None:
+        full_slots = mamba_ctx.compute_aligned_state_indices(ib.seq_lens, r).clone()
+    full_seq_lens = ib.seq_lens[:r].clone() if prefix_caching else None
+    slot_modules = _slot_modules() if prefix_caching else ()
     ctxs = []
     for b, sl in enumerate(slices):
         sub = _slice_input_batch(ib, sl, *_State.bufs[b])
+        if getattr(sub, "max_query_len", None) is not None:
+            # The slicer keeps the whole step's promised max_query_len; the
+            # metadata builders take it as this bank's own query bound.
+            import dataclasses
+
+            sub = dataclasses.replace(sub, max_query_len=int(sub.num_scheduled_tokens.max()))
         slots = st["slot_mappings"][:, sl.token_slice]
-        md = _ORIG_PREPARE(
-            ms, sub, st["cg_mode"],
-            tuple(t[sl.request_slice] for t in st["block_tables"]), slots,
-            st["attn_groups"], st["kv_cache_config"],
-        )
+        if full_slots is not None:
+            # The context class has __slots__: swap the method on the class for
+            # this one build (the engine core is single-threaded).
+            ctx_cls = type(mamba_ctx)
+            orig_slots_fn = ctx_cls.compute_aligned_state_indices
+            bank_slots = full_slots[:, sl.request_slice]
+            ctx_cls.compute_aligned_state_indices = lambda _self, _seq_lens, n_req, _s=bank_slots: _s[:, :n_req]
+        swapped = []
+        if full_seq_lens is not None:
+            step_lens = full_seq_lens[sl.request_slice]
+            for mod in slot_modules:
+                orig_fn = mod.mamba_get_block_table_tensor
+
+                def by_step_lens(block_table, _seq_lens, *args, _orig=orig_fn, _lens=step_lens, **kw):
+                    return _orig(block_table, _lens[: block_table.shape[0]], *args, **kw)
+
+                mod.mamba_get_block_table_tensor = by_step_lens
+                swapped.append((mod, orig_fn))
+        try:
+            md = st["prepare"](
+                ms, sub, st["cg_mode"],
+                tuple(t[sl.request_slice] for t in st["block_tables"]), slots,
+                st["attn_groups"], st["kv_cache_config"],
+            )
+        finally:
+            if full_slots is not None:
+                ctx_cls.compute_aligned_state_indices = orig_slots_fn
+            for mod, orig_fn in swapped:
+                mod.mamba_get_block_table_tensor = orig_fn
         md = _clone(md)
         ctxs.append(create_forward_context(
             md, ms.vllm_config, slot_mapping=build_slot_mappings_by_layer(slots, st["kv_cache_config"]),
@@ -379,11 +434,26 @@ def _bank_contexts(a: int, n: int):
     return ctxs
 
 
+def _slot_modules() -> tuple:
+    """The attention backends that pick a mamba state block from seq_lens."""
+    import importlib
+
+    mods = []
+    for name in ("gdn_attn", "mamba_attn", "linear_attn", "short_conv_attn"):
+        try:
+            mod = importlib.import_module(f"vllm.v1.attention.backends.{name}")
+        except ImportError:
+            continue
+        if hasattr(mod, "mamba_get_block_table_tensor"):
+            mods.append(mod)
+    return tuple(mods)
+
+
 def _restore_step_metadata() -> None:
     """Rebuilds the step's own metadata in place (the banks' builds overwrote the
     model state's persistent buffers; the drafter reads them after the forward)."""
     st = _State.step
-    _ORIG_PREPARE(
+    st["prepare"](
         st["model_state"], st["input_batch"], st["cg_mode"], st["block_tables"],
         st["slot_mappings"], st["attn_groups"], st["kv_cache_config"],
     )
@@ -583,11 +653,39 @@ def forward(model, input_ids, positions, query_start_loc, ngram_context, inputs_
     return sample_hidden
 
 
-_ORIG_PREPARE = None
+_CAPTURED: dict = {}  # model-state class -> its own prepare_attn
+
+
+def install_step_capture(cls) -> None:
+    """Wraps `cls.prepare_attn` so the step's inputs are kept for the bank
+    contexts (`_State.step`, with the original method as "prepare"). Only the
+    most derived wrapped class of a model state records the step: a subclass
+    that calls its base's prepare_attn does not overwrite it."""
+    if cls in _CAPTURED:
+        return
+    from vllm.config import CUDAGraphMode
+
+    orig = cls.prepare_attn
+    _CAPTURED[cls] = orig
+
+    def prepare_attn(self, input_batch, cudagraph_mode, block_tables, slot_mappings,
+                     attn_groups, kv_cache_config, for_capture=False, ubatch_idx=0, **kw):
+        if type(self).prepare_attn is prepare_attn:
+            _State.step = None
+            if not for_capture and cudagraph_mode != CUDAGraphMode.FULL:
+                _State.step = dict(
+                    model_state=self, input_batch=input_batch, cg_mode=cudagraph_mode,
+                    block_tables=block_tables, slot_mappings=slot_mappings,
+                    attn_groups=attn_groups, kv_cache_config=kv_cache_config, prepare=orig,
+                )
+        return orig(self, input_batch, cudagraph_mode, block_tables, slot_mappings,
+                    attn_groups, kv_cache_config, for_capture=for_capture,
+                    ubatch_idx=ubatch_idx, **kw)
+
+    cls.prepare_attn = prepare_attn
 
 
 def register() -> None:
-    global _ORIG_PREPARE
     if not enabled():
         return
     try:
@@ -597,22 +695,7 @@ def register() -> None:
         return
     from vllm.config import CUDAGraphMode
 
-    _ORIG_PREPARE = MambaHybridModelState.prepare_attn
-
-    def prepare_attn(self, input_batch, cudagraph_mode, block_tables, slot_mappings,
-                     attn_groups, kv_cache_config, for_capture=False, ubatch_idx=0, **kw):
-        _State.step = None
-        if not for_capture and cudagraph_mode != CUDAGraphMode.FULL:
-            _State.step = dict(
-                model_state=self, input_batch=input_batch, cg_mode=cudagraph_mode,
-                block_tables=block_tables, slot_mappings=slot_mappings,
-                attn_groups=attn_groups, kv_cache_config=kv_cache_config,
-            )
-        return _ORIG_PREPARE(self, input_batch, cudagraph_mode, block_tables, slot_mappings,
-                             attn_groups, kv_cache_config, for_capture=for_capture,
-                             ubatch_idx=ubatch_idx, **kw)
-
-    MambaHybridModelState.prepare_attn = prepare_attn
+    install_step_capture(MambaHybridModelState)
 
     cls = qm.Qwen4ExpForConditionalGeneration
     orig = cls.forward
@@ -673,4 +756,6 @@ def register() -> None:
         return orig(self, input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
 
     cls.forward = patched
-    _logger().info("libstrix: npu prefill patch installed (STRIX_ENABLE=npu)")
+    from strix_vllm import npu
+
+    _logger().info("libstrix: npu prefill patch installed (%s)", "STRIX_ENABLE=npu" if npu.forced() else f"{npu.DEVICE} found")

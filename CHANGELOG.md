@@ -31,6 +31,28 @@ Recipes:
   overlay `npu/qwen3.8-flash-next.yaml` went with `qwen3.8-flash-next`.
 - New `inkling-2-mini`: Inkling 2 Mini with its DSpark draft, 131k context
   (smoke: text, image, tool call and reasoning pass).
+- NPU prefill (Qwen3.8-Flash-Next, Qwen3.8-27B bf16) turns on by itself
+  where the host has the XDNA2 NPU and `GPU_UTIL` is at most 0.82:
+  `common.yaml` passes `/dev/accel` in when it exists and sets unlimited
+  memlock, so the `npu/` overrides are gone. `STRIX_DISABLE=npu` turns it
+  off; `STRIX_ENABLE=npu` forces it above 0.82. Served: +8-9 % prefill on
+  both, KLD against the NPU off 0.0136 (Flash-Next) and 0.002 (27B).
+
+Fixes:
+
+- NPU prefill on the current vLLM: the two banks now share the step's GDN
+  state slots (with prefix caching, and under ReplaySSM, the second bank read
+  a slot the first never wrote: wrong output on both models); the 27B hook
+  follows Qwen3.5's move to `vllm.models.qwen3_5`; the 27B loop records the
+  draft's hidden states, so it runs under DFlash 2.
+
+Experimental: gemma-4-31B bf16 NPU prefill (`STRIX_ENABLE=npu_gemma`), not
+correct yet.
+
+Image: layered so an update re-downloads only what changed (ROCm, torch,
+Triton and the pinned packages change only with the pins; libstrix is its own
+47 MB layer); vLLM and libstrix compile through ccache; CI rebuilds the
+toolchain image only when its block of the Dockerfile or the pins change.
 
 Releases: each version's GitHub release carries `libstrix-recipes-X.Y.Z.zip`
 (the recipes with the image pinned to that version; `docker/release-recipes.sh`),

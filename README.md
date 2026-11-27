@@ -46,7 +46,8 @@ Against stock upstream vLLM on one gfx1151 APU, single stream, int8 KV
   one request (56 with DSpark) and 155 tok/s total for 16; recipe
   `inkling-2-mini` (image 0.1.0 or later). See
   [docs/performance.md](docs/performance.md#inkling-2-mini).
-- **NPU prefill** (Flash-Next, `STRIX_ENABLE=npu`, kernel 7.4+): TTFT 7-8 %
+- **NPU prefill** (Flash-Next and the 27B bf16, on by itself where the XDNA2
+  NPU is there, kernel 7.4+): TTFT 7-8 %
   lower from 16k to 100k tokens served and prefill 9-11 % faster at 8k-32k
   offline, decode and short prompts unchanged, GSM8K unchanged; the NPU also
   covers multi-request steps. See

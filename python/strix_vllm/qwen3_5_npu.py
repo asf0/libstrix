@@ -44,7 +44,7 @@ import os
 
 import torch
 
-from strix_vllm import _env_names, disabled, npu
+from strix_vllm import disabled, npu
 from strix_vllm import qwen4_exp_npu as shared
 
 _MIN_TOKENS = int(os.environ.get("STRIX_NPU_MIN_TOKENS") or "4096")
@@ -59,6 +59,8 @@ _ROWS_MAX = _SIZES[-1]
 # Inductor then fuses the same kernels vLLM's compiled path fuses for this
 # model. STRIX_NPU_COMPILE=0 keeps the whole loop eager.
 _COMPILE = os.environ.get("STRIX_NPU_COMPILE", "1") != "0"
+# Debug: run the two-bank loop with every projection on the GPU (no NPU rows).
+_GPU_ONLY = os.environ.get("STRIX_NPU_GPU_ONLY", "0") != "0"
 
 
 class _State:
@@ -70,7 +72,9 @@ class _State:
 
 
 def enabled() -> bool:
-    return "npu" in _env_names("STRIX_ENABLE") and not disabled("npu")
+    """On where the NPU is usable (npu.unavailable() is None) or forced with
+    STRIX_ENABLE=npu; STRIX_DISABLE=npu turns it off."""
+    return not disabled("npu") and (npu.forced() or npu.unavailable() is None)
 
 
 def _logger():
@@ -102,6 +106,9 @@ def _open(model) -> list | None:
         return _State.runtimes
     log = _logger()
     try:
+        why = npu.util_blocks()
+        if why:
+            raise RuntimeError(why)
         weights = {}
         for idx, layer in enumerate(model.layers):
             if idx == 0:
@@ -161,6 +168,8 @@ def _warm(rt) -> None:
 
 
 def _rows(k: int) -> int:
+    if _GPU_ONLY:
+        return 0
     return max((r for r in _SIZES if r <= k), default=0)
 
 
@@ -326,8 +335,14 @@ def forward(model, input_ids, positions, inputs_embeds=None):
     rt_a = _State.runtimes[0]
     wake = rt_a.kick(_State.wake_layer, npu.GDN_IN, _State.wake_x[:, : npu.K], 0)
     hidden = model.embed_input_ids(input_ids) if inputs_embeds is None else inputs_embeds
+    # The draft's hidden states (DFlash / EAGLE), recorded as Qwen3_5Model.forward
+    # does: index 0 the embeddings, index i + 1 the residual stream after layer i.
+    aux_layers = set(getattr(model, "aux_hidden_state_layers", ()))
+    aux = {0: [hidden.clone()]} if 0 in aux_layers else {}
     # Layer 0 on all rows, with the step's own metadata.
     h, r = layers[0](positions=positions, hidden_states=hidden, residual=None)
+    if 1 in aux_layers:
+        aux[1] = [h + r]
     rt_a.result(npu.GDN_IN, _SIZES[0], wake, 0)
     rt_a.retire(wake, 0)
 
@@ -358,6 +373,9 @@ def forward(model, input_ids, positions, inputs_embeds=None):
             )
             with override_forward_context(ctx[b]):
                 state[b] = _layer_body(layer, normed, res, pos[b], given)
+            if idx + 1 in aux_layers:
+                # before premix: the next layer's fused add-norm updates res in place
+                aux.setdefault(idx + 1, []).append(state[b][0] + state[b][1])
             if nxt is not None:
                 premix(b, nxt)
 
@@ -376,26 +394,36 @@ def forward(model, input_ids, positions, inputs_embeds=None):
             _State.runtimes = None
             _logger().error("libstrix: npu prefill off after a failed NPU chain: %s", e)
             raise
-    return torch.cat(sample)
+    out = torch.cat(sample)
+    if aux_layers:
+        return out, [torch.cat(aux[i]) for i in sorted(aux)]
+    return out
 
 
 def register() -> None:
     if not enabled():
         return
-    try:
-        from vllm.config import CUDAGraphMode
-        from vllm.forward_context import get_forward_context, is_forward_context_available
-        from vllm.model_executor.models import qwen3_5
-    except ImportError:
+    import importlib
+
+    patched = 0
+    # vLLM's registry loads Qwen3.5 from vllm.models.qwen3_5 (per-platform:
+    # amd/model.py on ROCm); vllm.model_executor.models.qwen3_5 is the
+    # torch.compile version other platforms keep. Hook whichever exist.
+    for module in ("vllm.models.qwen3_5", "vllm.model_executor.models.qwen3_5"):
+        try:
+            qwen3_5 = importlib.import_module(module)
+        except ImportError:
+            continue
+        if getattr(qwen3_5, "Qwen3_5Model", None) is None:
+            continue
+        for name in ("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"):
+            cls = getattr(qwen3_5, name, None)
+            if cls is not None and not getattr(cls, "_strix_npu", False):
+                _patch(cls)
+                patched += 1
+    if not patched:
         return
-    inner_cls = getattr(qwen3_5, "Qwen3_5Model", None)
-    if inner_cls is None:
-        return
-    for name in ("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"):
-        cls = getattr(qwen3_5, name, None)
-        if cls is not None:
-            _patch(cls)
-    _logger().info("libstrix: npu prefill patch installed for Qwen3.5 (STRIX_ENABLE=npu)")
+    _logger().info("libstrix: npu prefill patch installed for Qwen3.5 (%s)", "STRIX_ENABLE=npu" if npu.forced() else f"{npu.DEVICE} found")
 
 
 def _patch(cls) -> None:
@@ -427,10 +455,11 @@ def _patch(cls) -> None:
             and st["input_batch"].num_tokens == n
             and _State.runtimes is not None
             and not inner.use_sequence_parallel
-            and not getattr(inner, "aux_hidden_state_layers", ())
-            and shared._ORIG_PREPARE is not None
+            and not getattr(inner, "mlp_output_is_partial", False)
+            and "prepare" in st
         ):
             return forward(inner, input_ids, positions, inputs_embeds)
         return orig(self, input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
 
     cls.forward = patched
+    cls._strix_npu = True

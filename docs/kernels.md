@@ -22,7 +22,10 @@ another model;
 `STRIX_DISABLE` still wins. `dense_w8` stops adding int8 copies at
 `STRIX_DENSE_W8_MAX_GB` (default 12).
 
-`STRIX_ENABLE=npu` (off by default) moves Qwen3.8-Flash-Next's prefill input
+The NPU path (on wherever `/dev/accel/accel0`, `libstrix_npu.so` and an
+unlimited memlock limit are there and `--gpu-memory-utilization` is at most
+`STRIX_NPU_MAX_UTIL`, 0.82; `STRIX_DISABLE=npu` turns it off, `STRIX_ENABLE=npu`
+forces it past the last two checks) moves Qwen3.8-Flash-Next's prefill input
 projections to the XDNA2 NPU (`python/strix_vllm/qwen4_exp_npu.py`, the `npu/`
 shim over hipfire's G80 BF16 trunk transport). A prefill step of N >=
 `STRIX_NPU_MIN_TOKENS` (4,096) tokens — one request or several — is split into
@@ -33,6 +36,13 @@ request straddling the boundary appears in both banks, its query truncated to
 the tokens each owns — bank B's suffix reads the GDN state bank A wrote — and
 whole requests inside a bank are independent; steps carrying draft rows or
 whose scheduled tokens do not line up with the token layout stay on the GPU).
+Each bank gets its own query bound (`max_query_len`), and the GDN state slots
+of the whole step: with prefix caching (and under ReplaySSM) vLLM picks a
+request's state block from its sequence length, which would give bank B the
+block of the step's last token while bank A wrote the block of its own, so
+both banks take the step's (`compute_aligned_state_indices` and
+`mamba_get_block_table_tensor` see the step's sequence lengths during the
+banks' metadata builds).
 Layers 0 and 1 (PLE, a convolution across tokens) run on all rows; from layer 2
 on each layer runs bank A, then bank B, while the NPU computes the other bank's
 input projection (GDN `in_proj_qkvz` + `in_proj_ba`, QSA `qkv_proj` and, riding
@@ -56,9 +66,12 @@ runtimes, summed in bf16; only 47 of the 48 GDN layers' `in_proj_qkvz` +
 `in_proj_ba` go to the NPU (full-attention layers and layer 0 stay on the GPU).
 The bank loop's dense regions (each bank's input norm and post-mixer tail) are
 torch.compiled - the mixers and NPU calls stay eager - which is what makes it
-faster than the compiled base (-6.7 to -7.3 % offline at 8k-16k prefill,
-about -7 % served, see
-[performance.md](performance.md#npu-prefill)). The step splits into two banks
+faster than the compiled base (+8-9 % prefill served at 17k-35k, see
+[performance.md](performance.md#npu-prefill)). The loop records the draft's
+hidden states the way the model does, so it also runs under DFlash 2 (the
+recipe default). The hook patches the Qwen3.5 classes vLLM's registry loads
+(`vllm.models.qwen3_5`, per platform) and the older
+`vllm.model_executor.models.qwen3_5`. The step splits into two banks
 at the boundary that covers the most NPU rows (`STRIX_NPU_SIZES`, default
 2,048 / 3,072 / 4,096 / 6,144 / 7,168 / 8,192): the served engine chunks
 prefill at sizes that do not halve cleanly, and a plain half-split leaves one
@@ -69,6 +82,13 @@ projections are already cheap on the GPU, so the path turns itself off there
 (measured break-even when tried, see
 [performance.md](performance.md#npu-prefill)); a checkpoint with any other
 projection shape turns it off the same way.
+
+gemma-4-31B bf16 (`python/strix_vllm/gemma4_npu.py`, the sliding layers'
+`qkv_proj`, K 5,120 on the NPU and the last 256 on the GPU) is experimental and
+opt-in only (`STRIX_ENABLE=npu_gemma`): its bank loop does not yet match the
+compiled model (KLD 0.17 at 16k with no NPU rows) and runs about 20 % slower
+than it, so auto-detection never turns it on. `STRIX_NPU_GPU_ONLY=1` (debug)
+runs any of these bank loops with every projection on the GPU.
 
 | `STRIX_DISABLE` name | kernel | replaces | when |
 | --- | --- | --- | --- |
